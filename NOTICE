@@ -1,0 +1,12 @@
+Chord
+Copyright 2026 Chord contributors
+
+This product contains source derived from the following project:
+
+humming
+Public upstream: https://github.com/inclusionAI/humming
+Public baseline: 4351af3a8fcdce1a8dee50104ba49566af2427fb
+This distribution contains modifications described in
+chord_kernels/operator/SOURCE.md.
+Licensed under the Apache License, Version 2.0. The complete license text is
+distributed at chord_kernels/operator/LICENSE and in the root LICENSE file.

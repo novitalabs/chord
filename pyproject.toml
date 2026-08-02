@@ -1,0 +1,46 @@
+[build-system]
+requires = [
+    "setuptools>=77",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chord_kernels"
+version = "0.1.0"
+description = "Indexed W4A16 CUDA MoE operator"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+# chord_kernels/operator/LICENSE additionally ships as package data (see
+# setup.py) so the JIT source tree carries its provenance record at runtime.
+license-files = [
+    "LICENSE",
+    "NOTICE",
+]
+dependencies = [
+    "torch>=2.1",
+    "jinja2",
+    "cuda-bindings",
+    # The prefill block-M model samples a routing with NumPy's RandomState to
+    # reproduce upstream Humming's block-M selection bit-for-bit.
+    "numpy",
+    "pyelftools",
+    "filelock",
+    "packaging",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA-capable GPU and the CUDA toolkit",
+    "perf: runs production-sized performance cases; enable with --run-perf",
+]
