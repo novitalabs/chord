@@ -19,10 +19,6 @@ are the model's full dimensions:
 | gate/up | 4096 | 7168 | `N = 2 * moe_intermediate` (gate and up fused into one GEMM before SwiGLU), `K = hidden_size` |
 | down | 7168 | 2048 | `N = hidden_size`, `K = moe_intermediate` |
 
-For contrast, TP8 splits the intermediate dimension instead, giving gate/up
-`N=512, K=7168` and down `N=7168, K=256`. Those shapes run correctly but are not in
-this kernel's tuning table.
-
 ## Token counts
 
 Prefill and decode sweep different token counts because they model different

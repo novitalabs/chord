@@ -404,11 +404,6 @@ def generate_indexed_case(case: IndexedCase, device: torch.device) -> IndexedTen
 #
 # gate/up emits 2x the intermediate width because the gate and up projections are
 # fused into one GEMM before SwiGLU; down then consumes the 2048-wide result.
-#
-# For contrast, TP8 (tensor parallelism over 8 GPUs) splits the intermediate
-# dimension instead, giving gate/up N=512 K=7168 and down N=7168 K=256.  Those
-# shapes run correctly but are not in this kernel's tuning table -- see the
-# tuning coverage section of the README.
 _EP8_GATE_UP = {"n": 4096, "k": 7168}
 _EP8_DOWN = {"n": 7168, "k": 2048}
 _EP8 = {"num_experts": 48, "top_k": 8}

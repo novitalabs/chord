@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Render the benchmark chart embedded in the README "Measured performance"
-section.
+"""Render the benchmark chart embedded in the README "Performance" section.
 
-The data below mirrors the three measured-performance tables in README.md
-(H200 EP8 prefill, H200 EP8 decode, B300 EP8 decode); when those tables are
-re-measured, update the numbers here and re-run:
+The data below mirrors the three measured-performance tables in
+docs/performance.md (H200 EP8 prefill, H200 EP8 decode, B300 EP8 decode); when
+those tables are re-measured, update the numbers here and re-run:
 
     python docs/assets/benchmark_chart.py
 

@@ -18,7 +18,7 @@ each supported part.
 | --- | --- | --- |
 | H200 EP8 indexed prefill | WGMMA, per-instruction commit+wait, generic block-M argmin, stream-K always on | WGMMA with batched `wait<1>` pipelining, tok/E block-M model, 2-CTAs/SM window, shape-aware stream-K gate, EP8-tuned tiles |
 | H200 EP8 indexed decode | WGMMA (no decode-specific path) | MMA `swap-AB` decode kernel: 4 CTAs/SM, semi-static token-tile schedule, fused dequant+scale |
-| Blackwell (B200/B300) EP8 indexed decode | No SM100 heuristics (falls back to SM80 rules) | Same MMA `swap-AB` kernel with EP8-tuned tile tables (stream-K on deep-K gate/up), `sm_100a`/`sm_103a` JIT targets |
+| Blackwell (B200/B300) EP8 indexed decode | Default config strategy only (no SM100 heuristics) | Same MMA `swap-AB` kernel with EP8-tuned tile tables (stream-K on deep-K gate/up), `sm_100a`/`sm_103a` JIT targets |
 
 ## H200 EP8 indexed prefill (`h200_prefill_ep8`, WGMMA)
 
@@ -105,12 +105,12 @@ to 13, else 24, with tile `(block_m, 256, 64)`, warp `(block_m, 64, 64)`,
 **P/D role selection.** Because prefill and decode want different physical
 weight layouts, the role must be fixed before weights are packed.
 `CHORD_SM90_DECODE=1` selects the decode profile for `profile="auto"` on SM90;
-unset/0 selects prefill. See the README.
+unset/0 selects prefill. See [getting_started.md](getting_started.md).
 
 ## Blackwell EP8 indexed decode (`blackwell_decode_ep8`)
 
-The public baseline has no SM100 heuristics (SM100 falls through to SM80
-rules). This repository runs the same MMA swap-AB decode kernel — `mma.sync`
+The public baseline has no SM100 heuristics and ships only its default config
+strategy there. This repository runs the same MMA swap-AB decode kernel — `mma.sync`
 `m16n8k16` is native on SM100/SM103; no tcgen05 path is required for these
 token counts. SM100 and SM103 share one tile table, tuned on B300 (148 SMs):
 
@@ -139,10 +139,3 @@ token counts. SM100 and SM103 share one tile table, tuned on B300 (148 SMs):
 On B300 the decode sweep (`tests/test_w4a16.py`, triton `do_bench`) measures
 gate/up 146/162/181/183 us and down 84/91/92/95 us at 20/30/40/50 tokens per
 GPU.
-
-## Not tuned here
-
-TP8 shapes (gate/up `N=512`, down `K=256`) and the fused SwiGLU/mul-sum
-elementwise kernels are outside this operator's tuning scope. TP8 shapes still
-execute correctly but fall back to generic defaults, as noted in
-[tuning.md](tuning.md).
