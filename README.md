@@ -4,21 +4,18 @@
 
 # Chord
 
-The `chord` repository publishes the Python package `chord_kernels`. It provides an
-indexed W4A16 MoE CUDA operator — BF16 activation, INT4 weight (stored as unsigned
-nibbles, decoded as `code - 8`), group-32 scale — through the `indexed` interface,
-plus a thin layer adapter for inference framework integration. The CUDA template
-directory keeps only the minimal dependency closure this operator needs at runtime.
+The `chord` repository publishes the Python package `chord_kernels`: Novita Labs'
+in-house W4A16 MoE CUDA operator — BF16 activation, INT4 weight (stored as
+unsigned nibbles, decoded as `code - 8`), group-32 scale — through the `indexed`
+interface, plus a thin layer adapter for inference framework integration. The
+kernel runs in Novita's production inference service; the CUDA template directory
+keeps only the minimal dependency closure it needs at runtime.
 
-## Production use and open-source scope
-
-Chord is Novita Labs' in-house W4A16 MoE kernel stack and runs in Novita's
-production inference service. It is open-sourced interface by interface. This
-release publishes the `indexed` interface, which fits single-node deployments:
-the routing metadata (sorted ids, expert ids) addresses one node's local experts
-directly. The `masked` and `contiguous` grouped-GEMM interfaces follow in a
-future release — those layouts are what wide-EP, P/D-disaggregated deployments
-are built around.
+The operator is open-sourced interface by interface. This release publishes the
+`indexed` interface, which fits single-node deployments: its routing metadata
+(sorted ids, expert ids) addresses one node's local experts directly. The
+`masked` and `contiguous` grouped-GEMM interfaces — the layouts wide-EP,
+P/D-disaggregated deployments are built around — follow in a future release.
 
 ## Where the name comes from
 
