@@ -7,7 +7,7 @@
 </p>
 
 <h3 align="center">
-Novita Labs' production W4A16 MoE CUDA kernel — three operands struck as one chord
+Novita Labs' production MoE CUDA kernel
 </h3>
 
 <p align="center">
