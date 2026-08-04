@@ -22,7 +22,8 @@ packing time and cannot be switched at runtime; a mismatched layout is rejected
 before launch. A production deployment prepares the matching profile per P/D
 instance, or keeps two packed copies of the weight. When the profile is left at
 `"auto"` on SM90, the per-instance role comes from the `CHORD_SM90_DECODE`
-environment variable (`1` decode; `0`/unset prefill; see the README), mirroring
+environment variable (`1` decode; `0`/unset prefill; see
+[getting_started.md](getting_started.md)), mirroring
 upstream Humming's `HUMMING_INT_SM90_DECODE`. Blackwell publishes only the
 decode profile, so `"auto"` needs no role bit there.
 
@@ -51,7 +52,7 @@ is rejected explicitly.
 | --- | --- | --- | --- |
 | EP8 gate/up | 4096 | 7168 | Tuned |
 | EP8 down | 7168 | 2048 | Tuned |
-| Anything else, including TP8 | — | — | Falls back to generic defaults |
+| Anything else | — | — | Falls back to generic defaults |
 
 Shapes outside the table still execute correctly, but `block_m` does not vary
 with routed-M and performance is untuned.
