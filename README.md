@@ -1,10 +1,32 @@
-# Chord
+<!-- markdownlint-disable MD001 MD033 MD041 -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo_lockup_dark.svg">
+    <img alt="Chord" src="docs/assets/logo_lockup.svg" width="240">
+  </picture>
+</p>
 
-The `chord` repository publishes the Python package `chord_kernels`. It provides an
-indexed W4A16 MoE CUDA operator — BF16 activation, INT4 weight (stored as unsigned
-nibbles, decoded as `code - 8`), group-32 scale — through the `indexed` interface,
-plus a thin layer adapter for inference framework integration. The CUDA template
-directory keeps only the minimal dependency closure this operator needs at runtime.
+<h3 align="center">
+Novita Labs' production MoE CUDA kernel
+</h3>
+
+<p align="center">
+| <a href="#documentation"><b>Documentation</b></a> | <a href="https://novita.ai"><b>Novita AI</b></a> | <a href="https://blogs.novita.ai"><b>Blog</b></a> |
+</p>
+
+---
+
+The `chord` repository publishes the Python package `chord_kernels`: Novita Labs'
+in-house W4A16 MoE CUDA operator — BF16 activation, INT4 weight (stored as
+unsigned nibbles, decoded as `code - 8`), group-32 scale — through the `indexed`
+interface, plus a thin layer adapter for inference framework integration. The
+kernel runs in Novita's production inference service; the CUDA template directory
+keeps only the minimal dependency closure it needs at runtime.
+
+The operator is open-sourced interface by interface. This release publishes the
+`indexed` interface, which fits single-node deployments: its routing metadata
+(sorted ids, expert ids) addresses one node's local experts directly. See
+[Roadmap](#roadmap) for what follows.
 
 ## Where the name comes from
 
@@ -44,6 +66,15 @@ separately per actual compute capability and does not reuse a cubin across them.
 for that scenario; both are timed on the same GPU at the same shape and the same
 routing draw. Times are per-call microseconds, lower is better. `gate_up + down` is
 the speedup of the two stages summed, which is what one MoE layer actually pays.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
+  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the three supported scenarios, lower is better">
+</picture>
+
+*Per-call latency from the tables below; each panel annotates the `gate_up + down`
+layer speedup range. Regenerate after re-measuring with
+`python docs/assets/benchmark_chart.py`.*
 
 ### H200 EP8 prefill (`h200_prefill_ep8`)
 
@@ -291,6 +322,12 @@ sweeps come from [docs/shapes.md](docs/shapes.md).
   reading TFLOPS/GB-s.
 - [docs/shapes.md](docs/shapes.md) — Kimi K2.5 EP8 shape derivation, token-count
   scoping, routing distribution, and the gate/up vs down contract.
+
+## Roadmap
+
+- **This release** — the `indexed` interface, for single-node deployments.
+- **Future release** — the `masked` and `contiguous` grouped-GEMM interfaces,
+  the layouts wide-EP, P/D-disaggregated deployments are built around.
 
 ## Provenance and license
 

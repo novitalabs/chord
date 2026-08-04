@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Chord logo">
+  <title>Chord</title>
+  <desc>Three rising bars crowned with note heads: a musical chord read as a performance chart. Dark-theme palette.</desc>
+  <defs>
+    <linearGradient id="chord-spectrum" gradientUnits="userSpaceOnUse" x1="12.5" y1="0" x2="51.5" y2="0">
+      <stop offset="0" stop-color="#8C54F4"/>
+      <stop offset="0.5" stop-color="#A78BFA"/>
+      <stop offset="1" stop-color="#C4B5FD"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#chord-spectrum)">
+    <rect x="12.5" y="39" width="9" height="16" rx="4.5"/>
+    <rect x="27.5" y="28" width="9" height="27" rx="4.5"/>
+    <rect x="42.5" y="17" width="9" height="38" rx="4.5"/>
+    <circle cx="17" cy="35" r="5.5"/>
+    <circle cx="32" cy="24" r="5.5"/>
+    <circle cx="47" cy="13" r="5.5"/>
+  </g>
+</svg>

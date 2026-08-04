@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 96" role="img" aria-label="Chord">
+  <title>Chord</title>
+  <desc>Chord wordmark: three rising note-headed bars next to the name. Light-theme palette.</desc>
+  <defs>
+    <linearGradient id="chord-spectrum" gradientUnits="userSpaceOnUse" x1="12.5" y1="0" x2="51.5" y2="0">
+      <stop offset="0" stop-color="#5B21B6"/>
+      <stop offset="0.5" stop-color="#6D28D9"/>
+      <stop offset="1" stop-color="#8C54F4"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(8, 8) scale(1.25)" fill="url(#chord-spectrum)">
+    <rect x="12.5" y="39" width="9" height="16" rx="4.5"/>
+    <rect x="27.5" y="28" width="9" height="27" rx="4.5"/>
+    <rect x="42.5" y="17" width="9" height="38" rx="4.5"/>
+    <circle cx="17" cy="35" r="5.5"/>
+    <circle cx="32" cy="24" r="5.5"/>
+    <circle cx="47" cy="13" r="5.5"/>
+  </g>
+  <text x="100" y="66" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="50" font-weight="700" fill="#171717">chord</text>
+</svg>
