@@ -1,8 +1,20 @@
+<!-- markdownlint-disable MD001 MD033 MD041 -->
 <p align="center">
-  <img src="docs/assets/logo.svg" alt="Chord logo" width="96">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/novitalabs/chord/main/docs/assets/logo_lockup_dark.svg">
+    <img alt="Chord" src="https://raw.githubusercontent.com/novitalabs/chord/main/docs/assets/logo_lockup.svg" width="240">
+  </picture>
 </p>
 
-# Chord
+<h3 align="center">
+Novita Labs' production W4A16 MoE CUDA kernel — three operands struck as one chord
+</h3>
+
+<p align="center">
+| <a href="#documentation"><b>Documentation</b></a> | <a href="https://novita.ai"><b>Novita AI</b></a> | <a href="https://blogs.novita.ai"><b>Blog</b></a> |
+</p>
+
+---
 
 The `chord` repository publishes the Python package `chord_kernels`: Novita Labs'
 in-house W4A16 MoE CUDA operator — BF16 activation, INT4 weight (stored as
@@ -57,8 +69,8 @@ routing draw. Times are per-call microseconds, lower is better. `gate_up + down`
 the speedup of the two stages summed, which is what one MoE layer actually pays.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
-  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the three supported scenarios, lower is better">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/novitalabs/chord/main/docs/assets/benchmark_chart_dark.svg">
+  <img src="https://raw.githubusercontent.com/novitalabs/chord/main/docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the three supported scenarios, lower is better">
 </picture>
 
 *Per-call latency from the tables below; each panel annotates the `gate_up + down`

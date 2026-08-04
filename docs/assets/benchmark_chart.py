@@ -49,14 +49,16 @@ SCENARIOS = [
 ]
 
 THEMES = {
+    # chord line colors track the novita.ai brand palette (purple-500/400 and
+    # blue-400/200); humming baselines stay neutral gray.
     "light": {
         "suffix": "",
         "text": "#24292f",
         "grid": "#d0d7de",
         "humming_gu": "#6e7781",
         "humming_down": "#8b949e",
-        "chord_gu": "#8b5cf6",
-        "chord_down": "#6366f1",
+        "chord_gu": "#8c54f4",
+        "chord_down": "#18bfff",
     },
     "dark": {
         "suffix": "_dark",
@@ -65,7 +67,7 @@ THEMES = {
         "humming_gu": "#8b949e",
         "humming_down": "#6e7681",
         "chord_gu": "#a78bfa",
-        "chord_down": "#818cf8",
+        "chord_down": "#89dfff",
     },
 }
 
