@@ -25,9 +25,8 @@ keeps only the minimal dependency closure it needs at runtime.
 
 The operator is open-sourced interface by interface. This release publishes the
 `indexed` interface, which fits single-node deployments: its routing metadata
-(sorted ids, expert ids) addresses one node's local experts directly. The
-`masked` and `contiguous` grouped-GEMM interfaces — the layouts wide-EP,
-P/D-disaggregated deployments are built around — follow in a future release.
+(sorted ids, expert ids) addresses one node's local experts directly. See
+[Roadmap](#roadmap) for what follows.
 
 ## Where the name comes from
 
@@ -323,6 +322,12 @@ sweeps come from [docs/shapes.md](docs/shapes.md).
   reading TFLOPS/GB-s.
 - [docs/shapes.md](docs/shapes.md) — Kimi K2.5 EP8 shape derivation, token-count
   scoping, routing distribution, and the gate/up vs down contract.
+
+## Roadmap
+
+- **This release** — the `indexed` interface, for single-node deployments.
+- **Future release** — the `masked` and `contiguous` grouped-GEMM interfaces,
+  the layouts wide-EP, P/D-disaggregated deployments are built around.
 
 ## Provenance and license
 
