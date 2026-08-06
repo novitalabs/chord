@@ -34,7 +34,11 @@ from chord_kernels.operator.packing import (
     pack_w4a16,
 )
 
-IndexedMode = Literal["prefill", "decode"]
+# A profile's serving role.  ``prefill``/``decode`` are the disaggregated roles,
+# each packing its own weight layout; ``mix`` is a single instance serving both
+# phases from one packed weight, so its schedule must hold across the whole
+# routed-M range instead of one phase's bracket.
+IndexedMode = Literal["prefill", "decode", "mix"]
 
 # P/D role bit for SM90 profile selection, mirroring upstream Humming's
 # HUMMING_INT_SM90_DECODE (default OFF -> the prefill/WGMMA path).  A serving
@@ -82,6 +86,10 @@ class IndexedLayerProfile:
     swap_ab: bool
     block_m: int
     compute_capabilities: tuple[tuple[int, int], ...]
+    # Which axis the 8-way shard runs along, since that changes the per-expert
+    # GEMM shape and not just the schedule: EP8 splits the expert list and leaves
+    # N/K whole, TP8 slices ``moe_intermediate``.  Exactly one size is 8.
+    tensor_parallel_size: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -113,17 +121,28 @@ class IndexedLayerProfile:
             )
         if len(set(capabilities)) != len(capabilities):
             raise ValueError("profile compute_capabilities must not contain duplicates")
-        if self.mode not in ("prefill", "decode"):
+        if self.mode not in ("prefill", "decode", "mix"):
             raise ValueError(
-                f"profile mode must be 'prefill' or 'decode', got {self.mode!r}"
+                "profile mode must be 'prefill', 'decode', or 'mix', got "
+                f"{self.mode!r}"
             )
-        if (
-            isinstance(self.expert_parallel_size, bool)
-            or not isinstance(self.expert_parallel_size, int)
-            or self.expert_parallel_size != 8
+        for name, value in (
+            ("expert_parallel_size", self.expert_parallel_size),
+            ("tensor_parallel_size", self.tensor_parallel_size),
         ):
+            if isinstance(value, bool) or not isinstance(value, int) or value not in (1, 8):
+                raise ValueError(
+                    f"profile {name} must be 1 or 8, got {value!r}"
+                )
+        # Rejecting the other two combinations keeps "which axis" unambiguous, so
+        # the shard degree cannot silently disagree with the shape table.
+        if (self.expert_parallel_size, self.tensor_parallel_size) not in ((8, 1), (1, 8)):
             raise ValueError(
-                "indexed W4A16 profiles are published only for expert_parallel_size=8"
+                "indexed W4A16 profiles are published for 8-way sharding along "
+                "exactly one axis (expert_parallel_size=8 with "
+                "tensor_parallel_size=1, or the reverse), got "
+                f"expert_parallel_size={self.expert_parallel_size}, "
+                f"tensor_parallel_size={self.tensor_parallel_size}"
             )
         if self.layout not in ("mma", "wgmma"):
             raise ValueError(
@@ -148,6 +167,11 @@ class IndexedLayerProfile:
     @property
     def role(self) -> IndexedMode:
         return self.mode
+
+    @property
+    def shard_axis(self) -> str:
+        """Which axis this profile shards over 8 GPUs, ``"ep"`` or ``"tp"``."""
+        return "ep" if self.expert_parallel_size == 8 else "tp"
 
     def validate_device(self, device: torch.device) -> None:
         device = torch.device(device)
@@ -342,6 +366,18 @@ _PROFILES: dict[str, IndexedLayerProfile] = {
         block_m=16,
         compute_capabilities=((9, 0),),
     ),
+    # TP8 targets single-instance ("mix") deployment, so it carries no P/D role.
+    "h200_tp8": IndexedLayerProfile(
+        name="h200_tp8",
+        device_major=9,
+        mode="mix",
+        expert_parallel_size=1,
+        tensor_parallel_size=8,
+        layout="wgmma",
+        swap_ab=False,
+        block_m=16,
+        compute_capabilities=((9, 0),),
+    ),
     "h200_decode_ep8": IndexedLayerProfile(
         name="h200_decode_ep8",
         device_major=9,
@@ -368,6 +404,7 @@ _PROFILES: dict[str, IndexedLayerProfile] = {
 # keeping the actual values immutable.  The dictionary is intentionally a copy so
 # callers cannot mutate the module's internal lookup table.
 H200_PREFILL_EP8 = _PROFILES["h200_prefill_ep8"]
+H200_TP8 = _PROFILES["h200_tp8"]
 H200_DECODE_EP8 = _PROFILES["h200_decode_ep8"]
 BLACKWELL_DECODE_EP8 = _PROFILES["blackwell_decode_ep8"]
 INDEXED_PROFILES = dict(_PROFILES)
@@ -469,6 +506,53 @@ def _h200_prefill_block_m(valid_shape_m: int, num_experts: int, shape_k: int) ->
     return 128
 
 
+def _h200_tp8_block_m(valid_shape_m: int, num_experts: int) -> int:
+    """Size TP8 block-M from routed tokens per expert.
+
+    TP8 slices ``moe_intermediate`` instead of the expert list, so both
+    projections are narrow in the dimension that decides how many n-tiles a
+    single m-block covers: gate/up is ``N=512`` and down is ``K=256``.  With
+    ``N / block_n`` as low as 2 the grid is not kept full by output width the way
+    the EP8 shapes are, so total block count and occupancy dominate instead of
+    per-expert M-padding, and the EP8 padding model would over-grow block-M into
+    the register cliff.
+
+    The windows are therefore flatter than EP8's: below ``tok_e`` 128 one block
+    per expert still pays (block-M sized to the padded rows), then a 96 window to
+    ``tok_e`` 190, then 128.  The whole 96..144 band beats the block-count argmin
+    the EP8 path falls back to, because register pressure and occupancy — not
+    block count — set the limit here.
+
+    Below ``tok_e`` 80 the model would undershoot for the same reason it does on
+    EP8, so block-M comes from minimizing total block count instead.
+    """
+
+    tokens_per_expert = valid_shape_m / max(num_experts, 1)
+    if tokens_per_expert < 80:
+        return _min_block_count_block_m(valid_shape_m, num_experts)
+    if tokens_per_expert <= 128:
+        # 1.1x covers the per-expert overshoot a random router leaves behind.
+        return round(tokens_per_expert * 1.1 / 8) * 8
+    if tokens_per_expert <= 190:
+        return 96
+    return 128
+
+
+def _h200_tp8_use_stream_k(valid_shape_m: int, shape_k: int) -> bool:
+    """Decide whether TP8 splits the K dimension across CTAs.
+
+    The two projections cross in opposite directions at ``routed_m`` 65536.  Down
+    (``K=256``) has only 4 K-blocks to split, so it stays one-pass until the
+    workload is imbalanced enough for the load balancing to repay the locks.
+    Gate/up (``K=7168``) is the mirror image: the split pays until the M*N tiles
+    fill the grid on their own, after which it is pure overhead.
+    """
+
+    if shape_k <= 512:
+        return valid_shape_m > 65536
+    return valid_shape_m < 65536
+
+
 def _h200_prefill_use_stream_k(valid_shape_m: int, shape_n: int, shape_k: int) -> bool:
     """Decide whether prefill splits the K dimension across CTAs.
 
@@ -534,6 +618,38 @@ def _select_indexed_kernel_config(
         return _indexed_config(
             meta, block_m=block_m, block_n=256, block_k=64,
             num_ctas_per_sm=num_ctas_per_sm,
+            use_stream_k=use_stream_k,
+        )
+
+    if profile == "h200_tp8" and (n, k) in {
+        (512, 7168),
+        (7168, 256),
+    }:
+        block_m = _h200_tp8_block_m(m, experts)
+        use_stream_k = _h200_tp8_use_stream_k(m, k)
+        # A short m-block leaves the mainloop too little work per tile, so block-K
+        # compensates and relaxes as block-M grows.  down starts one notch
+        # shallower throughout because K=256 has less depth to spend.
+        if k <= 512:
+            block_k = 128 if block_m <= 32 else 64
+            # down (N=7168 K=256).  At the generic block_n=256 the WGMMA
+            # accumulator plus B-smem are too large to fit two CTAs on an SM,
+            # pinning occupancy at 1 CTA/SM, and the short K leaves the mainloop
+            # latency-bound rather than compute-bound.  Halving block_n to 128
+            # halves both and unlocks 2 CTAs/SM, hiding the cp.async + dequant
+            # latency.
+            return _indexed_config(
+                meta, block_m=block_m, block_n=128, block_k=block_k,
+                num_ctas_per_sm=2,
+                use_stream_k=use_stream_k,
+            )
+        # gate/up (N=512 K=7168).  A 128-wide tile already covers this narrow
+        # output in 4 n-blocks, so the wide 256 tile only pays once block-M
+        # passes 64 and the deep-K mainloop has enough rows per tile to feed it.
+        block_k = 256 if block_m <= 32 else (128 if block_m <= 64 else 64)
+        block_n = 128 if block_m <= 64 else 256
+        return _indexed_config(
+            meta, block_m=block_m, block_n=block_n, block_k=block_k,
             use_stream_k=use_stream_k,
         )
 
@@ -754,8 +870,10 @@ def _resolve_tuning_config(
 def _normalise_mode(mode: str | None) -> IndexedMode | None:
     if mode is None:
         return None
-    if mode not in ("prefill", "decode"):
-        raise ValueError(f"mode must be 'prefill' or 'decode', got {mode!r}")
+    if mode not in ("prefill", "decode", "mix"):
+        raise ValueError(
+            f"mode must be 'prefill', 'decode', or 'mix', got {mode!r}"
+        )
     return mode  # type: ignore[return-value]
 
 
@@ -765,7 +883,8 @@ def select_indexed_profile(
     mode: IndexedMode | None = None,
     role: IndexedMode | None = None,
     device: torch.device | None = None,
-    expert_parallel_size: int = 8,
+    expert_parallel_size: int | None = None,
+    tensor_parallel_size: int | None = None,
 ) -> IndexedLayerProfile:
     """Resolve an explicit profile or select one from device capability.
 
@@ -775,6 +894,11 @@ def select_indexed_profile(
     SM90 the P/D role comes from an explicit ``mode``/``role`` argument, else
     ``CHORD_SM90_DECODE``, else the prefill default; Blackwell resolves to its
     only published profile (decode) regardless of the variable.
+
+    ``auto`` never resolves to the TP8 profile: the shard axis is not discoverable
+    from the device, and guessing it would pack the weight for the wrong shapes, so
+    TP8 must be requested by name or with ``tensor_parallel_size=8``.  Being a
+    single-instance ``mix`` profile, it also ignores the P/D role bit.
     """
     selected_mode = _normalise_mode(mode)
     if role is not None:
@@ -811,8 +935,16 @@ def select_indexed_profile(
                 # SM90 has both roles.  An explicit mode wins; otherwise the
                 # CHORD_SM90_DECODE bit decides, defaulting to prefill/WGMMA
                 # exactly like upstream HUMMING_INT_SM90_DECODE unset/0.
-                sm90_role = selected_mode or indexed_mode_from_env() or "prefill"
-                name = f"h200_{sm90_role}_ep8"
+                # The shard axis cannot be detected, so it defaults to EP8 unless
+                # the caller states tensor_parallel_size=8.  TP8 is a mix profile,
+                # so CHORD_SM90_DECODE does not apply to it.
+                if tensor_parallel_size == 8:
+                    name = "h200_tp8"
+                else:
+                    sm90_role = (
+                        selected_mode or indexed_mode_from_env() or "prefill"
+                    )
+                    name = f"h200_{sm90_role}_ep8"
             else:
                 raise RuntimeError(
                     "no indexed W4A16 profile for compute capability "
@@ -831,19 +963,41 @@ def select_indexed_profile(
             f"profile {resolved.name!r} is for {resolved.mode}, not {selected_mode}"
         )
 
-    if (
+    # Both sizes default to None rather than 8, so naming a profile is enough; a
+    # stated value is checked against the one the profile carries.
+    if expert_parallel_size is not None and (
         isinstance(expert_parallel_size, bool)
         or not isinstance(expert_parallel_size, int)
-        or expert_parallel_size != 8
+        or expert_parallel_size not in (1, 8)
     ):
         raise ValueError(
-            "the published indexed W4A16 profiles are for expert_parallel_size=8, "
-            f"got {expert_parallel_size!r}"
+            "expert_parallel_size must be 8 (EP8 profiles) or 1 (the TP8 "
+            f"profile), got {expert_parallel_size!r}"
         )
-    if resolved.expert_parallel_size != expert_parallel_size:
+    if tensor_parallel_size is not None and (
+        isinstance(tensor_parallel_size, bool)
+        or not isinstance(tensor_parallel_size, int)
+        or tensor_parallel_size not in (1, 8)
+    ):
+        raise ValueError(
+            "tensor_parallel_size must be 8 (the TP8 profile) or 1 (EP8 "
+            f"profiles), got {tensor_parallel_size!r}"
+        )
+    if (
+        expert_parallel_size is not None
+        and resolved.expert_parallel_size != expert_parallel_size
+    ):
         raise ValueError(
             f"profile {resolved.name!r} expects expert_parallel_size="
             f"{resolved.expert_parallel_size}, got {expert_parallel_size}"
+        )
+    if (
+        tensor_parallel_size is not None
+        and resolved.tensor_parallel_size != tensor_parallel_size
+    ):
+        raise ValueError(
+            f"profile {resolved.name!r} expects tensor_parallel_size="
+            f"{resolved.tensor_parallel_size}, got {tensor_parallel_size}"
         )
     if device is not None and torch.device(device).type == "cuda":
         resolved.validate_device(torch.device(device))
@@ -922,7 +1076,8 @@ class IndexedW4A16Layer(torch.nn.Module):
         profile: str | IndexedLayerProfile | None = "auto",
         mode: IndexedMode | None = None,
         role: IndexedMode | None = None,
-        expert_parallel_size: int = 8,
+        expert_parallel_size: int | None = None,
+        tensor_parallel_size: int | None = None,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str | None = None,
     ) -> None:
@@ -958,6 +1113,7 @@ class IndexedW4A16Layer(torch.nn.Module):
         self.shape_k = shape_k
         self.num_experts = num_experts
         self.expert_parallel_size = expert_parallel_size
+        self.tensor_parallel_size = tensor_parallel_size
         self.torch_dtype = torch_dtype
         self._profile_spec = profile
         # Only an explicit mode/role is recorded; an auto layer leaves the role
@@ -976,12 +1132,14 @@ class IndexedW4A16Layer(torch.nn.Module):
                 profile,
                 mode=self._mode,
                 expert_parallel_size=expert_parallel_size,
+                tensor_parallel_size=tensor_parallel_size,
             )
         elif profile not in (None, "auto"):
             self.profile = select_indexed_profile(
                 profile,
                 mode=None if mode is None and role is None else self._mode,
                 expert_parallel_size=expert_parallel_size,
+                tensor_parallel_size=tensor_parallel_size,
             )
         else:
             self.profile = None
@@ -1025,16 +1183,25 @@ class IndexedW4A16Layer(torch.nn.Module):
                 # the prefill default.  An auto layer moved to Blackwell must
                 # be recreated with the explicit Blackwell profile so weights
                 # are never silently repacked for another layout.
-                role = self._mode or indexed_mode_from_env() or "prefill"
+                # A TP8 layer keeps the TP8 provisional layout so the CPU-side
+                # metadata matches the table it will resolve to; being a mix
+                # profile, it takes no P/D role.
+                if self.tensor_parallel_size == 8:
+                    provisional = "h200_tp8"
+                else:
+                    role = self._mode or indexed_mode_from_env() or "prefill"
+                    provisional = f"h200_{role}_ep8"
                 return select_indexed_profile(
-                    f"h200_{role}_ep8",
+                    provisional,
                     expert_parallel_size=self.expert_parallel_size,
+                    tensor_parallel_size=self.tensor_parallel_size,
                 )
             self.profile = select_indexed_profile(
                 "auto",
                 mode=self._mode,
                 device=self.weight.device,
                 expert_parallel_size=self.expert_parallel_size,
+                tensor_parallel_size=self.tensor_parallel_size,
             )
         return self.profile
 
@@ -1878,6 +2045,7 @@ __all__ = [
     "BLACKWELL_DECODE_EP8",
     "H200_DECODE_EP8",
     "H200_PREFILL_EP8",
+    "H200_TP8",
     "INDEXED_PROFILES",
     "IndexedKernelConfig",
     "IndexedLayerMeta",

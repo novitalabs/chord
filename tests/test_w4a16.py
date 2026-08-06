@@ -321,13 +321,20 @@ def _group_title(case: IndexedCase) -> str:
 
     if case.is_prefill:
         tokens = (
-            "tokens = num_tokens_total per chunk, across the whole EP8 system"
+            "tokens = num_tokens_total per chunk, across the whole 8-GPU system"
         )
     else:
         tokens = (
             "tokens = num_tokens per GPU per step = bs_per_gpu * (mtp + 1), DP8"
         )
-    return f"{case.profile} -- Kimi K2.5 EP8 (384 experts / 8 GPUs), {tokens}"
+    if case.is_tensor_parallel:
+        # TP8 keeps every expert on every rank and slices moe_intermediate, so
+        # the same token count produces 8x the local routed rows EP8 does.  It is
+        # a single-instance (mix) deployment, so it carries no P/D role.
+        shard = "TP8 mix (384 experts on each of 8 GPUs, moe_intermediate/8)"
+    else:
+        shard = "EP8 (384 experts / 8 GPUs)"
+    return f"{case.profile} -- Kimi K2.5 {shard}, {tokens}"
 
 
 def _run_case_table(
@@ -590,6 +597,55 @@ def test_prefill_routed_rows_match_system_tokens() -> None:
     assert [case.routed_m for case in prefill] == list(PREFILL_SYSTEM_TOKENS)
 
 
+def test_tp8_routed_rows_are_eight_times_ep8() -> None:
+    """TP8: every rank holds a slice of all 384 experts, so every route is local.
+
+    At the same num_tokens_total that is 8x the EP8 row count, which is what pushes
+    the table past EP8's largest bracket.
+    """
+
+    tp8 = [
+        case
+        for case in PERFORMANCE_CASES
+        if case.profile == "h200_tp8" and case.projection == "gate_up"
+    ]
+    assert [case.token_count for case in tp8] == list(PREFILL_SYSTEM_TOKENS)
+    assert [case.routed_m for case in tp8] == [
+        tokens * 8 for tokens in PREFILL_SYSTEM_TOKENS
+    ]
+    # The largest case must exceed the EP8 maximum by the full shard factor.
+    assert max(case.routed_m for case in tp8) == 131072
+
+
+def test_tp8_shapes_slice_the_intermediate_dimension() -> None:
+    """TP8 narrows gate/up's N and down's K by 8, keeping all 384 experts."""
+
+    tp8 = [case for case in PERFORMANCE_CASES if case.profile == "h200_tp8"]
+    assert tp8, "the TP8 profile declares no cases"
+    gate_up = {(case.n, case.k) for case in tp8 if case.projection == "gate_up"}
+    down = {(case.n, case.k) for case in tp8 if case.projection == "down"}
+    # gate/up loses output width (2 * 2048/8), down loses K depth (2048/8);
+    # hidden_size 7168 is untouched in both.
+    assert gate_up == {(512, 7168)}
+    assert down == {(7168, 256)}
+    assert {case.num_experts for case in tp8} == {384}
+    assert {case.top_k for case in tp8} == {8}
+    assert all(case.is_tensor_parallel for case in tp8)
+
+
+def test_tp8_and_ep8_sweep_the_same_token_counts() -> None:
+    """Both 8-GPU shardings are quoted at the same serving load."""
+
+    def tokens(profile: str) -> list[int]:
+        return [
+            case.token_count
+            for case in PERFORMANCE_CASES
+            if case.profile == profile and case.projection == "gate_up"
+        ]
+
+    assert tokens("h200_tp8") == tokens("h200_prefill_ep8")
+
+
 def test_decode_tokens_are_already_per_gpu() -> None:
     """EP8 decode runs with DP8, so the declared token counts are per GPU."""
 
@@ -628,6 +684,139 @@ def test_prefill_block_m_follows_tokens_per_expert(
     from chord_kernels.operator.layer import _h200_prefill_block_m
 
     assert _h200_prefill_block_m(routed_m, 48, shape_k) == expected
+
+
+@pytest.mark.parametrize(
+    "routed_m,expected",
+    [
+        # tok_e < 80 falls back to the block-count argmin, same as EP8.
+        (8192, 40),
+        (16384, 72),
+        (30719, 120),
+        # tok_e >= 80: one block per expert while tok_e <= 128 ...
+        (30720, 88),
+        (32768, 96),
+        (49152, 144),
+        # ... then a flat 96 window to tok_e 190 ...
+        (49153, 96),
+        (65536, 96),
+        (72960, 96),
+        # ... then 128 for good.
+        (72961, 128),
+        (131072, 128),
+    ],
+)
+def test_tp8_block_m_follows_tokens_per_expert(
+    routed_m: int, expected: int
+) -> None:
+    """TP8 block-M uses the flatter TP-scale windows, not EP8's padding model.
+
+    Both TP8 projections are narrow in whichever dimension fills the grid, so
+    block count and occupancy dominate rather than per-expert M-padding: the
+    96..144 band beats the taller tiles EP8 grows into.
+    """
+
+    from chord_kernels.operator.layer import _h200_tp8_block_m
+
+    assert _h200_tp8_block_m(routed_m, 384) == expected
+
+
+@pytest.mark.parametrize(
+    "shape_k,routed_m,expected",
+    [
+        # down (K=256): only 4 K-blocks to split, so one-pass until the workload
+        # is imbalanced enough that load balancing repays the locks.
+        (256, 8192, False),
+        (256, 65536, False),
+        (256, 65537, True),
+        (256, 131072, True),
+        # gate/up (K=7168): the mirror image -- split until the M*N tiles fill
+        # the grid on their own at 65536.
+        (7168, 8192, True),
+        (7168, 65535, True),
+        (7168, 65536, False),
+        (7168, 131072, False),
+    ],
+)
+def test_tp8_stream_k_gate(
+    shape_k: int, routed_m: int, expected: bool
+) -> None:
+    """The two TP8 projections cross over in opposite directions at 65536."""
+
+    from chord_kernels.operator.layer import _h200_tp8_use_stream_k
+
+    assert _h200_tp8_use_stream_k(routed_m, shape_k) is expected
+
+
+@pytest.mark.parametrize(
+    "shape_n,shape_k,routed_m,block_shape,num_ctas_per_sm,use_stream_k",
+    [
+        # gate/up: block-K compensates for the narrow N while block-M is short,
+        # then the wide 256 tile takes over past block-M 64.
+        (512, 7168, 8192, (40, 128, 128), 1, True),
+        (512, 7168, 16384, (72, 256, 64), 1, True),
+        (512, 7168, 32768, (96, 256, 64), 1, True),
+        (512, 7168, 65536, (96, 256, 64), 1, False),
+        (512, 7168, 131072, (128, 256, 64), 1, False),
+        # down: block-N halved to 128 unlocks 2 CTAs/SM at every size, and the
+        # short K keeps block-K one notch shallower than gate/up's.
+        (7168, 256, 8192, (40, 128, 64), 2, False),
+        (7168, 256, 16384, (72, 128, 64), 2, False),
+        (7168, 256, 32768, (96, 128, 64), 2, False),
+        (7168, 256, 65536, (96, 128, 64), 2, False),
+        (7168, 256, 131072, (128, 128, 64), 2, True),
+    ],
+)
+def test_tp8_configs_at_benchmark_points(
+    shape_n: int,
+    shape_k: int,
+    routed_m: int,
+    block_shape: tuple[int, int, int],
+    num_ctas_per_sm: int,
+    use_stream_k: bool,
+) -> None:
+    """Pin the schedule behind the TP8 table in docs/performance.md.
+
+    ``num_tokens_total`` 1024..16384 (routed_m 8192..131072) for both projections,
+    so a change here is a change to published numbers.
+    """
+
+    from chord_kernels.operator import IndexedLayerMeta
+    from chord_kernels.operator.layer import _PROFILES
+
+    meta = IndexedLayerMeta(
+        shape_n=shape_n,
+        shape_k=shape_k,
+        num_experts=384,
+        profile=_PROFILES["h200_tp8"],
+    )
+    config = meta.kernel_config(routed_m)
+    assert config.block_shape == block_shape
+    assert config.warp_shape == (block_shape[0], 32, 64)
+    assert config.num_ctas_per_sm == num_ctas_per_sm
+    assert config.use_stream_k is use_stream_k
+    # TP8 is a WGMMA profile, so the swap-AB decode schedule never applies.
+    assert config.swap_ab is False
+
+
+def test_tp8_down_never_drops_to_one_cta() -> None:
+    """Block-N 128 is what buys down its 2 CTAs/SM, so it must hold everywhere.
+
+    At block-N 256 the accumulator plus B-smem pin occupancy at 1 CTA/SM, which is
+    the regression this checks for across the sweep, not just the table's points.
+    """
+
+    from chord_kernels.operator import IndexedLayerMeta
+    from chord_kernels.operator.layer import _PROFILES
+
+    meta = IndexedLayerMeta(
+        shape_n=7168, shape_k=256, num_experts=384,
+        profile=_PROFILES["h200_tp8"],
+    )
+    for routed_m in (1, 512, 8192, 32768, 65536, 131072, 262144):
+        config = meta.kernel_config(routed_m)
+        assert config.block_n == 128, routed_m
+        assert config.num_ctas_per_sm == 2, routed_m
 
 
 def test_prefill_block_m_is_deterministic() -> None:
@@ -740,9 +929,18 @@ def test_tuning_rows_cover_all_routed_m() -> None:
     from chord_kernels.operator import IndexedLayerMeta
     from chord_kernels.operator.layer import _PROFILES, _indexed_tuning_rows
 
-    for profile_name in ("h200_prefill_ep8", "h200_decode_ep8", "blackwell_decode_ep8"):
+    # Each profile is swept at one of its own tuned shapes: TP8 narrows gate/up's
+    # N to 512 and holds all 384 experts, so the EP8 shape would only exercise
+    # the generic fallback and never reach the TP8 rows.
+    sweeps = (
+        ("h200_prefill_ep8", 4096, 7168, 48),
+        ("h200_tp8", 512, 7168, 384),
+        ("h200_decode_ep8", 4096, 7168, 48),
+        ("blackwell_decode_ep8", 4096, 7168, 48),
+    )
+    for profile_name, shape_n, shape_k, num_experts in sweeps:
         meta = IndexedLayerMeta(
-            shape_n=4096, shape_k=7168, num_experts=48,
+            shape_n=shape_n, shape_k=shape_k, num_experts=num_experts,
             profile=_PROFILES[profile_name],
         )
         rows = _indexed_tuning_rows(meta)

@@ -9,14 +9,17 @@ This page records what changed and why; the mechanics live in
 `chord_kernels/operator/layer.py`.
 
 Measurements below are BF16 activation x INT4 weight, group-32 scale, indexed
-MoE routing, Kimi K2.5 EP8 shapes (gate/up `N=4096 K=7168`, down `N=7168
-K=2048`, 48 local experts, `top_k=8`).  H200 numbers come from H200 SXM and
+MoE routing, on the Kimi K2.5 shapes for the relevant shard axis: EP8 splits the
+expert list (gate/up `N=4096 K=7168`, down `N=7168 K=2048`, 48 local experts),
+while TP8 slices `moe_intermediate` (gate/up `N=512 K=7168`, down `N=7168 K=256`,
+all 384 experts local); `top_k=8` throughout.  H200 numbers come from H200 SXM and
 Blackwell numbers from B300 SXM6; every profile is compiled, run and timed on
 each supported part.
 
 | Scenario | Baseline behavior | This repository |
 | --- | --- | --- |
 | H200 EP8 indexed prefill | WGMMA, per-instruction commit+wait, generic block-M argmin, stream-K always on | WGMMA with batched `wait<1>` pipelining, tok/E block-M model, 2-CTAs/SM window, shape-aware stream-K gate, EP8-tuned tiles |
+| H200 TP8 indexed, single-instance mix | WGMMA, generic block-M argmin, stream-K always on | Same WGMMA improvements, plus the TP-scale block-M windows, down's block-N halving for 2 CTAs/SM, and per-projection stream-K crossovers |
 | H200 EP8 indexed decode | WGMMA (no decode-specific path) | MMA `swap-AB` decode kernel: 4 CTAs/SM, semi-static token-tile schedule, fused dequant+scale |
 | Blackwell (B200/B300) EP8 indexed decode | Default config strategy only (no SM100 heuristics) | Same MMA `swap-AB` kernel with EP8-tuned tile tables (stream-K on deep-K gate/up), `sm_100a`/`sm_103a` JIT targets |
 
@@ -61,6 +64,40 @@ gate/up keeps the narrow-deep `128x256` tile, the wide down projection uses
 `256x128`. For gate/up block-M 40..64 the wide `256x64` tile plus the 2-CTA
 window replaces the baseline `128x128` choice, measured 12-15% faster at
 routed 863..2073.
+
+## H200 TP8 indexed, single-instance mix (`h200_tp8`, WGMMA)
+
+TP8 runs the same WGMMA kernel and inherits the kernel-level changes above, which
+are shape independent. What differs is the schedule: slicing `moe_intermediate`
+narrows exactly the dimension the EP8 tables assume is wide. Being a single-instance
+(`mix`) profile, one packed weight also has to cover both phases. Measurements are
+H200 SXM over `num_tokens_total` 1024..16384 (`routed_m` 8192..131072).
+
+**TP-scale block-M windows.** With as few as 2 n-blocks per m-block, grid fill and
+occupancy replace per-expert M-padding as the binding constraint, so the EP8 padding
+model would over-grow block-M into the register cliff without a full grid to pay for
+it. TP8 uses flatter windows instead — one block per expert to `tok_e` 128, then 96
+to 190, then 128 — and the whole 96..144 band beats the block-count argmin. Below
+`tok_e` 80 the argmin is kept, sampling the identical seeded routing.
+
+**down block-N halving for 2 CTAs/SM.** At the generic `block_n=256` the WGMMA
+accumulator plus B-smem pin down's occupancy at 1 CTA/SM, and with `K=256` giving
+only 4 K-blocks the mainloop is short and latency-bound rather than compute-bound.
+Halving to `block_n=128` halves both and unlocks 2 CTAs/SM, hiding the cp.async +
+dequant latency. This is scoped to short K so the compute-bound gate/up, where
+halving block-N regresses, is untouched.
+
+**Per-projection stream-K crossovers.** The two projections flip in opposite
+directions at `routed_m` 65536: deep-K gate/up keeps the split until the M*N tiles
+fill the grid on their own and then drops it, while short-K down starts one-pass —
+4 K-blocks give the split almost nothing to work with — and only enables it past
+65536, where the workload is imbalanced enough for load balancing to repay the
+locks.
+
+Against the public baseline this measures 1.09-1.19x on gate/up and 1.27-1.51x on
+down, for 1.17-1.33x per layer ([performance.md](performance.md)); the block-N
+halving is why down gains most. The table also replaces the generic fallback these
+shapes previously landed on.
 
 ## H200 EP8 indexed decode (`h200_decode_ep8`, MMA swap-AB)
 

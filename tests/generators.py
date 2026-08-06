@@ -67,24 +67,45 @@ class IndexedCase:
         return 1 if self.projection == "down" else self.top_k
 
     @property
+    def is_tensor_parallel(self) -> bool:
+        """True when the profile shards ``moe_intermediate`` instead of experts."""
+
+        return "_tp8" in self.profile
+
+    @property
+    def is_decode(self) -> bool:
+        return "decode" in self.profile
+
+    @property
     def is_prefill(self) -> bool:
-        return "prefill" in self.profile
+        """True when the sweep is a whole-system chunk rather than a decode step.
+
+        TP8 counts as prefill-shaped here even though its profile is ``mix``.
+        """
+
+        return not self.is_decode
 
     @property
     def token_count(self) -> int:
         """Token count in the unit this phase is naturally specified in.
 
-        Prefill is quoted for the whole EP8 system, because a chunk is split
-        across all ranks; decode runs with DP8, so its count is already per GPU.
-        Both map onto the same ``m`` the kernel sees, but reporting the raw ``m``
-        for prefill invites reading a system-wide number as a per-GPU one.
+        Prefill-shaped sweeps are quoted for the whole system, because a chunk is
+        split across all ranks; decode runs with DP8, so its count is already per
+        GPU.  Reporting the raw ``m`` for prefill would invite reading a
+        system-wide number as a per-GPU one.
+
+        The two shard axes recover it differently: under EP8 a rank owns 48 of the
+        384 experts, so exactly ``routed_m == T`` routes land on it, while under
+        TP8 every route is local and the count is ``routed_m / top_k``, i.e. ``m``.
         """
 
-        return self.routed_m if self.is_prefill else self.m
+        if self.is_decode or self.is_tensor_parallel:
+            return self.m
+        return self.routed_m
 
     @property
     def token_count_label(self) -> str:
-        return "tokens_total" if self.is_prefill else "tokens/GPU"
+        return "tokens/GPU" if self.is_decode else "tokens_total"
 
     @property
     def label(self) -> str:
@@ -408,6 +429,19 @@ _EP8_GATE_UP = {"n": 4096, "k": 7168}
 _EP8_DOWN = {"n": 7168, "k": 2048}
 _EP8 = {"num_experts": 48, "top_k": 8}
 
+# TP8 shards the same model over the same 8 GPUs, but along the other axis.
+# Instead of splitting the expert list, every rank keeps all 384 routed experts
+# and slices `moe_intermediate` 2048 / 8 = 256 ways:
+#
+#     gate/up   N = 2 * (moe_intermediate / 8) = 512    K = hidden_size          = 7168
+#     down      N = hidden_size               = 7168    K = moe_intermediate / 8 = 256
+#
+# So TP8 narrows exactly the dimension EP8 leaves whole: gate/up loses output
+# width and down loses K depth.  The expert count is the full 384 rather than 48.
+_TP8_GATE_UP = {"n": 512, "k": 7168}
+_TP8_DOWN = {"n": 7168, "k": 256}
+_TP8 = {"num_experts": 384, "top_k": 8}
+
 # Chunked-prefill sizes for the whole EP8 system, not per GPU: serving splits a
 # long prompt into chunks, and 16384 is the largest chunk in use ("chunked 16k").
 #
@@ -433,6 +467,9 @@ def _profile_cases(
     routed_rows: tuple[int, ...],
     *,
     seed_base: int,
+    shard: dict | None = None,
+    gate_up_shape: dict | None = None,
+    down_shape: dict | None = None,
 ) -> tuple[IndexedCase, ...]:
     """Sweep local routed row counts for one profile, gate/up first then down.
 
@@ -443,12 +480,19 @@ def _profile_cases(
 
     The two projections stay in separate runs of rows so each one's scaling
     across the sweep can be read down a single column.
+
+    ``shard``/``gate_up_shape``/``down_shape`` default to the EP8 expert count and
+    shapes; the TP8 profile passes its own, which keeps this sweep the single
+    place a token count turns into cases regardless of the shard axis.
     """
 
-    top_k = _EP8["top_k"]
+    shard = _EP8 if shard is None else shard
+    gate_up_shape = _EP8_GATE_UP if gate_up_shape is None else gate_up_shape
+    down_shape = _EP8_DOWN if down_shape is None else down_shape
+    top_k = shard["top_k"]
     gate_up = [
         IndexedCase(
-            profile, m=routed // top_k, seed=seed_base + index, **_EP8, **_EP8_GATE_UP
+            profile, m=routed // top_k, seed=seed_base + index, **shard, **gate_up_shape
         )
         for index, routed in enumerate(routed_rows)
     ]
@@ -458,8 +502,8 @@ def _profile_cases(
             m=routed // top_k,
             seed=seed_base + len(routed_rows) + index,
             projection="down",
-            **_EP8,
-            **_EP8_DOWN,
+            **shard,
+            **down_shape,
         )
         for index, routed in enumerate(routed_rows)
     ]
@@ -475,9 +519,26 @@ _DECODE_ROUTED_ROWS = tuple(
     tokens * _EP8["top_k"] for tokens in DECODE_TOKENS_PER_GPU
 )
 
+# TP8 sweeps the same token counts as EP8 prefill, to compare the two shard axes
+# at equal serving load, but nothing is split by expert here: every rank holds a
+# slice of all 384 experts, so every route is local and routed_m is 8x the EP8
+# figure at the same token count (16384 tokens -> 131072 rows).  That is why the
+# tuning table has to reach far past EP8's 16384-row maximum.
+_TP8_ROUTED_ROWS = tuple(
+    tokens * _TP8["top_k"] for tokens in PREFILL_SYSTEM_TOKENS
+)
+
 
 PERFORMANCE_CASES: tuple[IndexedCase, ...] = (
     *_profile_cases("h200_prefill_ep8", _PREFILL_ROUTED_ROWS, seed_base=20260900),
+    *_profile_cases(
+        "h200_tp8",
+        _TP8_ROUTED_ROWS,
+        seed_base=20260920,
+        shard=_TP8,
+        gate_up_shape=_TP8_GATE_UP,
+        down_shape=_TP8_DOWN,
+    ),
     *_profile_cases("h200_decode_ep8", _DECODE_ROUTED_ROWS, seed_base=20260940),
     *_profile_cases("blackwell_decode_ep8", _DECODE_ROUTED_ROWS, seed_base=20260980),
 )
@@ -485,6 +546,7 @@ PERFORMANCE_CASES: tuple[IndexedCase, ...] = (
 
 _PROFILE_CAPABILITY = {
     "h200_prefill_ep8": {(9, 0)},
+    "h200_tp8": {(9, 0)},
     "h200_decode_ep8": {(9, 0)},
     "blackwell_decode_ep8": {(10, 0), (10, 3)},
 }

@@ -127,7 +127,34 @@ This is a single-projection weight and operator adapter, not a complete MoE plug
 with a router, activation and `w13+w2` lifecycle. It registers no vLLM quantization
 method and owns no vLLM router: the host framework still converts its own weight
 format and routing metadata to the contract above, and selects
-`profile="h200_prefill_ep8"`, `"h200_decode_ep8"` or `"blackwell_decode_ep8"`.
+`profile="h200_prefill_ep8"`, `"h200_tp8"`, `"h200_decode_ep8"` or
+`"blackwell_decode_ep8"`.
+
+### Selecting the shard axis
+
+The four profiles cover two different 8-way shardings. EP8 splits the 384 routed
+experts across ranks (48 each) and leaves every expert whole; TP8 keeps all 384 on
+every rank and slices `moe_intermediate`, narrowing gate/up to `N=512` and down to
+`K=256`. The per-expert shapes and tuning tables therefore differ — see
+[shapes.md](shapes.md).
+
+Unlike the P/D role, the shard axis is not discoverable at runtime, so
+`profile="auto"` never resolves to TP8: guessing would pack the weight against the
+wrong table. Ask for it by name, or pass `tensor_parallel_size=8`:
+
+```python
+layer = IndexedW4A16Layer(
+    num_experts=384,
+    shape_n=512,
+    shape_k=7168,
+    profile="h200_tp8",
+)
+```
+
+The axes also imply different deployments. The EP8 profiles are disaggregated P/D
+roles, each packing its own layout; TP8 targets a single instance (`mode="mix"`)
+serving both phases from one packed weight, so it takes no role and ignores
+`CHORD_SM90_DECODE`.
 
 ### Selecting the P/D role per serving instance
 
@@ -147,6 +174,8 @@ the profile is resolved and must be set before model load; it cannot switch an
 already packed layer at runtime. Blackwell publishes only the decode profile,
 so `profile="auto"` resolves to `blackwell_decode_ep8` there and the variable
 is ignored.
+
+The table covers the EP8 axis only; `h200_tp8` takes no role, as above.
 
 ## Tests and benchmarks
 

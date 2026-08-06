@@ -9,6 +9,7 @@ tables or the kernel; day-to-day use does not need it.
 | Profile | Tensor core instruction | Weight layout |
 | --- | --- | --- |
 | `h200_prefill_ep8` | WGMMA (`wgmma.mma_async`) | `wgmma` |
+| `h200_tp8` | WGMMA (`wgmma.mma_async`) | `wgmma` |
 | `h200_decode_ep8` | MMA (`mma.sync`) | `mma` |
 | `blackwell_decode_ep8` | MMA (`mma.sync`) | `mma` |
 
@@ -52,13 +53,24 @@ is rejected explicitly.
 | --- | --- | --- | --- |
 | EP8 gate/up | 4096 | 7168 | Tuned |
 | EP8 down | 7168 | 2048 | Tuned |
+| TP8 gate/up | 512 | 7168 | Tuned |
+| TP8 down | 7168 | 256 | Tuned |
 | Anything else | — | — | Falls back to generic defaults |
+
+The shard axis is part of the key, not just the shape, and it is not detectable
+from the device, so `profile="auto"` never resolves to TP8 — guessing would pack
+the weight against the wrong table. Request it by name, or pass
+`tensor_parallel_size=8`.
+
+`h200_tp8` is also a single-instance (`mode="mix"`) profile rather than a
+disaggregated P/D role, so `CHORD_SM90_DECODE` does not apply to it and its
+schedule has to hold across the whole routed-M range.
 
 Shapes outside the table still execute correctly, but `block_m` does not vary
 with routed-M and performance is untuned.
 
-These tables are a simplified schedule kept for the indexed/EP8 path. They are not
-a general autotune result; treat measurements on the target machine as
+These tables are a simplified schedule kept for the indexed path. They are not a
+general autotune result; treat measurements on the target machine as
 authoritative.
 
 ## Prefill block-M
@@ -77,6 +89,48 @@ equal `routed_m` but different expert counts want different tiles.
   so the chosen block-M matches Humming's for the same shape.
 
 Decode uses its own `tok_e` thresholds with swap-AB.
+
+### TP8 block-M
+
+TP8 keys on the same `tok_e`, but the windows are flatter. EP8 stays wide in the
+dimension that fills the grid (`N / block_n >= 16` tiles per m-block), so
+per-expert M-padding dominates and block-M grows to cover an expert's padded rows.
+TP8 narrows that dimension to as few as 2 n-blocks, so block count and occupancy
+dominate instead, and EP8's tall tiles would hit the register cliff without a full
+grid to pay for it.
+
+| `tok_e` | block-M |
+| --- | --- |
+| < 80 | block-count argmin (as EP8) |
+| 80–128 | one block per expert, `round(tok_e * 1.1 / 8) * 8` |
+| 128–190 | 96 |
+| > 190 | 128 |
+
+The whole 96..144 band beats the argmin's taller choice here. At the five benchmark
+token counts (1024..16384, i.e. routed_m 8192..131072) this gives block-M
+40, 72, 96, 96, 128 for both projections.
+
+### TP8 block-N/K tiles
+
+A short m-block leaves the mainloop too little work per tile, so block-K
+compensates and relaxes as block-M grows. The two projections differ in block-N and
+occupancy.
+
+| Projection | block-N | block-K | CTAs/SM |
+| --- | --- | --- | --- |
+| gate/up (`N=512 K=7168`) | 128 to block-M 64, then 256 | 256 (block-M ≤ 32), 128 (≤ 64), else 64 | 1 |
+| down (`N=7168 K=256`) | 128 always | 128 (block-M ≤ 32), else 64 | 2 |
+
+gate/up's narrow output is already covered by a 128-wide tile in 4 n-blocks, so the
+wide 256 tile only pays once block-M passes 64 and the deep-K mainloop has enough
+rows per tile to feed it. down goes the other way: at the generic block-N 256 the
+WGMMA accumulator plus B-smem are too large to fit two CTAs on an SM, pinning
+occupancy at 1 CTA/SM, and with only 4 K-blocks the kernel is latency-bound rather
+than compute-bound. Halving block-N to 128 halves both and unlocks 2 CTAs/SM, which
+hides the cp.async + dequant latency. That is the largest single TP8 win — down
+measures 1.27-1.51x against the baseline, against gate/up's 1.09-1.19x. down's
+block-K is also one notch shallower throughout, because `K=256` simply has less
+depth to spend.
 
 ### Block-N/K tiles
 
@@ -99,10 +153,23 @@ stays at 1 CTA/SM.
 ## Stream-K
 
 H200 prefill uses stream-K: the K dimension of a tile's tail is split across CTAs
-whose partial sums reduce into the output. gate/up enables it at every size; the
-mid-K down projection (512 < K < 4096) turns it off once `routed_m` reaches 5120,
-where the M*N tiles already fill the grid and the K-split is pure overhead. H200
-decode is one-pass.
+whose partial sums reduce into the output. Under EP8, gate/up enables it at every
+size; the mid-K down projection (512 < K < 4096) turns it off once `routed_m`
+reaches 5120, where the M*N tiles already fill the grid and the K-split is pure
+overhead. H200 decode is one-pass.
+
+TP8 crosses over in *opposite directions* for the two projections, both at
+`routed_m` 65536:
+
+| Projection | ≤ 65536 | > 65536 |
+| --- | --- | --- |
+| gate/up (`K=7168`) | on | off |
+| down (`K=256`) | off | on |
+
+gate/up behaves like its EP8 counterpart, with the crossover pushed out to where
+TP8's larger routed-M fills the grid on its own. down is the mirror image: 4
+K-blocks give the split almost nothing to work with, so it stays one-pass until the
+workload is imbalanced enough for the load balancing to repay the locks.
 
 Blackwell decode splits by projection: the deep-K gate/up projection (K=7168,
 112 K-blocks) keeps stream-K at every decode size — the long K loop leaves a
