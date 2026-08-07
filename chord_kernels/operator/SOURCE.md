@@ -13,6 +13,133 @@ not part of this distribution. The root `NOTICE` and this file form the central
 provenance and modification record; every source file in this directory carries
 a two-line pointer back here rather than repeating the description.
 
+## DeepGEMM W4A16 provenance
+
+The DeepGEMM-layout SM90 W4A16 backend (masked decode and contiguous prefill
+grouped GEMMs) is a secondary development on a second public upstream:
+
+- Public upstream: <https://github.com/deepseek-ai/DeepGEMM>
+- Public baseline: `7f2a703ed51ac1f7af07f5e1453b2d3267d37d50`
+- License: MIT (see `include/deep_gemm/LICENSE`)
+- Third-party CUDA headers carried inside that closure: NVIDIA CUTLASS/CuTe
+  (BSD-3-Clause), supplied unmodified by the `third_party/cutlass` submodule
+  pinned to `v4.2.0` (`59b61c606fe7aa4d33e60d3e6352cbfde98361c3`)
+
+The vendored unit is the persistent SM90 WGMMA kernel upstream calls
+`deep_gemm::sm90_fp8_gemm_1d2d_impl`, instantiated for W4A16 (BF16 activation,
+packed-INT4 weight, BF16 group-32 scales on the SFA TMA slot), its static
+include closure under `include/deep_gemm/`, and the CUTLASS/CuTe arch headers
+that closure needs under `include/cute/` + `include/cutlass/`. The upstream
+Python package (`deep_gemm`), its JIT cache, its pybind module, and all other
+GEMM families are NOT part of this distribution: the kernel is compiled by the
+chord NVRTC path and launched by the chord cubin launcher, exactly like the
+phase-1 indexed kernel.
+
+### Vendored DeepGEMM-derived files
+
+Copied under `chord_kernels/operator/include/` apart from package location,
+with development-log references in comments neutralized (code unchanged):
+
+- `deep_gemm/impls/sm90_w4a16_gemm.cuh` (the kernel, with the W4A16
+  instantiation family) — upstream `impls/sm90_fp8_gemm_1d2d.cuh`, renamed
+  along with its entry point `sm90_fp8_gemm_1d2d_impl` →
+  `sm90_w4a16_gemm_impl`, because W4A16 is the only instantiation this
+  distribution ships and the FP8 name misdescribes it. Contents are otherwise
+  unchanged apart from the `ld_shared` overload noted below.
+- `deep_gemm/common/{compile,exception,math,tma_copy,types,utils}.cuh`
+- `deep_gemm/mma/sm90.cuh` (int4 dequant RS-WGMMA additions)
+- `deep_gemm/epilogue/transform.cuh`
+- `deep_gemm/ptx/{ld_st,utils,wgmma}.cuh`
+- `deep_gemm/scheduler/gemm.cuh`
+- `deep_gemm/LICENSE` (MIT, DeepSeek)
+The CUTLASS/CuTe headers are not copied into this repository. `third_party/cutlass`
+is a git submodule pinned to `v4.2.0`, and the build stages the transitive
+include closure of the kernel sources (58 arch-level headers under `cute/` and
+`cutlass/`; no CUTLASS library layer) into `include/`, together with
+`cutlass/LICENSE.txt` (BSD-3-Clause, NVIDIA). `scripts/cutlass_closure.py`
+computes that closure by scanning the `#include` graph, so the packaged set
+follows the kernel sources instead of a hand-maintained list. The staged
+directories `include/cute/` and `include/cutlass/` are gitignored build output.
+
+Ported to Python/C++ (rewritten against the upstream sources, not copied):
+
+- `grouped/heuristics.py` — the `is_w4a16` branches of
+  `csrc/jit_kernels/heuristics/sm90.hpp` (`SM90ArchSpec`): masked/contiguous
+  BLOCK_M/N/K tables, stage targeting, the L1/L2 cycle model for the
+  (cluster-1/2) layout candidate pick, and the environment override hooks
+  renamed `CHORD_W4A16_*`.
+- `grouped/packing.py` — the closed-form `(row, nibble)` bit-permutation
+  weight reorder from `tests/generators.py::reorder_w4a16` (excess-8
+  pre-flip), checkpoint-unpacked and INT32-packed input forms, and the
+  one-time scale transpose into the kernel's MN-major `[G, K/32, N]` SFA
+  layout.
+- `grouped/kernel.py` — the code-generation template of
+  `csrc/jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp::generate_impl` (SHAPE_M
+  dynamic, `compiled_dims="nk"`, identity epilogue, upstream's `kMajorSFB=K`
+  spelling; the slot is dead under the W4A16 instantiation), plus
+  `extern "C" __constant__` metadata exports consumed by the cubin launcher.
+- `csrc/launcher/launcher.cpp` (DeepGEMM section) — the TMA descriptor
+  builders of `csrc/jit_kernels/impls/runtime_utils.hpp`
+  (`make_tma_{a,b,cd,sf}_desc`) specialized to K-major A/B, BF16 D and the
+  MN-major BF16 scale layout, plus the cluster/PDL launch plumbing of
+  `csrc/jit/handle.hpp`.
+- `grouped/api.py` — the tensor contracts of `csrc/apis/gemm.hpp`
+  (`sm90_m_grouped_w4a16_gemm_nt_masked` / `..._contiguous`), with the
+  packed-mode guard reversed into a hard error (masked BLOCK_K=128 vs
+  contiguous BLOCK_K=64 buffers are not interchangeable).
+
+Weight-pack semantics were independently re-derived from the vendored kernel:
+the packed nibble equals the unsigned checkpoint code, and the reorder is a
+pure permutation, so the offline flip introduces no arithmetic change.
+
+### Adapting the kernel to NVRTC
+
+Upstream DeepGEMM compiles this kernel with NVCC (`DG_JIT_USE_NVRTC` defaults
+to 0). This distribution compiles it with NVRTC instead, like the phase-1
+indexed kernel, which keeps the deploy-without-a-CUDA-toolkit property. Three
+changes carry that over; they are not upstream behaviour changes.
+
+- **Device prelude.** NVRTC provides no host standard library, and CUTLASS
+  v4.2.0 routes `<type_traits>` through `CUDA_STD_HEADER(...)` under
+  `__CUDACC_RTC__` (`include/cutlass/cutlass.h`), so nothing in the include
+  closure includes a bare `<type_traits>` and the `--header` shims this package
+  already used for phase-1 never fire. `Compiler.device_prelude()`
+  (`jit/compiler.py`) is a hook, empty in the base class so phase-1 codegen and
+  its cache keys are unchanged; `compile()` prepends the returned text and folds
+  it into the cache signature. `GroupedNVRTCCompiler.device_prelude()`
+  (`grouped/kernel.py`) maps the three `std::` names the kernel spells
+  (`conditional_t`, `min`, `forward`) onto libcu++, and declares the two
+  programmatic-dependent-launch builtins NVRTC does not provide
+  (`cudaGridDependencySynchronize`,
+  `cudaTriggerProgrammaticLaunchCompletion`) as `griddepcontrol` inline asm. The
+  `std::` import list is a module-level constant shared with the phase-1
+  `--header` shims, so the two paths cannot drift. Both mechanisms are retained
+  deliberately: the shims fire only for translation units that include the named
+  header, which is the right granularity for the phase-1 closure, whereas the
+  prelude is unconditional and is needed precisely because this closure includes
+  no such header. Moving phase-1 onto the prelude would inject text into every
+  translation unit and invalidate its cubin cache for no functional gain.
+- **`include/deep_gemm/ptx/ld_st.cuh`** gains an `ld_shared` overload for
+  `const __nv_bfloat16*`. The W4A16 instantiation types the SFA slot as
+  `__nv_bfloat16` (`TSF`), so the FP8 path's call in
+  `impls/sm90_w4a16_gemm.cuh` must name-resolve for that type. That call site
+  sits after the `if constexpr (kIsW4A16)` block's `continue`, so it is
+  discarded for W4A16: the overload satisfies overload resolution only and never
+  executes. NVCC rejects the unresolved name too, so this is independent of the
+  compiler choice.
+- **`utils/jit.py`** — `find_kernel_name_in_cubin` previously matched mangled
+  names with the regex `^_ZN(?:\d+[A-Za-z_]\w*)*\d+{keyword}`, which backtracks
+  catastrophically on the long template-argument suffixes this kernel mangles to
+  (a single symbol did not resolve in five minutes). `_mangled_name_matches()`
+  walks the Itanium length-prefixed components directly instead, with the same
+  observable behaviour. Phase-1 was unaffected only because its mangled names
+  are short.
+
+NVCC was measured as the alternative on the phase-1 kernel and found equivalent
+(identical instruction count and register/shared usage; differences confined to
+instruction selection), so the choice rests on the packaging property rather
+than on codegen.
+
 ## Modified source inventory
 
 Files retained from, rewritten from, or otherwise modified relative to the
@@ -25,7 +152,9 @@ Python integration and runtime:
 - `api.py`
 - `config/__init__.py`
 - `config/mma.py`
+- `dispatch.py`
 - `dtypes.py`
+- `env.py`
 - `jit/__init__.py`
 - `jit/compiler.py`
 - `jit/runtime.py`
@@ -35,6 +164,8 @@ Python integration and runtime:
 - `layer.py`
 - `ops.py`
 - `packing.py`
+- `profiles.py`
+- `tuning.py`
 - `utils/cuda.py`
 - `utils/jit.py`
 - `utils/nvrtc.py`
@@ -77,6 +208,14 @@ CUDA operator and repacking kernels:
 - `include/humming/utils/ptx/wgmma.cuh`
 - `include/humming/utils/storage.cuh`
 
+Relative to the DeepGEMM baseline (see "DeepGEMM W4A16 provenance" for the
+ported Python and launcher files, which are rewritten rather than copied):
+
+- `include/deep_gemm/ptx/ld_st.cuh` — one added `ld_shared` overload for
+  `const __nv_bfloat16*`, required for name resolution in a branch the W4A16
+  instantiation discards
+- `grouped/{__init__,api,heuristics,kernel,packing}.py` — ported, not copied
+
 ## Extraction changes
 
 - The public execution surface was narrowed to INT4 packing and indexed
@@ -88,9 +227,12 @@ CUDA operator and repacking kernels:
   The retained MMA generator emits only the MMA/WGMMA instruction forms used
   by these profiles; generic dtype, quantization, and GEMM configuration
   objects were removed.
-- `layer.py` is a framework-facing adapter around the indexed API. It owns
-  profile selection and packed weight lifecycle but does not copy an upstream
-  model, router, or quantization registry.
+- `layer.py` is a framework-facing adapter around the operator APIs. It owns
+  the packed weight lifecycle but does not copy an upstream model, router, or
+  quantization registry, and it is backend-agnostic: the published profiles
+  live in `profiles.py`, the process-level switches in `env.py`, the indexed
+  launch tables in `tuning.py`, and every backend-specific pack/forward call
+  goes through `dispatch.py`.
 - The launcher now accepts only the tensors needed by indexed W4A16. Generic
   bias, zero-point, input-scale, global-scale, and TMA descriptor handling was
   removed; it does allocate and pass the int32 stream-K lock buffer (see below).
@@ -146,6 +288,11 @@ CUDA operator and repacking kernels:
 This extraction supports the H200 SM90 prefill/decode profiles and the
 Blackwell decode profile on B200 SM100 and B300 SM103; all three parts have
 been compiled, run and timed. Every tuning row is exercised by
-`tests/test_w4a16.py`, which checks the kernel output against a plain-PyTorch
+`tests/test_w4a16_indexed.py`, which checks the kernel output against a plain-PyTorch
 reference on the running device before timing it. Public APIs reject
 unsupported compute capabilities or profile combinations.
+
+The DeepGEMM-backend masked and contiguous paths are exercised by
+`tests/test_w4a16_grouped.py` against an independent BF16 dequant reference
+on the running SM90 device; the launch heuristics are additionally covered by
+torch-free unit tests of the ported selection tables.

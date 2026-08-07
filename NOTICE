@@ -1,7 +1,7 @@
 Chord
 Copyright 2026 Chord contributors
 
-This product contains source derived from the following project:
+This product contains source derived from the following projects:
 
 humming
 Public upstream: https://github.com/inclusionAI/humming
@@ -10,3 +10,21 @@ This distribution contains modifications described in
 chord_kernels/operator/SOURCE.md.
 Licensed under the Apache License, Version 2.0. The complete license text is
 distributed at chord_kernels/operator/LICENSE and in the root LICENSE file.
+
+DeepGEMM
+Public upstream: https://github.com/deepseek-ai/DeepGEMM
+Public baseline: 7f2a703ed51ac1f7af07f5e1453b2d3267d37d50
+This distribution contains modifications described in
+chord_kernels/operator/SOURCE.md.
+Licensed under the MIT License. The complete license text is distributed at
+chord_kernels/operator/include/deep_gemm/LICENSE.
+
+CUTLASS (arch headers of the DeepGEMM include closure)
+Public upstream: https://github.com/NVIDIA/cutlass
+Public baseline: v4.2.0 (59b61c606fe7aa4d33e60d3e6352cbfde98361c3)
+Included as the git submodule third_party/cutlass and redistributed unmodified.
+The build stages the transitive cute/ and cutlass/ include closure of the
+kernels into chord_kernels/operator/include/.
+Licensed under the BSD 3-Clause License. The complete license text is
+distributed at third_party/cutlass/LICENSE.txt and alongside the staged headers
+at chord_kernels/operator/include/{cute,cutlass}/LICENSE.txt.

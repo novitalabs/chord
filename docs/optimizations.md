@@ -173,6 +173,6 @@ token counts. SM100 and SM103 share one tile table, tuned on B300 (148 SMs):
 - JIT targets `sm_100a` (B200) and `sm_103a` (B300) separately per detected
   capability; cubins are not shared across the two.
 
-On B300 the decode sweep (`tests/test_w4a16.py`, triton `do_bench`) measures
+On B300 the decode sweep (`tests/test_w4a16_indexed.py`, triton `do_bench`) measures
 gate/up 146/162/181/183 us and down 84/91/92/95 us at 20/30/40/50 tokens per
 GPU.

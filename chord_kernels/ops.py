@@ -45,4 +45,50 @@ def indexed(
     )
 
 
-__all__ = ["indexed"]
+def masked(
+    activation: Any,
+    weight: Any,
+    masked_m: Any,
+    expected_m: int,
+    *,
+    outputs: Any | None = None,
+    enable_pdl: bool = False,
+) -> Any:
+    """Run the grouped masked (decode) grouped W4A16 operator.
+
+    ``activation`` is ``[G*max_m, K]`` flat or ``[G, max_m, K]`` BF16, the
+    weight comes from ``pack_w4a16_grouped(mode="masked")``, and ``masked_m``
+    is the per-expert valid token count ``[G] int32``.  Returns flat
+    ``[G*max_m, N]``.
+    """
+    from .operator.grouped.api import w4a16_masked
+
+    return w4a16_masked(
+        activation, weight, masked_m, expected_m, outputs=outputs,
+        enable_pdl=enable_pdl,
+    )
+
+
+def contiguous(
+    activation: Any,
+    weight: Any,
+    m_indices: Any,
+    *,
+    outputs: Any | None = None,
+    enable_pdl: bool = False,
+) -> Any:
+    """Run the grouped contiguous (prefill) grouped W4A16 operator.
+
+    ``activation`` is the grouped-native ``[m, K]`` layout (per-expert rows
+    padded to 128, padding rows zeroed) with ``m_indices`` ``[m] int32``
+    selecting the expert (-1 for padding).  The weight comes from
+    ``pack_w4a16_grouped(mode="contiguous")``.  Returns ``[m, N]``.
+    """
+    from .operator.grouped.api import w4a16_contiguous
+
+    return w4a16_contiguous(
+        activation, weight, m_indices, outputs=outputs, enable_pdl=enable_pdl
+    )
+
+
+__all__ = ["contiguous", "indexed", "masked"]

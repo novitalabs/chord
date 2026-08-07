@@ -13,3 +13,11 @@ __pycache__/
 
 .vscode
 .claude
+
+# macOS AppleDouble sidecars, created when the tree is copied via a Mac.
+._*
+.DS_Store
+
+# CUTLASS headers staged from third_party/cutlass by an editable install.
+chord_kernels/operator/include/cute/
+chord_kernels/operator/include/cutlass/

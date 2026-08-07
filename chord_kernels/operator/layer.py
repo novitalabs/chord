@@ -37,6 +37,8 @@ from chord_kernels.operator.packing import (
 from chord_kernels.operator.profiles import (
     BLACKWELL_DECODE_EP8,
     H200_DECODE_EP8,
+    H200_GROUPED_DECODE,
+    H200_GROUPED_PREFILL,
     H200_PREFILL_EP8,
     H200_TP8,
     INDEXED_PROFILES,
@@ -1107,6 +1109,8 @@ class IndexedW4A16Method:
 __all__ = [
     "BLACKWELL_DECODE_EP8",
     "H200_DECODE_EP8",
+    "H200_GROUPED_DECODE",
+    "H200_GROUPED_PREFILL",
     "H200_PREFILL_EP8",
     "H200_TP8",
     "INDEXED_PROFILES",

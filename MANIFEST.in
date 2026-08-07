@@ -5,5 +5,11 @@ include pyproject.toml
 recursive-include docs *.md
 recursive-include tests *.py
 recursive-include chord_kernels *.py *.cpp *.cuh *.h LICENSE SOURCE.md
+recursive-include scripts *.py
+# git archive omits submodule content, so graft the CUTLASS sources explicitly:
+# without them an sdist cannot rebuild the operator include closure.
+graft third_party/cutlass/include/cute
+graft third_party/cutlass/include/cutlass
+include third_party/cutlass/LICENSE.txt
 global-exclude *.so *.o *.cubin *.ptx *.pyc
 prune build

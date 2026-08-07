@@ -39,8 +39,21 @@ class Compiler:
         return json.dumps(data, ensure_ascii=False)
 
     @classmethod
+    def device_prelude(cls):
+        """Source text prepended to every translation unit.
+
+        Empty by default. Backends whose include closure does not reach the
+        ``--header`` shims (see :attr:`NVRTCCompiler._STD_HEADER_SHIMS`) use this
+        to map the ``std::`` symbols they need onto libcu++ directly.
+        """
+        return ""
+
+    @classmethod
     def compile(cls, code, sm_version, kernel_expr):
         flags = cls.get_flags(sm_version)
+        prelude = cls.device_prelude()
+        if prelude:
+            code = prelude + code
         signature = f"{cls.__name__}$${cls.signature()}$${flags}$${kernel_expr}$${code}"
         signature += "$$" + Compiler.cuh_last_update_time()
         hash_hex = jit_utils.hash_to_hex(signature)
@@ -101,6 +114,20 @@ class Compiler:
         raise NotImplementedError
 
 
+# NVRTC has no host standard library, so the ``std::`` type traits the kernels
+# spell must be mapped onto libcu++. Shared by the ``--header`` shims below and
+# by the prelude the grouped backend injects.
+_STD_TYPE_TRAIT_IMPORTS = """
+    namespace std {
+    using cuda::std::is_same;
+    using cuda::std::conditional_t;
+    using cuda::std::conditional;
+    using cuda::std::enable_if;
+    using cuda::std::enable_if_t;
+    }
+"""
+
+
 class NVRTCCompiler(Compiler):
     _STD_HEADER_SHIMS: dict[str, str] = {
         "climits": "#include <cuda/std/climits>",
@@ -113,24 +140,12 @@ class NVRTCCompiler(Compiler):
             #include <cuda/std/cstdint>
             #include <cuda/std/type_traits>
             using namespace cuda::std;
-            namespace std {
-            using cuda::std::is_same;
-            using cuda::std::conditional_t;
-            using cuda::std::conditional;
-            using cuda::std::enable_if;
-            using cuda::std::enable_if_t;
-            }
-        """,
+        """
+        + _STD_TYPE_TRAIT_IMPORTS,
         "type_traits": """
             #include <cuda/std/type_traits>
-            namespace std {
-            using cuda::std::is_same;
-            using cuda::std::conditional_t;
-            using cuda::std::conditional;
-            using cuda::std::enable_if;
-            using cuda::std::enable_if_t;
-            }
-        """,
+        """
+        + _STD_TYPE_TRAIT_IMPORTS,
     }
 
     @classmethod
