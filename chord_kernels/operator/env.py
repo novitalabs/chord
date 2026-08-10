@@ -112,11 +112,15 @@ def resolve_backend_name(
 ) -> str:
     """Map an SM90 instance role to its per-layer backend name.
 
-    This is the single backend-selection policy, mirroring upstream Humming's
-    ``sm90_w4a16_decode_backend``: the master switch picks the family and the
-    role picks the kernel/layout within it.  ``use_grouped=None`` reads the
-    environment; passing a bool makes the policy testable without touching the
-    process environment.
+    This is chord's single backend-selection policy: the master switch picks the
+    family and the role picks the kernel/layout within it.  ``use_grouped=None``
+    reads the environment; passing a bool makes the policy testable without
+    touching the process environment.
+
+    Upstream Humming has no equivalent function.  It derives the MMA type from
+    dtype and SM version and takes the GEMM family as a per-call ``GemmType``
+    argument, so it never needs to map a process to a backend; chord does,
+    because its weight layout is frozen when the profile is chosen at pack time.
 
     ``mix`` (the single-instance TP8 role) always resolves to ``indexed``: the
     two grouped kernels are each tied to one phase, so there is no grouped

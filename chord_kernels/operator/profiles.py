@@ -483,6 +483,40 @@ H200_DECODE_EP8 = _PROFILES["h200_decode_ep8"]
 BLACKWELL_DECODE_EP8 = _PROFILES["blackwell_decode_ep8"]
 INDEXED_PROFILES = dict(_PROFILES)
 
+# Per-expert ``(shape_n, shape_k)`` projection pairs each shard axis publishes a
+# tuned schedule for.  The two sets are disjoint, which is what makes the axis
+# recoverable from a layer's shapes: EP8 splits the expert list and leaves each
+# expert's projections whole, while TP8 slices ``moe_intermediate`` and so
+# narrows gate/up's N and down's K by 8.
+#
+# These pairs must stay in step with the shape guards in
+# :mod:`chord_kernels.operator.tuning`; ``test_shard_axis_shapes_match_tuning``
+# asserts they do, so a new tuned shape cannot be added in one place only.
+_EP8_SHAPES = ((4096, 7168), (7168, 2048))
+_TP8_SHAPES = ((512, 7168), (7168, 256))
+
+
+def shard_axis_from_shapes(shape_n: int, shape_k: int) -> str | None:
+    """Recover the shard axis from one projection's per-expert shape.
+
+    Returns ``"ep"``, ``"tp"``, or ``None`` when the pair is not one this
+    operator publishes a tuned schedule for.  ``None`` means "do not guess": an
+    unrecognised shape falls back to the EP8 default and the conservative
+    profile tile, rather than claiming a tuning result for another model.
+
+    This is how a framework adapter reaches TP8 without a chord-specific
+    argument.  Upstream Humming has no shard-axis concept at all — it derives a
+    schedule from N/K/num_experts on every call, so the axis never needs naming.
+    chord replaced that with a fixed profile table, so the axis has to be
+    recovered from the same shapes upstream would have keyed on.
+    """
+    pair = (shape_n, shape_k)
+    if pair in _TP8_SHAPES:
+        return "tp"
+    if pair in _EP8_SHAPES:
+        return "ep"
+    return None
+
 
 def _normalise_mode(mode: str | None) -> IndexedMode | None:
     if mode is None:
@@ -494,10 +528,48 @@ def _normalise_mode(mode: str | None) -> IndexedMode | None:
     return mode  # type: ignore[return-value]
 
 
+def resolve_shard_axis(
+    tensor_parallel_size: int | None,
+    shape_n: int | None = None,
+    shape_k: int | None = None,
+) -> str:
+    """Decide the shard axis from an explicit size and/or the layer's shapes.
+
+    An explicit ``tensor_parallel_size`` states the deployment and wins, so a
+    model whose shapes this operator has no tuned schedule for can still select
+    TP8 (it gets the conservative profile tile).  When the shapes *are* published
+    and the stated size contradicts them, that is a configuration error and is
+    rejected rather than resolved: the two disagree about which table applies, so
+    either answer would pack the weight against the wrong schedule.
+
+    With no explicit size the axis is recovered from the shapes, defaulting to
+    ``"ep"`` when they are unrecognised.
+    """
+    inferred = (
+        shard_axis_from_shapes(shape_n, shape_k)
+        if isinstance(shape_n, int) and isinstance(shape_k, int)
+        else None
+    )
+    if tensor_parallel_size is None:
+        return inferred or "ep"
+    stated = "tp" if tensor_parallel_size == 8 else "ep"
+    if inferred is not None and inferred != stated:
+        published = _TP8_SHAPES if inferred == "tp" else _EP8_SHAPES
+        raise ValueError(
+            f"tensor_parallel_size={tensor_parallel_size} states the "
+            f"{stated.upper()}8 axis, but (shape_n={shape_n}, shape_k={shape_k}) "
+            f"is a published {inferred.upper()}8 projection "
+            f"{tuple(published)}; the shard axis and the projection shapes must "
+            "agree, since each axis has its own tuned schedule"
+        )
+    return stated
+
+
 def _auto_profile_name(
     capability: tuple[int, int],
     selected_mode: IndexedMode | None,
     tensor_parallel_size: int | None = None,
+    shard_axis: str | None = None,
 ) -> str:
     """Resolve ``profile='auto'`` for one CUDA capability.
 
@@ -507,14 +579,14 @@ def _auto_profile_name(
     ``CHORD_USE_GROUPED=1`` both roles reroute to the grouped backend's
     profiles once that kernel is vendored.
 
-    The shard axis is not discoverable from the device, so it defaults to EP8
-    unless the caller states ``tensor_parallel_size=8``; guessing it would pack
-    the weight for the wrong shapes.  TP8 is a single-instance ``mix`` profile,
-    so neither the P/D role bit nor ``CHORD_USE_GROUPED`` applies to it.
+    The shard axis is not a property of the *device*, so it is never inferred
+    from ``capability``; the caller resolves it with :func:`resolve_shard_axis`
+    and passes the result as ``shard_axis``.  TP8 is a single-instance ``mix``
+    profile, so neither the P/D role bit nor ``CHORD_USE_GROUPED`` applies to it.
     """
     from chord_kernels.operator.dispatch import backend_profile_name
 
-    if tensor_parallel_size == 8:
+    if shard_axis == "tp":
         if capability != (9, 0):
             raise RuntimeError(
                 "the TP8 W4A16 profile is published for SM90 only, got "
@@ -543,6 +615,8 @@ def select_indexed_profile(
     device: torch.device | None = None,
     expert_parallel_size: int | None = None,
     tensor_parallel_size: int | None = None,
+    shape_n: int | None = None,
+    shape_k: int | None = None,
 ) -> IndexedLayerProfile:
     """Resolve an explicit profile or select one from device capability.
 
@@ -553,11 +627,14 @@ def select_indexed_profile(
     ``CHORD_SM90_DECODE``, else the prefill default; Blackwell resolves to its
     only published profile (decode) regardless of the variable.
 
-    ``auto`` never resolves to the TP8 profile on its own: the shard axis is not
-    discoverable from the device, and guessing it would pack the weight for the
-    wrong shapes, so TP8 must be requested by name or with
-    ``tensor_parallel_size=8``.  Being a single-instance ``mix`` profile, it also
-    ignores the P/D role bit.
+    The shard axis is decided separately from the P/D role, because it is a
+    property of the deployment rather than the device.  ``auto`` takes it from an
+    explicit ``tensor_parallel_size``, else from ``shape_n``/``shape_k`` when they
+    name a published TP8 or EP8 projection (see :func:`shard_axis_from_shapes`),
+    else defaults to EP8.  Passing the shapes is what lets a framework adapter
+    land on TP8 without a chord-specific argument; omitting them keeps the EP8
+    default.  TP8 is a single-instance ``mix`` profile, so it also ignores the
+    P/D role bit.
 
     Both parallel sizes default to ``None`` rather than 8, so naming a profile is
     enough; a stated value is checked against the one the profile carries.
@@ -588,7 +665,10 @@ def select_indexed_profile(
                 None if device is None else torch.device(device)
             )
             name = _auto_profile_name(
-                capability, selected_mode, tensor_parallel_size
+                capability,
+                selected_mode,
+                tensor_parallel_size,
+                resolve_shard_axis(tensor_parallel_size, shape_n, shape_k),
             )
         try:
             resolved = _PROFILES[name]
@@ -660,4 +740,5 @@ __all__ = [
     "IndexedLayerProfile",
     "IndexedMode",
     "select_indexed_profile",
+    "shard_axis_from_shapes",
 ]

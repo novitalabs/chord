@@ -22,6 +22,15 @@ raise with actionable messages rather than approximating behaviour.
 
 Runtime policy is selected by ``CHORD_SM90_DECODE`` / ``CHORD_USE_GROUPED``
 (read at weight-pack time); see ``chord.config`` for the backend mapping.
+
+Where chord adds rather than mirrors: upstream computes a launch schedule per
+call from device heuristics, while chord selects a named *profile* at pack time
+from a published tuning table.  A profile therefore has to name things upstream
+never does — the serving role (including ``mix``, for a single instance serving
+both phases) and the 8-way shard axis (EP8 vs TP8).  Adapters need not supply
+either: both are recovered from the ``shape_n``/``shape_k`` and environment an
+upstream-shaped adapter already provides.  ``chord.config`` is likewise chord's
+own policy surface, not an upstream API; its docstring says so.
 """
 
 try:

@@ -134,8 +134,105 @@ def test_default_f16_dtype_is_bfloat16() -> None:
     assert chord_layer.get_default_f16_torch_dtype() is torch.bfloat16
 
 
+class TestShardAxisReachability:
+    """TP8 must be reachable from an adapter that passes only upstream args.
+
+    A framework adapter calls ``prepare_layer_meta`` with the shapes it always
+    passes and no chord-specific arguments.  Since each shard axis has its own
+    tuned schedule, landing on the wrong one would silently pack the weight
+    against the wrong table -- so these pin the shape-driven axis recovery.
+    """
+
+    @staticmethod
+    def _meta(shape_n: int, shape_k: int, num_experts: int, **kwargs):
+        return chord_layer.HummingLayerMethod.prepare_layer_meta(
+            torch.nn.Module(),
+            shape_n=shape_n,
+            shape_k=shape_k,
+            num_experts=num_experts,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize(("shape_n", "shape_k"), [(512, 7168), (7168, 256)])
+    def test_tp8_shapes_reach_the_tp8_profile(
+        self, shape_n: int, shape_k: int
+    ) -> None:
+        meta = self._meta(shape_n, shape_k, 384)
+        assert meta.profile.name == "h200_tp8"
+        assert meta.profile.shard_axis == "tp"
+        assert meta.profile.mode == "mix"
+
+    @pytest.mark.parametrize(("shape_n", "shape_k"), [(4096, 7168), (7168, 2048)])
+    def test_ep8_shapes_keep_the_ep8_profile(
+        self, shape_n: int, shape_k: int
+    ) -> None:
+        meta = self._meta(shape_n, shape_k, 32)
+        assert meta.profile.shard_axis == "ep"
+        assert meta.profile.expert_parallel_size == 8
+
+    def test_unpublished_shapes_default_to_ep8(self) -> None:
+        """An unrecognised shape must not be guessed into a tuned profile."""
+        meta = self._meta(2048, 2048, 32)
+        assert meta.profile.shard_axis == "ep"
+
+    def test_explicit_size_selects_tp8_for_unpublished_shapes(self) -> None:
+        """A stated axis still works for a model chord has no table for."""
+        meta = self._meta(2048, 2048, 32, tensor_parallel_size=8)
+        assert meta.profile.name == "h200_tp8"
+
+    def test_explicit_profile_overrides_the_inferred_axis(self) -> None:
+        meta = self._meta(512, 7168, 384, profile="h200_prefill_ep8")
+        assert meta.profile.name == "h200_prefill_ep8"
+
+    @pytest.mark.parametrize(
+        ("shape_n", "shape_k", "tensor_parallel_size"),
+        [(4096, 7168, 8), (512, 7168, 1)],
+    )
+    def test_size_contradicting_published_shapes_is_rejected(
+        self, shape_n: int, shape_k: int, tensor_parallel_size: int
+    ) -> None:
+        """Silently honouring either side would use the wrong tuned table."""
+        with pytest.raises(ValueError, match="shard axis"):
+            self._meta(
+                shape_n,
+                shape_k,
+                384,
+                tensor_parallel_size=tensor_parallel_size,
+            )
+
+    def test_tp8_ignores_the_pd_role_bit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A mix profile serves both phases, so CHORD_SM90_DECODE cannot apply."""
+        monkeypatch.setenv("CHORD_SM90_DECODE", "1")
+        assert self._meta(512, 7168, 384).profile.name == "h200_tp8"
+
+    def test_tp8_ignores_the_grouped_switch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each grouped kernel serves one phase, so none can back a mix weight."""
+        monkeypatch.setenv("CHORD_USE_GROUPED", "1")
+        meta = self._meta(512, 7168, 384)
+        assert meta.profile.name == "h200_tp8"
+        assert meta.backend == "indexed"
+
+    def test_tp8_metadata_selects_the_tp8_tuning_table(self) -> None:
+        """The point of the axis: TP8 shapes must get TP8's schedule.
+
+        Compared at equal tokens-per-expert so the two tables are asked the same
+        question.  TP8's windows are flatter (capped at block-M 128) than EP8's
+        padding model, so a TP8 layer landing on the EP8 profile would launch a
+        tile its shapes were never tuned for.
+        """
+        tp8 = self._meta(512, 7168, 384)
+        ep8 = self._meta(4096, 7168, 384)
+        routed_m = 384 * 300
+        assert tp8.kernel_config(routed_m).block_m == 128
+        assert ep8.kernel_config(routed_m).block_m == 168
+
+
 class TestBackendPolicy:
-    """``sm90_w4a16_decode_backend`` must reproduce upstream's constants."""
+    """``sm90_w4a16_decode_backend`` must report chord's own constants."""
 
     @staticmethod
     def _clear(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,11 +1,20 @@
-"""Humming-name aliases for the backend-selection policy.
+"""chord's backend-selection policy, in humming-shaped spellings.
 
-Upstream Humming exposes the SM90 W4A16 backend policy as
-``humming.config.sm90_w4a16_decode_backend`` with the string constants below.
-chord's policy lives in :mod:`chord_kernels.operator.env`; this module maps
-the names so framework code keyed on the upstream constants keeps working.
+Note on provenance: unlike the rest of this facade, the names here are **not**
+mirrors of an upstream API.  Upstream Humming (inclusionAI/humming at ``main``)
+has no backend-selection policy function and no such constants: its
+``humming.config`` package carries only ``LayerConfig``/``MmaType``/``GemmType``,
+its MMA type is derived from dtype and SM version, and the GEMM family
+(``dense``/``indexed``/``grouped_contiguous``/``grouped_masked``) is a per-call
+``GemmType`` argument rather than a load-time property.
 
-Constant mapping (upstream -> chord backend name):
+This module exists because chord replaced upstream's per-call device heuristics
+with a fixed profile table chosen at pack time, which needs a policy to pick a
+profile.  It is offered in the naming style of the rest of the facade for
+consistency, and the constants below are chord's own.  Framework code should not
+expect an upstream ``humming`` install to provide them.
+
+Constant mapping (constant -> chord backend name):
 
 * ``SM90_W4A16_DEEPGEMM_MASKED`` (``"deepgemm"``) -> ``grouped_masked``
 * ``SM90_W4A16_DEEPGEMM_CONTIGUOUS`` -> ``grouped_contiguous``
@@ -29,7 +38,7 @@ SM90_W4A16_DEEPGEMM_CONTIGUOUS = "deepgemm_contiguous"
 SM90_W4A16_SWAP_AB = "swap_ab"
 SM90_W4A16_WGMMA = "wgmma"
 
-_BACKEND_TO_UPSTREAM = {
+_BACKEND_TO_CONSTANT = {
     "grouped_masked": SM90_W4A16_DEEPGEMM_MASKED,
     "grouped_contiguous": SM90_W4A16_DEEPGEMM_CONTIGUOUS,
 }
@@ -48,12 +57,12 @@ def _sm90_ep8_min_experts() -> int:
 
 
 def is_sm90_decode() -> bool:
-    """Upstream spelling of the SM90 P/D role bit."""
+    """Whether this process is an SM90 decode instance (``CHORD_SM90_DECODE``)."""
     return indexed_mode_from_env() == "decode"
 
 
 def use_deepgemm() -> bool:
-    """Upstream spelling of the grouped-backend master switch."""
+    """Whether the grouped-backend master switch is on (``CHORD_USE_GROUPED``)."""
     return use_grouped_from_env()
 
 
@@ -64,13 +73,16 @@ def sm90_w4a16_decode_backend(
     weight_scale_group_size: int = 32,
     use_fused_e8m0_scale: bool = False,
 ) -> str:
-    """Upstream-shaped policy function returning the upstream constants.
+    """Report the W4A16 backend for this process as one of the constants above.
 
-    chord ships only the W4A16 group-scale MoE operator, so a non-W4A16
-    signature falls back to ``wgmma`` exactly like upstream.  Within scope the
-    result comes from :func:`resolve_backend_name`; the humming-native
-    swap-AB/WGMMA split is a profile detail inside the indexed backend, so
-    both indexed roles report their upstream constant by role.
+    chord ships only the W4A16 group-scale MoE operator, so a signature outside
+    that scope reports ``wgmma`` rather than guessing.  Within scope the result
+    comes from :func:`resolve_backend_name`; the WGMMA/swap-AB split is a profile
+    detail inside the indexed backend, so both indexed roles report a constant
+    chosen by role.
+
+    This function has no upstream counterpart (see the module docstring); it is
+    chord's own policy, exposed in the facade's naming style.
     """
     is_w4a16_group = (
         a_num_bits == 16
@@ -82,11 +94,11 @@ def sm90_w4a16_decode_backend(
         return SM90_W4A16_WGMMA
     role = indexed_mode_from_env() or "prefill"
     backend = resolve_backend_name(role)
-    if backend in _BACKEND_TO_UPSTREAM:
-        return _BACKEND_TO_UPSTREAM[backend]
-    # Indexed backend: report upstream's own split.  Its swap-AB decode path
-    # applies only to EP8-class expert counts; below the threshold upstream
-    # stays on WGMMA even for decode.
+    if backend in _BACKEND_TO_CONSTANT:
+        return _BACKEND_TO_CONSTANT[backend]
+    # Indexed backend: report the WGMMA/swap-AB split.  The swap-AB decode path
+    # applies only to EP8-class expert counts; below the threshold the WGMMA
+    # profile is used even for decode.
     if role == "decode" and num_experts >= _sm90_ep8_min_experts():
         return SM90_W4A16_SWAP_AB
     return SM90_W4A16_WGMMA

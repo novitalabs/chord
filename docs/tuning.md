@@ -56,10 +56,12 @@ is rejected explicitly.
 | TP8 down | 7168 | 256 | Tuned |
 | Anything else | — | — | Falls back to generic defaults |
 
-The shard axis is part of the key, not just the shape, and it is not detectable
-from the device, so `profile="auto"` never resolves to TP8 — guessing would pack
-the weight against the wrong table. Request it by name, or pass
-`tensor_parallel_size=8`.
+The shard axis is part of the key, and it is not detectable from the device. It
+is instead recovered from the projection shapes above, which are disjoint between
+the axes — so `profile="auto"` lands on TP8 for a TP8 shape and EP8 otherwise,
+with no chord-specific argument. Request it explicitly by name or with
+`tensor_parallel_size=8`; a stated axis that contradicts a published shape is
+rejected rather than resolved.
 
 `h200_tp8` is also a single-instance (`mode="mix"`) profile rather than a
 disaggregated P/D role, so `CHORD_SM90_DECODE` does not apply to it and its

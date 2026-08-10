@@ -45,7 +45,9 @@ from chord_kernels.operator.profiles import (
     IndexedLayerMeta,
     IndexedLayerProfile,
     _normalise_mode,
+    resolve_shard_axis,
     select_indexed_profile,
+    shard_axis_from_shapes,
 )
 from chord_kernels.operator.tuning import (
     _h200_prefill_block_m,
@@ -256,6 +258,16 @@ class IndexedW4A16Layer(torch.nn.Module):
         self._set_humming_meta("")
 
     @property
+    def _is_tensor_parallel(self) -> bool:
+        """Whether this layer is TP8-sharded, by explicit size or by shape."""
+        return (
+            resolve_shard_axis(
+                self.tensor_parallel_size, self.shape_n, self.shape_k
+            )
+            == "tp"
+        )
+
+    @property
     def indexed_profile(self) -> IndexedLayerProfile:
         if self.profile is None:
             if not self.weight.is_cuda:
@@ -271,12 +283,12 @@ class IndexedW4A16Layer(torch.nn.Module):
                 # A TP8 layer keeps the TP8 provisional layout so the CPU-side
                 # metadata matches the table it will resolve to; being a mix
                 # profile, it takes the mix role and so neither the P/D bit nor
-                # the grouped switch applies to it.
-                role: IndexedMode = (
-                    "mix"
-                    if self.tensor_parallel_size == 8
-                    else (self._mode or indexed_mode_from_env() or "prefill")
-                )
+                # the grouped switch applies to it.  The axis comes from an
+                # explicit size when given, else from this layer's own shapes.
+                if self._is_tensor_parallel:
+                    role: IndexedMode = "mix"
+                else:
+                    role = self._mode or indexed_mode_from_env() or "prefill"
                 return select_indexed_profile(
                     dispatch.profile_name_for_role(
                         resolve_backend_name(role), role
@@ -290,6 +302,8 @@ class IndexedW4A16Layer(torch.nn.Module):
                 device=self.weight.device,
                 expert_parallel_size=self.expert_parallel_size,
                 tensor_parallel_size=self.tensor_parallel_size,
+                shape_n=self.shape_n,
+                shape_k=self.shape_k,
             )
         return self.profile
 
@@ -647,7 +661,12 @@ def _validate_indexed_schema(
             raise ValueError("indexed W4A16 does not support input scales")
 
 
-def _host_profile(layer: object, kwargs: Mapping[str, Any]) -> IndexedLayerProfile:
+def _host_profile(
+    layer: object,
+    kwargs: Mapping[str, Any],
+    shape_n: int | None = None,
+    shape_k: int | None = None,
+) -> IndexedLayerProfile:
     explicit = kwargs.get("profile")
     if explicit is None:
         # A live `indexed_profile` property re-resolves auto layers after they
@@ -676,15 +695,42 @@ def _host_profile(layer: object, kwargs: Mapping[str, Any]) -> IndexedLayerProfi
         if isinstance(candidate, torch.Tensor) and candidate.is_cuda:
             device = candidate.device
             break
+    # The shard axis is a deployment property, not a device one, so it is taken
+    # from an explicit size when the caller states one and otherwise recovered
+    # from the projection shapes.  A framework adapter passes the same
+    # shape_n/shape_k it always passes, which is how it reaches TP8 without a
+    # chord-specific argument; an unrecognised pair infers nothing and keeps the
+    # EP8 default.
+    tensor_parallel_size = kwargs.get("tensor_parallel_size")
+    if tensor_parallel_size is None:
+        tensor_parallel_size = getattr(layer, "tensor_parallel_size", None)
+    if shape_n is None:
+        shape_n = getattr(layer, "shape_n", None)
+    if shape_k is None:
+        shape_k = getattr(layer, "shape_k", None)
+    # Resolved even when an explicit profile short-circuits the auto path, so a
+    # stated size that contradicts the shapes is rejected either way.
+    axis = resolve_shard_axis(tensor_parallel_size, shape_n, shape_k)
     if explicit == "auto" and device is None and not torch.cuda.is_available():
         # CPU/meta construction cannot inspect an architecture.  Keep the
         # Hopper metadata for the SM90 role (explicit mode, else
         # CHORD_SM90_DECODE, else the prefill default), routed through the
         # backend policy; callers targeting Blackwell should pass
-        # profile="blackwell_decode_ep8" before loading.
-        role = mode or indexed_mode_from_env() or "prefill"
+        # profile="blackwell_decode_ep8" before loading.  A TP8 layer takes the
+        # mix role, so neither the P/D bit nor the grouped switch reaches it.
+        if axis == "tp":
+            role: IndexedMode = "mix"
+        else:
+            role = mode or indexed_mode_from_env() or "prefill"
         explicit = dispatch.profile_name_for_role(resolve_backend_name(role), role)
-    profile = select_indexed_profile(explicit, mode=mode, device=device)
+    profile = select_indexed_profile(
+        explicit,
+        mode=mode,
+        device=device,
+        tensor_parallel_size=tensor_parallel_size,
+        shape_n=shape_n,
+        shape_k=shape_k,
+    )
     try:
         setattr(layer, "_w4a16_profile", profile)
     except Exception:
@@ -900,7 +946,7 @@ class IndexedW4A16Method:
                 f"indexed W4A16 requires torch.bfloat16 parameters, got {torch_dtype}"
             )
         _validate_indexed_schema(weight_schema, input_schema)
-        profile = _host_profile(layer, kwargs)
+        profile = _host_profile(layer, kwargs, shape_n, shape_k)
         if hasattr(layer, "_set_humming_meta"):
             layer_profile = getattr(layer, "indexed_profile")
             if layer_profile.name != profile.name:

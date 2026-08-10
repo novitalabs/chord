@@ -953,6 +953,47 @@ def test_tuning_rows_cover_all_routed_m() -> None:
             assert config["layout"] == meta.layout
 
 
+def test_shard_axis_shapes_match_tuning() -> None:
+    """The axis-inference table must list exactly the tuned shapes.
+
+    Shard-axis recovery keys on the published projection shapes, so if a tuned
+    shape is added to the resolver without being registered here, that shape
+    would infer the wrong axis (or none).  This reads the resolver's own guards
+    back out by asking which shapes actually get a non-fallback schedule.
+    """
+
+    from chord_kernels.operator import IndexedLayerMeta
+    from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.profiles import (
+        _EP8_SHAPES,
+        _TP8_SHAPES,
+        shard_axis_from_shapes,
+    )
+
+    assert not set(_EP8_SHAPES) & set(_TP8_SHAPES), "axes must be distinguishable"
+
+    for axis, shapes, profile_name, num_experts in (
+        ("ep", _EP8_SHAPES, "h200_prefill_ep8", 48),
+        ("tp", _TP8_SHAPES, "h200_tp8", 384),
+    ):
+        for shape_n, shape_k in shapes:
+            assert shard_axis_from_shapes(shape_n, shape_k) == axis
+            # A tuned shape resolves to a schedule the profile fallback would
+            # not produce, which is what makes it "published" for this axis.
+            meta = IndexedLayerMeta(
+                shape_n=shape_n, shape_k=shape_k, num_experts=num_experts,
+                profile=_PROFILES[profile_name],
+            )
+            tuned = meta.kernel_config(num_experts * 256)
+            assert tuned.block_m != meta.profile.block_m, (
+                f"{profile_name} {shape_n}x{shape_k} hit the profile fallback; "
+                "it is listed as a tuned shape but the resolver has no row"
+            )
+
+    # An unlisted shape must infer nothing rather than be forced onto an axis.
+    assert shard_axis_from_shapes(2048, 2048) is None
+
+
 def test_sm90_decode_env_selects_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     """CHORD_SM90_DECODE off means prefill.
 

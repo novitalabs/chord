@@ -34,7 +34,14 @@ HummingModule = torch.nn.Module
 
 
 def get_default_f16_torch_dtype() -> torch.dtype:
-    """Upstream helper: the W4A16 extraction is BF16-only."""
+    """The half-precision dtype this operator packs against: always BF16.
+
+    Convenience for adapters that ask the backend rather than hardcoding a dtype.
+    Upstream Humming has no function of this name — it resolves the f16 dtype
+    inline in ``prepare_layer_config`` from ``torch.get_default_dtype()`` and the
+    device capability, since it supports FP16 and BF16; chord's extracted W4A16
+    path is BF16-only, so the answer is constant.
+    """
     return torch.bfloat16
 
 

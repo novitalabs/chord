@@ -138,9 +138,15 @@ every rank and slices `moe_intermediate`, narrowing gate/up to `N=512` and down 
 `K=256`. The per-expert shapes and tuning tables therefore differ — see
 [shapes.md](shapes.md).
 
-Unlike the P/D role, the shard axis is not discoverable at runtime, so
-`profile="auto"` never resolves to TP8: guessing would pack the weight against the
-wrong table. Ask for it by name, or pass `tensor_parallel_size=8`:
+The axis is not a property of the device, so it is never guessed from the GPU.
+It is recovered from the projection shapes, which are distinct per axis: TP8's
+`(512, 7168)` and `(7168, 256)` against EP8's `(4096, 7168)` and `(7168, 2048)`.
+A framework adapter therefore reaches TP8 by passing the `shape_n`/`shape_k` it
+always passes, with no chord-specific argument. A shape this operator publishes
+no tuned schedule for infers nothing and keeps the EP8 default.
+
+To be explicit, ask for the profile by name or pass `tensor_parallel_size=8`
+(which also selects TP8 for a model whose shapes are not in the table):
 
 ```python
 layer = IndexedW4A16Layer(
@@ -153,8 +159,13 @@ layer = IndexedW4A16Layer(
 
 The axes also imply different deployments. The EP8 profiles are disaggregated P/D
 roles, each packing its own layout; TP8 targets a single instance (`mode="mix"`)
-serving both phases from one packed weight, so it takes no role and ignores
-`CHORD_SM90_DECODE`.
+serving both phases from one packed weight, so it takes no role and ignores both
+`CHORD_SM90_DECODE` and `CHORD_USE_GROUPED` (each grouped kernel serves one
+phase, so none can back a mix weight).
+
+If `tensor_parallel_size` contradicts a published shape — say `8` alongside EP8's
+`(4096, 7168)` — that is rejected rather than resolved, since the two disagree
+about which tuned table applies.
 
 ### Selecting the P/D role per serving instance
 
