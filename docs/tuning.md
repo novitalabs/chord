@@ -24,8 +24,7 @@ before launch. A production deployment prepares the matching profile per P/D
 instance, or keeps two packed copies of the weight. When the profile is left at
 `"auto"` on SM90, the per-instance role comes from the `CHORD_SM90_DECODE`
 environment variable (`1` decode; `0`/unset prefill; see
-[getting_started.md](getting_started.md)), mirroring
-upstream Humming's `HUMMING_INT_SM90_DECODE`. Blackwell publishes only the
+[getting_started.md](getting_started.md)). Blackwell publishes only the
 decode profile, so `"auto"` needs no role bit there.
 
 Both instruction paths put the dequantized weight in registers and the activation

@@ -954,7 +954,7 @@ def test_tuning_rows_cover_all_routed_m() -> None:
 
 
 def test_sm90_decode_env_selects_profile(monkeypatch: pytest.MonkeyPatch) -> None:
-    """CHORD_SM90_DECODE mirrors HUMMING_INT_SM90_DECODE: off means prefill.
+    """CHORD_SM90_DECODE off means prefill.
 
     The SM90 role bit only fills in when ``profile="auto"`` carries no explicit
     mode; explicit arguments always win, and any value other than 0/1 is
@@ -1019,7 +1019,11 @@ def test_layer_adapter_contract(monkeypatch: pytest.MonkeyPatch) -> None:
         calls.update(args=args, kwargs=kwargs)
         return expected
 
-    monkeypatch.setattr(layer_module, "w4a16_indexed", fake_indexed)
+    # The kernel call is dispatched flatly; the dispatch module owns the single
+    # ``w4a16_indexed`` call site.
+    from chord_kernels.operator import dispatch as dispatch_mod
+
+    monkeypatch.setattr(dispatch_mod, "w4a16_indexed", fake_indexed)
     layer._prepared_weight = object()
     inputs = torch.zeros((1, 64), dtype=torch.bfloat16)
     sorted_ids = torch.arange(8, dtype=torch.int32)

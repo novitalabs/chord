@@ -159,9 +159,9 @@ serving both phases from one packed weight, so it takes no role and ignores
 ### Selecting the P/D role per serving instance
 
 A disaggregated deployment launches prefill and decode instances from the same
-code path, so the instance role usually cannot be a Python argument. Mirroring
-upstream Humming's `HUMMING_INT_SM90_DECODE` (default off), the layer reads
-`CHORD_SM90_DECODE` when a profile is left at `"auto"` on SM90:
+code path, so the instance role usually cannot be a Python argument. The layer
+reads `CHORD_SM90_DECODE` (default off) when a profile is left at `"auto"` on
+SM90:
 
 | `CHORD_SM90_DECODE` | Resolved SM90 profile |
 | --- | --- |
