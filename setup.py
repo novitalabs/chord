@@ -24,10 +24,19 @@ def package_data(package: str) -> list[str]:
 
 
 setup(
-    # ``chord`` is the humming-compatible facade over ``chord_kernels``; it is
-    # import-root-only (no kernel sources), so it needs no package_data.
+    # ``chord`` is the humming-compatible facade over ``chord_kernels``, and
+    # ``humming`` is the import root frameworks that hardcode the upstream
+    # package name resolve (notably vLLM's lazy facade); both are
+    # import-root-only (no kernel sources), so they need no package_data.
     packages=find_packages(
-        include=("chord_kernels", "chord_kernels.*", "chord", "chord.*")
+        include=(
+            "chord_kernels",
+            "chord_kernels.*",
+            "chord",
+            "chord.*",
+            "humming",
+            "humming.*",
+        )
     ),
     # The implementation is packaged under the ``operator`` subpackage.
     package_data={"chord_kernels.operator": package_data("operator")},
