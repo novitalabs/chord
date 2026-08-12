@@ -188,6 +188,64 @@ is ignored.
 
 The table covers the EP8 axis only; `h200_tp8` takes no role, as above.
 
+## vLLM integration through the `humming` import root
+
+The distribution ships two import surfaces over the same operator:
+
+- `chord` — the humming-compatible facade (`chord.{dtypes,config,layer,ops}`)
+  for adapters written against chord directly.
+- `humming` — the upstream import root itself, for frameworks whose integration
+  hardcodes the package name. vLLM's lazy facade (`vllm/utils/humming.py`)
+  resolves fixed `humming.{dtypes,config,layer,schema,utils.weight}` module
+  paths and gates on `find_spec("humming")`; installing `chord_kernels` makes
+  both resolve to this repository with no framework change. Do not install
+  upstream `inclusionAI/humming` alongside it — the `humming` name is
+  claimed by design.
+
+Under the `humming` root the shimming scope is exactly the indexed W4A16 MoE
+contract vLLM consumes:
+
+- `humming.layer.HummingMethod` dispatches to `IndexedW4A16Method`; foreign
+  host layers are prepared through the `humming_metas` +
+  `w13_weight`/`w2_weight` naming convention vLLM already uses. The published
+  w2 tuning rows have their M tile re-mapped onto the w13 routing block-M
+  (each row keeps its own N/K tile and stream-K choice); this bakes in the
+  same adjustment that an explicit `block_m` forward argument performs, so a
+  shared `moe_align_block_size` routing stays correct on vLLM's existing call
+  shape.
+- `humming.schema` implements `HummingWeightSchema` (uint4 + group-32 +
+  BF16 scale), the BF16-passthrough `HummingInputSchema`, and a
+  compressed-tensors **pack-quantized INT4 group-32** weight schema (the
+  checkpoint format vLLM's CT-quantized MoE models ship, e.g. Kimi K2.x), so
+  both entry points in vLLM — the WNA16 MoE backend oracle and
+  `--quantization humming` — load with no framework change. Every other
+  schema name vLLM may import (AWQ/GPTQ/MXFP4/NVFP4/FP8/modelopt/AutoRound/
+  Bitnet, online `quantize_weight`, dense GEMM) exists but raises
+  `NotImplementedError`, so unsupported quantizations fail closed at load.
+  The weight-scale-2 hierarchy (`weight_scale_2_type`) and block/token scale
+  types are out of scope.
+- `humming.config` provides the `GemmType`/`WeightScaleType` enums. Only
+  `GemmType.INDEXED` resolves to a working backend here; the grouped members
+  exist so class references work and selecting them raises during schedule
+  validation.
+- Profile resolution needs no chord-specific argument from the framework:
+  the shard axis is recovered from the published projection shapes (see
+  *Selecting the shard axis*), and the SM90 P/D role follows
+  `CHORD_SM90_DECODE`.
+
+On the vLLM side two things apply. First, the humming MoE experts must admit
+group-32 INT4 through `HummingExpertsBase._supports_quant_scheme`; upstream
+branches older than the current WNA16 generalization (see vLLM PR #48918,
+which admits unsigned-integer WNA16 group scales generically) may need the
+group-32 keys added explicitly. Second, the Humming backend is selected with
+`moe_backend="humming"` (or `--quantization humming` for the schema route),
+since the automatic WNA16 priority order tries other backends first. Keep
+`VLLM_HUMMING_MOE_GEMM_TYPE` at its default indexed behavior and leave
+`VLLM_HUMMING_USE_F16_ACCUM` / `VLLM_BATCH_INVARIANT` off — the indexed
+kernel rejects those compute options. No environment variable is needed for
+TP8: `profile='auto'` recovers the shard axis from the projection shapes and
+lands on `h200_tp8`.
+
 ## Tests and benchmarks
 
 ```bash
