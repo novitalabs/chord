@@ -26,6 +26,7 @@ INT4 weights.
 | Interface | GPU | Compute capability | Scenario | Profile |
 | --- | --- | --- | --- | --- |
 | `indexed` | Hopper (H200) | SM90 (9.0) | Prefill, EP8 | `h200_prefill_ep8` |
+| `indexed` | Hopper (H200) | SM90 (9.0) | Single-instance (mix), TP8 | `h200_tp8` |
 | `indexed` | Hopper (H200) | SM90 (9.0) | Decode, EP8 | `h200_decode_ep8` |
 | `indexed` | Blackwell (B200/B300) | B200: SM100 (10.0); B300: SM103 (10.3) | Decode, EP8 | `blackwell_decode_ep8` |
 | `contiguous`, `masked` | Hopper (H200) | SM90 (9.0) | EP8/EP16/EP32 | To be released — H200 `masked` vs public Humming: 1.2–1.4x (EP16), 1.5–1.7x (EP32) |
@@ -38,7 +39,7 @@ public Humming ships only its default config strategy. Full tables are in
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
-  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the three supported scenarios, lower is better">
+  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the four supported scenarios, lower is better">
 </picture>
 
 ## Installation
@@ -86,8 +87,8 @@ for framework integration and per-instance P/D role selection — is in
   2-CTAs/SM window, and the stream-K reduction.
 - [docs/benchmarking.md](docs/benchmarking.md) — timing methods, `cos_diff`, and
   reading TFLOPS/GB-s.
-- [docs/shapes.md](docs/shapes.md) — Kimi K2.5 EP8 shape derivation, token-count
-  scoping, routing distribution, and the gate/up vs down contract.
+- [docs/shapes.md](docs/shapes.md) — Kimi K2.5 EP8 and TP8 shape derivation,
+  token-count scoping, routing distribution, and the gate/up vs down contract.
 
 ## Provenance and license
 

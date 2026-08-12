@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Render the benchmark chart embedded in the README "Performance" section.
 
-The data below mirrors the three measured-performance tables in
-docs/performance.md (H200 EP8 prefill, H200 EP8 decode, B300 EP8 decode); when
-those tables are re-measured, update the numbers here and re-run:
+The data below mirrors the measured-performance tables in docs/performance.md
+(H200 EP8 prefill, H200 TP8 mix, H200 EP8 decode, B300 EP8 decode); when those
+tables are re-measured, update the numbers here and re-run:
 
     python docs/assets/benchmark_chart.py
 
@@ -26,6 +26,18 @@ SCENARIOS = [
         [313.5, 383.4, 545.8, 997.7, 1743.1],
         [195.9, 235.1, 337.4, 606.4, 1059.4],
         [162.9, 204.5, 293.2, 533.4, 937.3],
+    ),
+    (
+        # TP8 slices moe_intermediate, so the same token count is 8x the local
+        # routed rows EP8 sees; the x axis stays num_tokens_total so the two H200
+        # chunk panels are read at the same serving load.
+        "H200 TP8 mix (WGMMA)",
+        "tokens (total)",
+        ["1024", "2048", "4096", "8196", "16384"],
+        [399.0, 476.4, 655.0, 1206.2, 2066.1],
+        [365.5, 414.6, 567.9, 1014.5, 1842.7],
+        [336.2, 429.6, 604.6, 1277.2, 2187.7],
+        [265.3, 327.1, 469.8, 847.8, 1723.5],
     ),
     (
         "H200 EP8 decode (MMA swap-AB)",
@@ -90,7 +102,14 @@ def render(theme):
             "ytick.color": theme["text"],
         }
     )
-    fig, axes = plt.subplots(1, 3, figsize=(12.8, 4.1))
+    # Two columns keeps each panel wide enough for a five-point x axis; the row
+    # count follows SCENARIOS so adding a scenario does not silently drop a panel.
+    columns = 2
+    rows = -(-len(SCENARIOS) // columns)
+    fig, axes = plt.subplots(
+        rows, columns, figsize=(8.6 * columns / 2, 4.1 * rows)
+    )
+    axes = axes.flatten()
 
     series_styles = [
         ("humming gate_up", theme["humming_gu"], "--", "o"),
@@ -134,7 +153,13 @@ def render(theme):
         )
         ax.margins(y=0.12)
 
-    axes[0].set_ylabel("\u00b5s per call (lower is better)")
+    # Label the leftmost panel of every row, and hide any trailing empty cell an
+    # odd scenario count leaves behind.
+    for index in range(0, len(SCENARIOS), columns):
+        axes[index].set_ylabel("\u00b5s per call (lower is better)")
+    for ax in axes[len(SCENARIOS):]:
+        ax.set_visible(False)
+
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
@@ -144,7 +169,9 @@ def render(theme):
         frameon=False,
         bbox_to_anchor=(0.5, 1.0),
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    # The legend sits above the grid, so reserve a slice of the figure for it that
+    # shrinks as rows are added (a fixed 0.93 would eat a whole row's title space).
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.07 / rows))
 
     out = Path(__file__).with_name(f"benchmark_chart{theme['suffix']}.svg")
     fig.savefig(out, transparent=True, bbox_inches="tight")

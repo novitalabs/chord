@@ -24,7 +24,11 @@ def package_data(package: str) -> list[str]:
 
 
 setup(
-    packages=find_packages(include=("chord_kernels", "chord_kernels.*")),
+    # ``chord`` is the humming-compatible facade over ``chord_kernels``; it is
+    # import-root-only (no kernel sources), so it needs no package_data.
+    packages=find_packages(
+        include=("chord_kernels", "chord_kernels.*", "chord", "chord.*")
+    ),
     # The implementation is packaged under the ``operator`` subpackage.
     package_data={"chord_kernels.operator": package_data("operator")},
     include_package_data=False,

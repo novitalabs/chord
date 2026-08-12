@@ -127,14 +127,52 @@ This is a single-projection weight and operator adapter, not a complete MoE plug
 with a router, activation and `w13+w2` lifecycle. It registers no vLLM quantization
 method and owns no vLLM router: the host framework still converts its own weight
 format and routing metadata to the contract above, and selects
-`profile="h200_prefill_ep8"`, `"h200_decode_ep8"` or `"blackwell_decode_ep8"`.
+`profile="h200_prefill_ep8"`, `"h200_tp8"`, `"h200_decode_ep8"` or
+`"blackwell_decode_ep8"`.
+
+### Selecting the shard axis
+
+The four profiles cover two different 8-way shardings. EP8 splits the 384 routed
+experts across ranks (48 each) and leaves every expert whole; TP8 keeps all 384 on
+every rank and slices `moe_intermediate`, narrowing gate/up to `N=512` and down to
+`K=256`. The per-expert shapes and tuning tables therefore differ — see
+[shapes.md](shapes.md).
+
+The axis is not a property of the device, so it is never guessed from the GPU.
+It is recovered from the projection shapes, which are distinct per axis: TP8's
+`(512, 7168)` and `(7168, 256)` against EP8's `(4096, 7168)` and `(7168, 2048)`.
+A framework adapter therefore reaches TP8 by passing the `shape_n`/`shape_k` it
+always passes, with no chord-specific argument. A shape this operator publishes
+no tuned schedule for infers nothing and keeps the EP8 default.
+
+To be explicit, ask for the profile by name or pass `tensor_parallel_size=8`
+(which also selects TP8 for a model whose shapes are not in the table):
+
+```python
+layer = IndexedW4A16Layer(
+    num_experts=384,
+    shape_n=512,
+    shape_k=7168,
+    profile="h200_tp8",
+)
+```
+
+The axes also imply different deployments. The EP8 profiles are disaggregated P/D
+roles, each packing its own layout; TP8 targets a single instance (`mode="mix"`)
+serving both phases from one packed weight, so it takes no role and ignores both
+`CHORD_SM90_DECODE` and `CHORD_USE_GROUPED` (each grouped kernel serves one
+phase, so none can back a mix weight).
+
+If `tensor_parallel_size` contradicts a published shape — say `8` alongside EP8's
+`(4096, 7168)` — that is rejected rather than resolved, since the two disagree
+about which tuned table applies.
 
 ### Selecting the P/D role per serving instance
 
 A disaggregated deployment launches prefill and decode instances from the same
-code path, so the instance role usually cannot be a Python argument. Mirroring
-upstream Humming's `HUMMING_INT_SM90_DECODE` (default off), the layer reads
-`CHORD_SM90_DECODE` when a profile is left at `"auto"` on SM90:
+code path, so the instance role usually cannot be a Python argument. The layer
+reads `CHORD_SM90_DECODE` (default off) when a profile is left at `"auto"` on
+SM90:
 
 | `CHORD_SM90_DECODE` | Resolved SM90 profile |
 | --- | --- |
@@ -147,6 +185,8 @@ the profile is resolved and must be set before model load; it cannot switch an
 already packed layer at runtime. Blackwell publishes only the decode profile,
 so `profile="auto"` resolves to `blackwell_decode_ep8` there and the variable
 is ignored.
+
+The table covers the EP8 axis only; `h200_tp8` takes no role, as above.
 
 ## Tests and benchmarks
 

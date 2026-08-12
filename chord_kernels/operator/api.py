@@ -277,8 +277,9 @@ def w4a16_indexed(
 ) -> torch.Tensor:
     """Run BF16 x INT4 group-32 indexed MoE GEMM.
 
-    The three profiles select a narrow shape-aware tile table: H200 prefill uses
-    WGMMA, while decode uses MMA (swap-AB for small token blocks). All rows load
+    Each published profile selects a narrow shape-aware tile table: the H200
+    prefill and TP8 profiles use WGMMA, while the decode profiles use MMA
+    (swap-AB for small token blocks). All rows load
     through cp.async rather than TMA; stream-K is enabled per row by the layer's
     tuning table and can be requested here through ``config``. If no explicit
     config is supplied, block-N defaults to the largest compatible power of two
