@@ -2,8 +2,9 @@
 """Render the benchmark chart embedded in the README "Performance" section.
 
 The data below mirrors the measured-performance tables in docs/performance.md
-(H200 EP8 prefill, H200 TP8 mix, H200 EP8 decode, B300 EP8 decode); when those
-tables are re-measured, update the numbers here and re-run:
+(H200 EP8 indexed prefill, H200 TP8 indexed mix, H200 EP8 indexed decode,
+B300 EP8 indexed decode, H200 EP8 grouped prefill/decode); when those tables
+are re-measured, update the numbers here and re-run:
 
     python docs/assets/benchmark_chart.py
 
@@ -19,7 +20,7 @@ import matplotlib.pyplot as plt
 #  humming down, chord down) — all times are per-call microseconds.
 SCENARIOS = [
     (
-        "H200 EP8 prefill (WGMMA)",
+        "H200 EP8 indexed prefill (WGMMA)",
         "routed tokens (total)",
         ["1024", "2048", "4096", "8196", "16384"],
         [375.0, 466.3, 608.4, 1085.7, 1903.0],
@@ -31,7 +32,7 @@ SCENARIOS = [
         # TP8 slices moe_intermediate, so the same token count is 8x the local
         # routed rows EP8 sees; the x axis stays num_tokens_total so the two H200
         # chunk panels are read at the same serving load.
-        "H200 TP8 mix (WGMMA)",
+        "H200 TP8 indexed mix (WGMMA)",
         "tokens (total)",
         ["1024", "2048", "4096", "8196", "16384"],
         [399.0, 476.4, 655.0, 1206.2, 2066.1],
@@ -40,7 +41,7 @@ SCENARIOS = [
         [265.3, 327.1, 469.8, 847.8, 1723.5],
     ),
     (
-        "H200 EP8 decode (MMA swap-AB)",
+        "H200 EP8 indexed decode (MMA swap-AB)",
         "tokens per GPU",
         ["20", "30", "40", "50"],
         [267.6, 281.3, 284.0, 296.4],
@@ -49,13 +50,36 @@ SCENARIOS = [
         [111.9, 116.8, 123.0, 126.4],
     ),
     (
-        "B300 EP8 decode (MMA swap-AB)",
+        "B300 EP8 indexed decode (MMA swap-AB)",
         "tokens per GPU",
         ["20", "30", "40", "50"],
         [319.1, 320.4, 320.6, 320.9],
         [146.0, 162.3, 175.2, 182.9],
         [174.8, 181.3, 181.4, 181.7],
         [83.8, 91.3, 91.9, 95.1],
+    ),
+    (
+        # The grouped panels are a different kernel family (DeepGEMM-derived TMA
+        # + persistent WGMMA) against Humming's own grouped path, so they are
+        # labelled by mode rather than by the indexed profile name.  Rows per
+        # expert are multiples of the 128-row tile boundary on both sides, so
+        # each point is the same GEMM shape for both implementations.
+        "H200 EP8 grouped prefill (contiguous)",
+        "rows per expert",
+        ["128", "256", "512"],
+        [777.2, 1393.2, 2265.0],
+        [607.1, 1186.9, 2318.2],
+        [426.8, 751.3, 1261.7],
+        [310.4, 604.4, 1196.1],
+    ),
+    (
+        "H200 EP8 grouped decode (masked)",
+        "tokens per expert",
+        ["8", "16", "32", "64"],
+        [308.8, 329.7, 452.3, 508.0],
+        [248.8, 266.5, 329.2, 435.2],
+        [166.5, 176.2, 214.0, 269.5],
+        [132.5, 138.7, 164.2, 233.0],
     ),
 ]
 
@@ -102,9 +126,10 @@ def render(theme):
             "ytick.color": theme["text"],
         }
     )
-    # Two columns keeps each panel wide enough for a five-point x axis; the row
-    # count follows SCENARIOS so adding a scenario does not silently drop a panel.
-    columns = 2
+    # Three columns keeps the figure wide rather than tall, which reads better
+    # embedded in the README; the row count follows SCENARIOS so adding a
+    # scenario does not silently drop a panel.
+    columns = 3
     rows = -(-len(SCENARIOS) // columns)
     fig, axes = plt.subplots(
         rows, columns, figsize=(8.6 * columns / 2, 4.1 * rows)

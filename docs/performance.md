@@ -78,3 +78,42 @@ its B300 numbers are an untuned reference point — note how its time barely
 moves from 20 to 50 tokens per GPU, and how it reads roughly the same GB/s on
 B300 as on H200 despite the wider memory system. Read the H200 ratios as the
 honest tuned-to-tuned comparison.
+
+## H200 EP8 grouped prefill (`h200_grouped_prefill`, contiguous)
+
+The grouped rows compare against public Humming's own `grouped_contiguous`
+path, not its indexed one, since that is the contract this backend replaces
+(see [optimizations.md](optimizations.md)). Rows per expert are multiples of the
+128-row tile boundary on both sides — `bench_humming.py --balanced` and the
+aligned cases in `tests/test_w4a16_grouped.py` — so each row is the same GEMM
+shape for both implementations and no tile is spent on padding. 48 local
+experts (EP8); `rows/E` x 48 is the total routed rows.
+
+| Stage | rows/E | humming µs | chord µs | chord TFLOPS | Speedup | gate_up + down |
+| --- | --- | --- | --- | --- | --- | --- |
+| gate_up | 128 | 777.2 | 607.1 | 594 | 1.28 | 1.31 |
+| gate_up | 256 | 1393.2 | 1186.9 | 608 | 1.17 | 1.20 |
+| gate_up | 512 | 2265.0 | 2318.2 | 623 | 0.98 | 1.00 |
+| down | 128 | 426.8 | 310.4 | 581 | 1.38 | |
+| down | 256 | 751.3 | 604.4 | 597 | 1.24 | |
+| down | 512 | 1261.7 | 1196.1 | 603 | 1.05 | |
+
+## H200 EP8 grouped decode (`h200_grouped_decode`, masked)
+
+Tokens per expert; the per-GPU batch is `tokens/E * 48 / top_k`, so the 8-token
+row is the one that matches the decode counts in [shapes.md](shapes.md).
+
+| Stage | tokens/E | humming µs | chord µs | chord GB/s | Speedup | gate_up + down |
+| --- | --- | --- | --- | --- | --- | --- |
+| gate_up | 8 | 308.8 | 248.8 | 3220 | 1.24 | 1.25 |
+| gate_up | 16 | 329.7 | 266.5 | 3041 | 1.24 | 1.25 |
+| gate_up | 32 | 452.3 | 329.2 | 2516 | 1.37 | 1.35 |
+| gate_up | 64 | 508.0 | 435.2 | 1986 | 1.17 | 1.16 |
+| down | 8 | 166.5 | 132.5 | 3043 | 1.26 | |
+| down | 16 | 176.2 | 138.7 | 2961 | 1.27 | |
+| down | 32 | 214.0 | 164.2 | 2592 | 1.30 | |
+| down | 64 | 269.5 | 233.0 | 1953 | 1.16 | |
+
+EP16 (24 experts) and EP32 (12 experts) run the same tables; the grouped
+profiles are EP-width agnostic and measure 1.18-1.34x and 1.13-1.30x per layer
+over the same baseline.

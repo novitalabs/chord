@@ -11,11 +11,14 @@ only; ``masked_m`` carries the authoritative per-group row counts.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from chord_kernels.operator import ops
 from chord_kernels.operator.grouped.heuristics import (
     W4A16GemmDesc,
+    _env_int,
     select_w4a16_config,
 )
 from chord_kernels.operator.grouped.kernel import GroupedW4A16Kernel
@@ -73,15 +76,42 @@ def _check_activation(inputs: torch.Tensor, shape_k: int) -> None:
         raise ValueError("inputs must be non-empty")
 
 
+@functools.lru_cache(maxsize=8)
 def _num_sms(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def _resolve_kernel(desc: W4A16GemmDesc) -> GroupedW4A16Kernel:
+def _env_tuning_key() -> tuple[int | None, ...]:
+    """The ``CHORD_W4A16_*`` overrides the heuristic reads, as a cache key part.
+
+    The layout search consults these at call time, so they have to participate
+    in the memo key: a tuning sweep that exports a new BM/BN between launches
+    must not keep replaying the layout picked under the previous values.
+    """
+    return tuple(_env_int(name) for name in ("BM", "BN", "BK", "CM", "CN", "STAGES"))
+
+
+@functools.lru_cache(maxsize=256)
+def _resolve_kernel_cached(
+    desc: W4A16GemmDesc, _env_key: tuple[int | None, ...]
+) -> GroupedW4A16Kernel:
     config = select_w4a16_config(desc)
     kernel = GroupedW4A16Kernel(desc=desc, config=config)
     kernel.load_cubin()
     return kernel
+
+
+def _resolve_kernel(desc: W4A16GemmDesc) -> GroupedW4A16Kernel:
+    """Select the layout and load its cubin, memoized on the problem shape.
+
+    The layout search plus ``load_cubin`` costs ~30us of CPU per call, which is
+    pure overhead once a shape has been seen: a serving process replays a
+    handful of descs (one per projection per phase) for the whole run.  Leaving
+    it uncached puts that cost on every forward, where it is invisible behind a
+    large GEMM but dominates a small decode launch whose kernel is ~37us.  This
+    mirrors the indexed path's ``_get_indexed_kernel`` cache.
+    """
+    return _resolve_kernel_cached(desc, _env_tuning_key())
 
 
 def w4a16_masked(

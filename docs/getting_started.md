@@ -252,14 +252,18 @@ contract vLLM consumes:
   `NotImplementedError`, so unsupported quantizations fail closed at load.
   The weight-scale-2 hierarchy (`weight_scale_2_type`) and block/token scale
   types are out of scope.
-- `humming.config` provides the `GemmType`/`WeightScaleType` enums. Only
-  `GemmType.INDEXED` resolves to a working backend here; the grouped members
-  exist so class references work and selecting them raises during schedule
-  validation.
+- `humming.config` provides the `GemmType`/`WeightScaleType` enums.
+  `GemmType.INDEXED` and both grouped members resolve to working backends, but
+  the value must agree with what the weight was packed for: a layer packed
+  `indexed` rejects a grouped `gemm_type` and a grouped layer rejects the other
+  mode's, since the packed bytes differ. `GemmType.DENSE` is not implemented.
 - Profile resolution needs no chord-specific argument from the framework:
   the shard axis is recovered from the published projection shapes (see
   *Selecting the shard axis*), and the SM90 P/D role follows
-  `CHORD_SM90_DECODE`.
+  `CHORD_SM90_DECODE`. The grouped backends need no framework argument either:
+  `CHORD_USE_GROUPED=1` reroutes `profile='auto'` to them, and the routing
+  tensors they consume (`expert_layout` / `m_indices`) are already part of the
+  delegation signature vLLM passes.
 
 On the vLLM side two things apply. First, the humming MoE experts must admit
 group-32 INT4 through `HummingExpertsBase._supports_quant_scheme`; upstream
@@ -267,12 +271,13 @@ branches older than the current WNA16 generalization (see vLLM PR #48918,
 which admits unsigned-integer WNA16 group scales generically) may need the
 group-32 keys added explicitly. Second, the Humming backend is selected with
 `moe_backend="humming"` (or `--quantization humming` for the schema route),
-since the automatic WNA16 priority order tries other backends first. Keep
-`VLLM_HUMMING_MOE_GEMM_TYPE` at its default indexed behavior and leave
-`VLLM_HUMMING_USE_F16_ACCUM` / `VLLM_BATCH_INVARIANT` off — the indexed
-kernel rejects those compute options. No environment variable is needed for
-TP8: `profile='auto'` recovers the shard axis from the projection shapes and
-lands on `h200_tp8`.
+since the automatic WNA16 priority order tries other backends first. Leave
+`VLLM_HUMMING_USE_F16_ACCUM` / `VLLM_BATCH_INVARIANT` off — neither backend
+implements those compute options. `VLLM_HUMMING_MOE_GEMM_TYPE` must agree with
+what the weight was packed for: its default indexed behavior for an indexed
+layer, or the matching grouped value when `CHORD_USE_GROUPED=1` is set. No
+environment variable is needed for TP8: `profile='auto'` recovers the shard
+axis from the projection shapes and lands on `h200_tp8`.
 
 ## Tests and benchmarks
 

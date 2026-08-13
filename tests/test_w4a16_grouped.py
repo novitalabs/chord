@@ -50,6 +50,11 @@ from roofline import (  # noqa: E402  (needs the sys.path setup above)
     throughput_columns,
     traffic_bytes,
 )
+from bench import (  # noqa: E402  (needs the sys.path setup above)
+    BENCH_METHODS,
+    DEFAULT_BENCH_METHOD,
+    benchmark,
+)
 
 _COSINE_LIMIT = 1e-3
 _W4A16_GROUP = 32
@@ -95,6 +100,17 @@ class MaskedCase:
         )
 
 
+# Per-expert runs must begin on a BLOCK_M boundary: the contiguous scheduler
+# reads the expert id at each tile's first row
+# (``grouped_layout[m_block_idx * BLOCK_M]``) and applies it to the whole tile,
+# so a tile may not straddle two experts.  W4A16 picks BLOCK_M 64 or 128, and
+# 128 is the safe bound that covers both -- the same value DeepGEMM carries as
+# ``kLegacyMKAlignmentForContiguousLayout``.  Rows past an expert's real count
+# are masked out per row (``grouped_layout[...] >= 0``), so they never corrupt
+# the output but they DO occupy tiles and cost time.
+CONTIGUOUS_ROW_ALIGNMENT = 128
+
+
 @dataclass(frozen=True)
 class ContiguousCase:
     num_groups: int
@@ -111,19 +127,43 @@ class ContiguousCase:
 
 
 # The upstream tuning matrix restricted to a fast, representative subset:
-# EP16/EP32 groups, both projections, small/mid/large decode buckets.
+# EP8/EP16/EP32 groups, both projections, small/mid/large decode buckets.
+# EP8 (G=48) is the shape docs/shapes.md derives, and it is also the width
+# where the masked BN rule flips: BN=256 needs enough N-tiles to fill the
+# machine, and the tile count scales with G.
 MASKED_CASES = [
     MaskedCase(g, 256, em, n, k)
-    for g in (24, 12)
+    for g in (48, 24, 12)
     for (n, k) in ((4096, 7168), (7168, 2048))
-    for em in (8, 16, 64)
+    for em in (8, 16, 32, 64)
 ]
+# ``m/grp`` values are multiples of CONTIGUOUS_ROW_ALIGNMENT so every expert
+# fills whole tiles: the kernel then processes exactly the useful rows, and the
+# timing is directly comparable with a baseline fed the same per-expert counts.
 CONTIGUOUS_CASES = [
     ContiguousCase(g, mpg, n, k)
     for g in (48, 24)
     for (n, k) in ((4096, 7168), (7168, 2048))
-    for mpg in (37, 128, 1024)
+    for mpg in (128, 256, 512)
 ]
+
+# Kimi K2.5 routing, the configuration these shapes are derived for; see
+# docs/shapes.md.  Used only to restate ``m/grp`` as the serving-side token
+# count each row models, so a tuning row can be matched to a deployment.
+_ROUTED_EXPERTS = 384
+_TOP_K = 8
+
+
+def prefill_chunk_tokens(case: ContiguousCase) -> int:
+    """System-wide chunk size a contiguous-prefill row models.
+
+    A chunk of ``T`` tokens fans out to ``T * top_k`` routes across all 384
+    experts, of which this rank owns ``G``, so ``T * top_k * G / 384`` rows
+    land here and each local expert sees ``m/grp`` of them.  Solving for ``T``
+    cancels ``G``: at a given ``m/grp`` every EP width models the same chunk,
+    which is what makes the two ``G`` blocks comparable row for row.
+    """
+    return case.expected_m_per_group * _ROUTED_EXPERTS // _TOP_K
 
 
 def _reset_seed(seed: int = 0) -> None:
@@ -161,12 +201,14 @@ def make_masked_case(case: MaskedCase, device: torch.device):
 
 def make_contiguous_case(case: ContiguousCase, device: torch.device):
     """Build (a2, codes, scale, m_indices, ref, bounds) in the kernel's native
-    contiguous layout: per-expert runs padded to a 128-row boundary, padding
-    rows zeroed with m_indices == -1."""
+    contiguous layout: per-expert runs starting on a
+    ``CONTIGUOUS_ROW_ALIGNMENT`` boundary, padding rows zeroed with
+    m_indices == -1."""
     _reset_seed()
     g, mpg, n, k = case.num_groups, case.expected_m_per_group, case.n, case.k
-    actual_ms = [max(1, int(mpg * random.uniform(0.7, 1.3))) for _ in range(g)]
-    aligned_ms = [((am + 127) // 128) * 128 for am in actual_ms]
+    align = CONTIGUOUS_ROW_ALIGNMENT
+    actual_ms = [mpg] * g
+    aligned_ms = [((am + align - 1) // align) * align for am in actual_ms]
     m = sum(aligned_ms)
 
     a2 = torch.randn((m, k), device=device, dtype=torch.bfloat16)
@@ -217,6 +259,19 @@ def _expected_masked_config(num_sms: int = 132):
         (2048, 16, 7168, 12): (24, 256, 128, 4),
         (7168, 64, 4096, 48): (88, 256, 128, 4),
         (2048, 64, 7168, 48): (80, 128, 128, 6),
+        # EP8 (G=48), the width docs/shapes.md derives.  Its N-tile count is
+        # past the 3-wave mark at both projections, so BN=256 survives every
+        # bracket except the bm>=72 cutoff that sends down/em=64 to BN=128
+        # above -- i.e. EP8 exercises the wave guard's saturated side, while
+        # EP32 (G=12, gate_up) is the only width that falls under 2 waves.
+        (7168, 8, 4096, 48): (16, 256, 128, 4),
+        (7168, 32, 4096, 48): (48, 256, 128, 4),
+        (2048, 8, 7168, 48): (16, 256, 128, 4),
+        (2048, 32, 7168, 48): (40, 256, 128, 4),
+        # EP32 gate_up: 192 N-tiles < 2 waves, the one bracket that drops to
+        # BN=128 on wave quantization rather than on the register ceiling.
+        (7168, 8, 4096, 12): (16, 128, 128, 4),
+        (7168, 32, 4096, 12): (48, 128, 128, 4),
     }
 
 
@@ -460,8 +515,17 @@ def test_masked_w4a16_correctness(case: MaskedCase, hopper: torch.device) -> Non
         assert diff < _COSINE_LIMIT, (case.label, j, mm, diff)
 
 
+# One case per decode bucket at a single shape: the flat/3D equivalence is a
+# calling-convention property, so it needs the bucket spread rather than the
+# full shape matrix.  Selected by value so extending MASKED_CASES cannot
+# silently change which buckets this covers.
+_FLAT_BUFFER_CASES = [
+    case for case in MASKED_CASES if (case.num_groups, case.n) == (24, 4096)
+]
+
+
 @pytest.mark.gpu
-@pytest.mark.parametrize("case", MASKED_CASES[:3], ids=lambda c: c.label)
+@pytest.mark.parametrize("case", _FLAT_BUFFER_CASES, ids=lambda c: c.label)
 def test_masked_w4a16_flat_input_and_output_buffer(
     case: MaskedCase, hopper: torch.device
 ) -> None:
@@ -609,19 +673,26 @@ def test_layer_contiguous_prefill_end_to_end(hopper: torch.device) -> None:
 # compute bound, so it goes on TFLOPS (matching the indexed tables).  Both
 # ceilings describe the same operating point, so the number is the same either
 # way -- only its placement says which resource is saturated.
-_BASE_COLUMNS: tuple[tuple[str, int], ...] = (
-    ("proj", 7),
-    ("n", 5),
-    ("k", 5),
-    ("G", 4),
-    ("m/grp", 6),
-    ("routed_m", 8),
-    ("blk_k", 5),
-    ("us", 9),
-    ("TFLOPS", 11),
-    ("GB/s", 13),
-    ("cos_diff", 9),
-)
+#
+# ``m/grp`` is the kernel-side knob (rows per expert, what picks the tile).
+# Prefill adds one column restating it as the system-wide chunk size, since a
+# chunked-prefill deployment is configured in tokens; decode omits it, as its
+# per-GPU batch is already the ``m/grp``/top_k relation read off ``G``.
+def _base_columns(token_column: str | None) -> tuple[tuple[str, int], ...]:
+    return (
+        ("proj", 7),
+        ("n", 5),
+        ("k", 5),
+        ("G", 4),
+        ("m/grp", 6),
+        *(((token_column, 9),) if token_column else ()),
+        ("routed_m", 8),
+        ("blk_k", 5),
+        ("us", 9),
+        ("TFLOPS", 11),
+        ("GB/s", 13),
+        ("cos_diff", 9),
+    )
 
 
 def _projection(n: int, k: int) -> str:
@@ -634,7 +705,11 @@ def _projection(n: int, k: int) -> str:
     return "gate_up" if k > n else "down"
 
 
-def run_perf_table(device: torch.device, iterations: int = 20) -> None:
+def run_perf_table(
+    device: torch.device,
+    iterations: int = 20,
+    method: str = DEFAULT_BENCH_METHOD,
+) -> None:
     """Print the grouped roofline tables in the indexed table's column layout.
 
     Each case is checked against the same plain-PyTorch reference the
@@ -646,25 +721,28 @@ def run_perf_table(device: torch.device, iterations: int = 20) -> None:
         w4a16_masked,
     )
 
-    def bench(fn, iters: int = iterations) -> float:
-        for _ in range(3):
-            fn()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) / iters / 1e3  # seconds
+    def bench(fn) -> float:
+        # Shared with the indexed table (tests/bench.py): the default ``triton``
+        # method is ``do_bench(warmup=100, rep=1000)``, matching upstream
+        # Humming's benchmarks/bench_humming.py so rows compare one-to-one.
+        # ``kineto`` reports the kernel's own GPU time, excluding the launch
+        # path, which is what to use when a small decode shape is dominated by
+        # per-call overhead rather than by the GEMM.
+        _, seconds = benchmark(
+            fn, device=device, method=method, iterations=iterations
+        )
+        return seconds
 
     # Prefill first, then decode, matching the order of the indexed tables.
-    contiguous_columns = throughput_columns(_BASE_COLUMNS, compute_bound=True)
+    contiguous_columns = throughput_columns(
+        _base_columns("chunk_tok"), compute_bound=True
+    )
     print_group(
         "grouped contiguous prefill (BLOCK_K=64) -- inputs [m, K], routing = "
-        "m_indices with per-expert runs padded to 128 rows; m/grp = expected "
-        "rows per expert",
+        f"m_indices with per-expert runs on {CONTIGUOUS_ROW_ALIGNMENT}-row "
+        "boundaries; m/grp = rows per expert; chunk_tok = system-wide "
+        f"chunked-prefill tokens that produces it at {_ROUTED_EXPERTS} experts "
+        f"/ top_k {_TOP_K} (EP-width independent)",
         contiguous_columns,
     )
     for case in CONTIGUOUS_CASES:
@@ -694,6 +772,7 @@ def run_perf_table(device: torch.device, iterations: int = 20) -> None:
             str(case.k),
             str(case.num_groups),
             str(case.expected_m_per_group),
+            str(prefill_chunk_tokens(case)),
             str(valid_m),
             "64",
             f"{t * 1e6:.1f}",
@@ -702,7 +781,7 @@ def run_perf_table(device: torch.device, iterations: int = 20) -> None:
             f"{cos:.2e}",
         ), contiguous_columns)
 
-    masked_columns = throughput_columns(_BASE_COLUMNS, compute_bound=False)
+    masked_columns = throughput_columns(_base_columns(None), compute_bound=False)
     print_group(
         "grouped masked decode (BLOCK_K=128) -- inputs [G, max_m, K], routing = "
         "per-expert valid row counts; m/grp = expected tokens per expert",
@@ -772,7 +851,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--iterations",
         type=int,
         default=20,
-        help="timed iterations per case (default: 20)",
+        help="timed iterations per case (default: 20; unused by 'triton')",
+    )
+    parser.add_argument(
+        "--bench-method",
+        choices=BENCH_METHODS,
+        default=DEFAULT_BENCH_METHOD,
+        help=(
+            "timing method (default: %(default)s, matching upstream Humming's "
+            "do_bench; 'kineto' excludes launch overhead)"
+        ),
     )
     parser.add_argument("--device", default="cuda")
     return parser.parse_args(argv)
@@ -793,9 +881,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print(
         f"{torch.cuda.get_device_name(device)} (SM{major}{minor}) -- grouped "
-        "W4A16, BF16 activation x INT4 weight, group-32 scale"
+        "W4A16, BF16 activation x INT4 weight, group-32 scale -- timing: "
+        f"{args.bench_method}"
     )
-    run_perf_table(device, iterations=args.iterations)
+    run_perf_table(
+        device, iterations=args.iterations, method=args.bench_method
+    )
     print(flush=True)
 
 

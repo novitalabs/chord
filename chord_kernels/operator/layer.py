@@ -277,8 +277,8 @@ class IndexedW4A16Layer(torch.nn.Module):
                 # Hopper schedule as a provisional layout — the SM90 role
                 # comes from the explicit mode, else CHORD_SM90_DECODE, else
                 # the prefill default, routed through the backend policy
-                # (CHORD_USE_GROUPED reroutes both roles once the grouped
-                # backend is registered).  An auto layer moved to Blackwell
+                # (CHORD_USE_GROUPED reroutes both roles to the grouped
+                # profiles).  An auto layer moved to Blackwell
                 # must be recreated with the explicit Blackwell profile so
                 # weights are never silently repacked for another layout.
                 #

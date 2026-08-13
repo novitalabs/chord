@@ -34,13 +34,15 @@ INT4 weights.
 
 ## Performance
 
-Per-call latency against the public Humming `indexed` path; on SM100/SM103
-public Humming ships only its default config strategy. Full tables are in
+Per-call latency against public Humming, each backend measured against the
+matching Humming path (`indexed` against `indexed`, the grouped modes against
+Humming's own `grouped_contiguous`/`grouped_masked`); on SM100/SM103 public
+Humming ships only its default config strategy. Full tables are in
 [docs/performance.md](docs/performance.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
-  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the four supported scenarios, lower is better">
+  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the six measured scenarios, lower is better">
 </picture>
 
 ## Installation
