@@ -29,17 +29,20 @@ INT4 weights.
 | `indexed` | Hopper (H200) | SM90 (9.0) | Single-instance (mix), TP8 | `h200_tp8` |
 | `indexed` | Hopper (H200) | SM90 (9.0) | Decode, EP8 | `h200_decode_ep8` |
 | `indexed` | Blackwell (B200/B300) | B200: SM100 (10.0); B300: SM103 (10.3) | Decode, EP8 | `blackwell_decode_ep8` |
-| `contiguous`, `masked` | Hopper (H200) | SM90 (9.0) | EP8/EP16/EP32 | To be released — H200 `masked` vs public Humming: 1.2–1.4x (EP16), 1.5–1.7x (EP32) |
+| `masked` | Hopper (H200) | SM90 (9.0) | Decode, EP8/EP16/EP32 | `h200_grouped_decode` |
+| `contiguous` | Hopper (H200) | SM90 (9.0) | Prefill, EP8/EP16/EP32 | `h200_grouped_prefill` |
 
 ## Performance
 
-Per-call latency against the public Humming `indexed` path; on SM100/SM103
-public Humming ships only its default config strategy. Full tables are in
+Per-call latency against public Humming, each backend measured against the
+matching Humming path (`indexed` against `indexed`, the grouped modes against
+Humming's own `grouped_contiguous`/`grouped_masked`); on SM100/SM103 public
+Humming ships only its default config strategy. Full tables are in
 [docs/performance.md](docs/performance.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
-  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the four supported scenarios, lower is better">
+  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the six measured scenarios, lower is better">
 </picture>
 
 ## Installation
@@ -47,6 +50,19 @@ public Humming ships only its default config strategy. Full tables are in
 ```bash
 pip install git+https://github.com/novitalabs/chord.git
 ```
+
+NVIDIA CUTLASS ships as a git submodule and supplies the arch headers the JIT
+compiles against; `pip` fetches it as part of the command above. A source
+checkout needs it initialized explicitly:
+
+```bash
+git clone --recurse-submodules https://github.com/novitalabs/chord.git
+cd chord
+pip install -e .
+```
+
+For a checkout that already exists, run `git submodule update --init --recursive`
+first.
 
 ## Quick start
 
@@ -75,6 +91,31 @@ The full API surface — packing layouts, the routing contract, the layer adapte
 for framework integration and per-instance P/D role selection — is in
 [docs/getting_started.md](docs/getting_started.md).
 
+### DeepGEMM-layout grouped paths (SM90)
+
+The `masked` (decode) and `contiguous` (prefill) interfaces consume the
+DeepGEMM-native group layouts and pack a different weight buffer via
+`pack_w4a16_grouped`. The two modes are not interchangeable: masked packs
+with BLOCK_K=128, contiguous with BLOCK_K=64, and the packed buffer records
+the mode so a mismatch fails loudly at dispatch.
+
+```python
+from chord_kernels import contiguous, masked
+from chord_kernels.operator import pack_w4a16_grouped
+
+# decode: activations laid out per expert with a fixed row budget per expert
+packed_masked = pack_w4a16_grouped(weight, scale, "masked")
+out = masked(a3, packed_masked, masked_m, expected_m)    # [G, max_m, N]
+
+# prefill: activations concatenated per expert, padded to 128-row boundaries
+packed_contig = pack_w4a16_grouped(weight, scale, "contiguous")
+out = contiguous(a2, packed_contig, m_indices)           # [m, N]
+```
+
+Layer-level, `select_indexed_profile("auto")` keeps the indexed phase-1
+profiles by default; setting `CHORD_USE_GROUPED=1` before model
+load reroutes both SM90 roles to `h200_grouped_{prefill,decode}`.
+
 ## Documentation
 
 - [docs/getting_started.md](docs/getting_started.md) — JIT cache, low-level
@@ -95,8 +136,16 @@ for framework integration and per-instance P/D role selection — is in
 This repository derives from the public `inclusionAI/humming` commit
 [`4351af3a8fcdce1a8dee50104ba49566af2427fb`](https://github.com/inclusionAI/humming/commit/4351af3a8fcdce1a8dee50104ba49566af2427fb);
 "based on Humming" describes source lineage, not a runtime dependency. The
-extraction scope, W4A16 modifications and retained files are listed in
+SM90 `masked`/`contiguous` backend additionally vendors the W4A16 kernel and
+its launch heuristics from `deepseek-ai/DeepGEMM`
+([public release commit `7f2a703`](https://github.com/deepseek-ai/DeepGEMM/tree/7f2a703ed51ac1f7af07f5e1453b2d3267d37d50),
+secondarily developed; MIT), together with the arch-level CUTLASS/CuTe headers
+it includes (BSD-3-Clause, NVIDIA). The extraction scope, W4A16 modifications and
+retained files of both upstreams are listed in
 [chord_kernels/operator/SOURCE.md](chord_kernels/operator/SOURCE.md). The
-upstream Apache-2.0 license text is in
-[chord_kernels/operator/LICENSE](chord_kernels/operator/LICENSE); the repository
-as a whole is Apache-2.0.
+upstream license texts are in
+[chord_kernels/operator/LICENSE](chord_kernels/operator/LICENSE),
+[chord_kernels/operator/include/deep_gemm/LICENSE](chord_kernels/operator/include/deep_gemm/LICENSE)
+and
+[chord_kernels/operator/include/cutlass/LICENSE.txt](chord_kernels/operator/include/cutlass/LICENSE.txt);
+the repository as a whole is Apache-2.0.

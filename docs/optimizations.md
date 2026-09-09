@@ -22,6 +22,8 @@ each supported part.
 | H200 TP8 indexed, single-instance mix | WGMMA, generic block-M argmin, stream-K always on | Same WGMMA improvements, plus the TP-scale block-M windows, down's block-N halving for 2 CTAs/SM, and per-projection stream-K crossovers |
 | H200 EP8 indexed decode | WGMMA (no decode-specific path) | MMA `swap-AB` decode kernel: 4 CTAs/SM, semi-static token-tile schedule, fused dequant+scale |
 | Blackwell (B200/B300) EP8 indexed decode | Default config strategy only (no SM100 heuristics) | Same MMA `swap-AB` kernel with EP8-tuned tile tables (stream-K on deep-K gate/up), `sm_100a`/`sm_103a` JIT targets |
+| H200 grouped prefill (`contiguous`) | Humming's own grouped kernel, generic per-`shape_m` config | DeepGEMM-derived kernel: INT4 bit-permuted weight at BLOCK_K=64, MN-major scale, BM128/BK64 tile |
+| H200 grouped decode (`masked`) | Humming's own grouped kernel, generic per-`shape_m` config | Same kernel at BLOCK_K=128, K-gated BLOCK_M covering the routed tail, wave-aware BLOCK_N, buffered-K stage depth |
 
 ## H200 EP8 indexed prefill (`h200_prefill_ep8`, WGMMA)
 
@@ -173,6 +175,78 @@ token counts. SM100 and SM103 share one tile table, tuned on B300 (148 SMs):
 - JIT targets `sm_100a` (B200) and `sm_103a` (B300) separately per detected
   capability; cubins are not shared across the two.
 
-On B300 the decode sweep (`tests/test_w4a16.py`, triton `do_bench`) measures
+On B300 the decode sweep (`tests/test_w4a16_indexed.py`, triton `do_bench`) measures
 gate/up 146/162/181/183 us and down 84/91/92/95 us at 20/30/40/50 tokens per
 GPU.
+
+## H200 grouped W4A16 (`h200_grouped_prefill` / `h200_grouped_decode`)
+
+The two grouped profiles do not extend the Humming kernel at all: they run a
+different kernel family, derived from `deepseek-ai/DeepGEMM`'s SM90 FP8 GEMM
+specialized to INT4 weights (provenance and the vendored file list are in
+`chord_kernels/operator/SOURCE.md`). Public Humming ships its own
+`grouped_contiguous` / `grouped_masked` path; this repository replaces it
+wholesale rather than tuning it, so the comparison below is between two
+implementations of the same contract, not a baseline plus patches.
+
+The two share their Hopper mainloop structure — both issue weight loads through
+TMA descriptors from a dedicated producer warpgroup while consumer warpgroups
+run WGMMA (Humming enables `use_tma`/`use_warp_spec`/`use_mbarrier` for every
+non-indexed `gemm_type`, see `humming/tune/sm90.py`). The differences are in the
+weight buffer and in how the launch schedule is chosen:
+
+- **A bit-permuted INT4 weight buffer.** The weight is reordered at pack time
+  into the layout the dequant path consumes (`pack_w4a16_grouped`), so the
+  mainloop turns four-bit codes into BF16 operands with shifts and a
+  `prmt`-style nibble map instead of gathering scattered nibbles. The perm
+  width is baked into the buffer, which is why the two modes are separate
+  profiles: masked packs at BLOCK_K=128 and contiguous at BLOCK_K=64, and the
+  buffers are not interchangeable.
+- **Weight-scale TMA in MN-major order.** Humming checkpoints store scales
+  N-major `[G, N, K/32]`; the kernel's SFA descriptor reads
+  `[G, K/32, N]`. That transpose happens once at pack time, so the forward hot
+  path never reshapes.
+
+On top of the upstream DeepGEMM W4A16 work this repository carries the SM90
+tuning from `novitalabs/DeepGEMM-int`, which is where the grouped heuristics in
+`chord_kernels/operator/grouped/heuristics.py` come from. Ported verbatim,
+including:
+
+- **Contiguous: BM128 paired with BK64.** The larger WGMMA amortizes the
+  int4-to-BF16 dequant and scale promotion over more work, while BK64 keeps
+  per-stage smem small enough that BM128 still fits with a useful stage count.
+  BM128/BK128 overflows smem and collapses the pipeline; BM64/BK128 was the
+  earlier pick. A single small problem falls back to BM64 so the M tiles can
+  fill the SMs.
+- **Masked: K-gated BLOCK_M.** A masked group's real row count varies around
+  `expected_m`, and a group that exceeds BLOCK_M spills into a second M tile
+  that re-reads the whole K. On deep-K gate/up that redundant pass is
+  expensive, so BLOCK_M is sized to cover the tail (`1.3 x expected_m`); on
+  short-K down the pass is cheap and a leaner `ceil(1.25 x expected_m, 8)`
+  tile wins by leaving room for more stages.
+- **Masked: wave-aware BLOCK_N.** BN=256 amortizes dequant over twice the
+  weight-N work and gives two independent WGMMA accumulator chains per
+  warpgroup, but halves the tile count. It is selected only when the N-tile
+  count still fills the machine — `G x ceil(N/256) >= 2 x num_sms` on gate/up,
+  a conservative `3 x num_sms` on down's mid-M range, and never once BLOCK_M
+  reaches 72. EP32 gate/up is the one published width that falls under the
+  two-wave line and stays at BN=128.
+- **Masked: fixed buffered-K stage depth.** The decode kernel is latency-bound
+  at one block per SM, so stages target a constant ~512 elements of buffered K
+  (`512 / BLOCK_K`) rather than filling smem; deeper rings only lengthen
+  barrier recycling. Large-BM masked decode (BM >= 72) is barrier-bound
+  instead and targets ~768.
+
+Tile selection is therefore owned by this heuristic at dispatch time, not by
+the profile: `block_m` on a grouped profile is metadata, and the indexed tuning
+tables and `block_m` forward override do not apply. `CHORD_W4A16_BM/BN/BK/CM/CN/STAGES`
+pin a single layout for sweeps.
+
+Measured against public Humming's grouped path on the same H200 at matched
+per-expert row counts (`tests/test_w4a16_grouped.py` and
+`benchmarks/bench_humming.py --balanced`, both triton `do_bench`): per EP8
+layer 1.00-1.31x on contiguous prefill and 1.16-1.35x on masked decode. The
+prefill lead narrows with rows per expert — at 512 rows both implementations sit
+near 620 TFLOPS, so the win there is the tile/pipeline choice paying off at
+small and mid chunk sizes rather than a higher ceiling. The tables, including
+the EP16/EP32 widths, are in [performance.md](performance.md).

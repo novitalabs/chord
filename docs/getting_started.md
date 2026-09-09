@@ -188,6 +188,34 @@ is ignored.
 
 The table covers the EP8 axis only; `h200_tp8` takes no role, as above.
 
+### DeepGEMM-layout SM90 backend (`masked` / `contiguous`)
+
+A second, independent weight layout serves grouped GEMMs on Hopper via the
+vendored DeepGEMM W4A16 kernel (TMA + persistent WGMMA with warp-specialized
+producer). Two profiles select it explicitly, and both accept EP8/EP16/EP32
+shards:
+
+| Profile | Forward convention | Weight buffer |
+| --- | --- | --- |
+| `h200_grouped_decode` | masked decode: inputs `[G*max_m, K]`, routing `expert_layout` = per-expert valid counts `[G] int32`, `valid_shape_m` = total routed tokens | INT4 bit-permuted at BLOCK_K=128 |
+| `h200_grouped_prefill` | contiguous prefill: inputs `[m, K]` with per-expert rows padded to a 128-row boundary (padding zeroed), routing `m_indices` `[m] int32` (`-1` marks padding) | the same reorder at BLOCK_K=64 |
+
+The packed buffer carries its mode and the two layouts are NOT interchangeable
+(the reorder perm width is baked in); dispatch validates `compute_config`'s
+`gemm_type` (`grouped_masked` / `grouped_contiguous`) against the packed mode
+and rejects a mismatch instead of mis-computing. Tile selection is owned by
+the ported DeepGEMM SM90 heuristic per call, so the layer's `block_m` and
+tuning rows do not apply to this backend. At the operator level the same paths
+are exposed as `chord_kernels.masked` / `chord_kernels.contiguous` around
+`pack_w4a16_grouped(...)`.
+
+Setting `CHORD_USE_GROUPED=1` before model load makes `profile="auto"` resolve
+the SM90 prefill/decode roles to the grouped pair; `CHORD_SM90_DECODE` then
+picks which of the two (decode -> masked, prefill -> contiguous). Both are read
+before the weight is packed, so both must be set before model load.
+`CHORD_W4A16_BM/BN/BK/CM/CN/STAGES` pin a single forced layout for tuning
+experiments.
+
 ## vLLM integration through the `humming` import root
 
 The distribution ships two import surfaces over the same operator:
@@ -224,14 +252,18 @@ contract vLLM consumes:
   `NotImplementedError`, so unsupported quantizations fail closed at load.
   The weight-scale-2 hierarchy (`weight_scale_2_type`) and block/token scale
   types are out of scope.
-- `humming.config` provides the `GemmType`/`WeightScaleType` enums. Only
-  `GemmType.INDEXED` resolves to a working backend here; the grouped members
-  exist so class references work and selecting them raises during schedule
-  validation.
+- `humming.config` provides the `GemmType`/`WeightScaleType` enums.
+  `GemmType.INDEXED` and both grouped members resolve to working backends, but
+  the value must agree with what the weight was packed for: a layer packed
+  `indexed` rejects a grouped `gemm_type` and a grouped layer rejects the other
+  mode's, since the packed bytes differ. `GemmType.DENSE` is not implemented.
 - Profile resolution needs no chord-specific argument from the framework:
   the shard axis is recovered from the published projection shapes (see
   *Selecting the shard axis*), and the SM90 P/D role follows
-  `CHORD_SM90_DECODE`.
+  `CHORD_SM90_DECODE`. The grouped backends need no framework argument either:
+  `CHORD_USE_GROUPED=1` reroutes `profile='auto'` to them, and the routing
+  tensors they consume (`expert_layout` / `m_indices`) are already part of the
+  delegation signature vLLM passes.
 
 On the vLLM side two things apply. First, the humming MoE experts must admit
 group-32 INT4 through `HummingExpertsBase._supports_quant_scheme`; upstream
@@ -239,18 +271,21 @@ branches older than the current WNA16 generalization (see vLLM PR #48918,
 which admits unsigned-integer WNA16 group scales generically) may need the
 group-32 keys added explicitly. Second, the Humming backend is selected with
 `moe_backend="humming"` (or `--quantization humming` for the schema route),
-since the automatic WNA16 priority order tries other backends first. Keep
-`VLLM_HUMMING_MOE_GEMM_TYPE` at its default indexed behavior and leave
-`VLLM_HUMMING_USE_F16_ACCUM` / `VLLM_BATCH_INVARIANT` off — the indexed
-kernel rejects those compute options. No environment variable is needed for
-TP8: `profile='auto'` recovers the shard axis from the projection shapes and
-lands on `h200_tp8`.
+since the automatic WNA16 priority order tries other backends first. Leave
+`VLLM_HUMMING_USE_F16_ACCUM` / `VLLM_BATCH_INVARIANT` off — neither backend
+implements those compute options. `VLLM_HUMMING_MOE_GEMM_TYPE` must agree with
+what the weight was packed for: its default indexed behavior for an indexed
+layer, or the matching grouped value when `CHORD_USE_GROUPED=1` is set. No
+environment variable is needed for TP8: `profile='auto'` recovers the shard
+axis from the projection shapes and lands on `h200_tp8`.
 
 ## Tests and benchmarks
 
 ```bash
-python tests/test_w4a16.py                 # run every case, print a perf table
-python -m pytest -m "not gpu" tests/       # fast CPU-only contract tests
+python tests/test_w4a16_indexed.py    # indexed cases, print a perf table
+python tests/test_w4a16_grouped.py    # masked + contiguous cases, same table style
+python -m pytest -m "not gpu" tests/  # fast CPU-only contract tests
+python -m pytest tests/               # everything except the perf-sized cases
 ```
 
 Shapes live in `tests/generators.py` (`PERFORMANCE_CASES`); each case is checked

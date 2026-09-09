@@ -4,9 +4,11 @@
 """Launch-schedule tables for the indexed backend.
 
 The published tuning results for the indexed profiles live here: a
-routed-M in, an :class:`IndexedKernelConfig` out.  The grouped backends do not
-consult this module — their tile selection is owned by the grouped SM90
-heuristic at dispatch time.
+routed-M in, an :class:`IndexedKernelConfig` out.  The grouped backends draw no
+tiles from this module — their tile selection is owned by the grouped SM90
+heuristic at dispatch time — so the only grouped code here is the
+compute-config gate that keeps a framework from requesting one grouped mode
+against a buffer packed for the other.
 """
 
 from __future__ import annotations
@@ -356,6 +358,11 @@ def _indexed_tuning_rows(meta: IndexedLayerMeta) -> list[tuple[int, int, dict]]:
     row's block-M is guaranteed the forward path launches that same tile for
     every routed-M inside the row.
     """
+    if meta.profile.is_grouped:
+        raise ValueError(
+            "grouped-backend layers dispatch with the SM90 heuristic at launch "
+            "time and have no indexed tuning rows"
+        )
     rows = [
         (lower, upper, dict(config))
         for lower, upper, config in _swept_tuning_rows(meta)
@@ -436,6 +443,55 @@ def _validate_indexed_compute_config(compute_config: object) -> None:
         )
 
 
+def _validate_grouped_compute_config(
+    compute_config: object | None, mode: str
+) -> None:
+    """Gate a grouped-backend forward on its packed mode.
+
+    Accepts the framework spellings ``grouped_masked`` / ``grouped_contiguous``
+    (matching upstream Humming's ``GemmType`` values) and requires them to
+    agree with the mode that was packed into the weight.  The reorder perm
+    width is baked into the buffer, so a mismatch is a silent wrong answer
+    rather than a slow path.
+    """
+    if compute_config is None:
+        return
+    value = compute_config
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("compute_config must be valid JSON") from exc
+    if isinstance(value, Mapping):
+        gemm_type = value.get("gemm_type")
+        unsupported = [
+            name
+            for name in ("use_f16_accum", "use_batch_invariant")
+            if bool(value.get(name, False))
+        ]
+    else:
+        gemm_type = getattr(value, "gemm_type", None)
+        unsupported = [
+            name
+            for name in ("use_f16_accum", "use_batch_invariant")
+            if bool(getattr(value, name, False))
+        ]
+    if unsupported:
+        raise ValueError(
+            "grouped W4A16 does not implement compute option(s): "
+            + ", ".join(unsupported)
+        )
+    if gemm_type is None:
+        return
+    gemm_type = str(getattr(gemm_type, "value", gemm_type)).lower()
+    required = "grouped_masked" if mode == "masked" else "grouped_contiguous"
+    if gemm_type != required:
+        raise ValueError(
+            f"the packed weight is grouped-{mode} but compute_config requests "
+            f"gemm_type={gemm_type!r}; repack or pass {required!r}"
+        )
+
+
 def _resolve_tuning_config(
     meta: IndexedLayerMeta,
     selected_shape_m: int,
@@ -483,5 +539,6 @@ __all__ = [
     "_indexed_tuning_rows",
     "_resolve_tuning_config",
     "_select_indexed_kernel_config",
+    "_validate_grouped_compute_config",
     "_validate_indexed_compute_config",
 ]

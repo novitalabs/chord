@@ -5,20 +5,59 @@ import functools
 import glob
 import hashlib
 import os
-import re
 from pathlib import Path
 
 from elftools.elf.elffile import ELFFile
 
 
-def find_kernel_name_in_cubin(filename: str, func_keyword: str) -> str:
+def _mangled_name_matches(
+    symbol_name: str, func_keyword: str, *, nested: bool = False
+) -> bool:
+    """Return whether an Itanium-mangled symbol names ``func_keyword``.
+
+    Source names mangle as length-prefixed components: ``_Z<len><fn>`` at global
+    scope, and ``_ZN<len><ns>...<len><fn>`` inside namespaces. The components are
+    walked directly rather than matched with a regex, because the nested form
+    ``^_ZN(?:\\d+[A-Za-z_]\\w*)*\\d+<fn>`` backtracks catastrophically on the long
+    template-argument suffixes these kernels mangle to.
+    """
+    if nested:
+        if not symbol_name.startswith("_ZN"):
+            return False
+        position = 3
+    else:
+        if not symbol_name.startswith("_Z"):
+            return False
+        position = 2
+
+    total = len(symbol_name)
+    while position < total and symbol_name[position].isdigit():
+        length_end = position
+        while length_end < total and symbol_name[length_end].isdigit():
+            length_end += 1
+        length = int(symbol_name[position:length_end])
+        component = symbol_name[length_end : length_end + length]
+        if len(component) != length:
+            return False
+        if component == func_keyword:
+            return True
+        if not nested:
+            # Global scope carries exactly one component before the arguments.
+            return False
+        position = length_end + length
+    return False
+
+
+def find_kernel_name_in_cubin(
+    filename: str, func_keyword: str, *, nested: bool = False
+) -> str:
     with open(filename, "rb") as cubin:
         symbol_table = ELFFile(cubin).get_section_by_name(".symtab")
         symbol_names = [
             symbol.name
             for symbol in symbol_table.iter_symbols()
             if symbol["st_info"]["type"] == "STT_FUNC"
-            and re.findall(f"^_Z\\d+{func_keyword}", symbol.name)
+            and _mangled_name_matches(symbol.name, func_keyword, nested=nested)
         ]
     if len(symbol_names) != 1:
         raise RuntimeError(

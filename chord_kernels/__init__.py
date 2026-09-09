@@ -4,9 +4,9 @@ from importlib import import_module
 from typing import Any
 
 
-__all__ = ["indexed", "operator"]
+__all__ = ["contiguous", "indexed", "masked", "operator"]
 
-_OPERATOR_NAMES = frozenset(("indexed",))
+_OPERATOR_NAMES = frozenset(("indexed", "masked", "contiguous"))
 
 
 def __getattr__(name: str) -> Any:

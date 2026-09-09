@@ -109,4 +109,53 @@ def launch_kernel(
     )
 
 
-__all__ = ["init_launcher", "launch_kernel", "register_kernel"]
+def register_grouped_w4a16_kernel(cubin_path: str, func_name: str) -> int:
+    """Register a compiled grouped W4A16 cubin and return its launch id."""
+    init_launcher()
+    return torch.ops.chord.register_grouped_w4a16_kernel(cubin_path, func_name)
+
+
+def launch_grouped_w4a16_masked(
+    *,
+    kernel_id: int,
+    inputs: torch.Tensor,
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    outputs: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Masked (decode) grouped W4A16 GEMM: [G, max_m, K] -> [G, max_m, N]."""
+    init_launcher()
+    return torch.ops.chord.launch_grouped_w4a16_masked(
+        kernel_id, inputs, packed_weight, weight_scale, masked_m, outputs,
+        enable_pdl,
+    )
+
+
+def launch_grouped_w4a16_contiguous(
+    *,
+    kernel_id: int,
+    inputs: torch.Tensor,
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    outputs: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Contiguous (prefill) grouped W4A16 GEMM: [m, K] -> [m, N]."""
+    init_launcher()
+    return torch.ops.chord.launch_grouped_w4a16_contiguous(
+        kernel_id, inputs, packed_weight, weight_scale, m_indices, outputs,
+        enable_pdl,
+    )
+
+
+__all__ = [
+    "init_launcher",
+    "launch_grouped_w4a16_contiguous",
+    "launch_grouped_w4a16_masked",
+    "launch_kernel",
+    "register_grouped_w4a16_kernel",
+    "register_kernel",
+]

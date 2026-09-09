@@ -1,6 +1,11 @@
 # Benchmarking and correctness reporting
 
-How `tests/test_w4a16.py` times the kernel and what its columns mean.
+How `tests/test_w4a16_indexed.py` times the kernel and what its columns mean.
+`tests/test_w4a16_grouped.py` prints the masked (decode) and contiguous
+(prefill) tables in the same column layout and roofline model, so everything
+below about reading the columns applies to both; its shape columns carry `G` and
+`m/grp` instead of a routing distribution, and it fixes the timing method to
+CUDA events.
 
 ## Running
 
@@ -9,8 +14,8 @@ removing a shape is an edit to that table; the test module only iterates over
 whichever cases the current device supports and prints one row each.
 
 ```bash
-python tests/test_w4a16.py                 # run everything, print the table
-python tests/test_w4a16.py --device cuda:1 # pick a specific GPU
+python tests/test_w4a16_indexed.py                 # run everything, print the table
+python tests/test_w4a16_indexed.py --device cuda:1 # pick a specific GPU
 ```
 
 Every case is checked against a reference and then timed, so each row carries both
@@ -23,9 +28,9 @@ the terminal, and the production-sized ones additionally need `--run-perf` becau
 they are marked `perf` and skipped by default:
 
 ```bash
-python -m pytest -m "not gpu" tests/test_w4a16.py
-python -m pytest -m gpu -s tests/test_w4a16.py
-python -m pytest --run-perf -m "gpu and perf" -s tests/test_w4a16.py
+python -m pytest -m "not gpu" tests/test_w4a16_indexed.py
+python -m pytest -m gpu -s tests/test_w4a16_indexed.py
+python -m pytest --run-perf -m "gpu and perf" -s tests/test_w4a16_indexed.py
 ```
 
 ## Timing methods
@@ -52,11 +57,13 @@ the peak a single kernel can reach and reads higher.
 
 ## Reading the throughput columns
 
-`TFLOPS` and `GB/s` are printed as `achieved/roofline`. Both ceilings describe the
-same operating point clipped by the running device's BF16 tensor peak and HBM
-bandwidth (H200 SXM: 989 TFLOPS / 4800 GB/s; B200/B300: 2250 TFLOPS /
-7700 GB/s at the shipping memory clock), so the `util` percentage is the same
-in either unit; showing
+`TFLOPS` and `GB/s` are printed as `achieved/roofline`, with the utilization
+percentage in parentheses on whichever column is the binding wall: `TFLOPS` for
+the compute-bound prefill blocks (indexed prefill, contiguous prefill), `GB/s`
+for the bandwidth-bound decode blocks (indexed decode, masked decode). Both ceilings describe the same operating
+point clipped by the running device's BF16 tensor peak and HBM bandwidth
+(H200 SXM: 989 TFLOPS / 4800 GB/s; B200/B300: 2250 TFLOPS / 7700 GB/s at the
+shipping memory clock), so that percentage is the same in either unit; showing
 both makes it visible which wall is binding. The INT4 weight is dequantized to BF16
 before the MMA, so the compute ceiling is the BF16 rate.
 

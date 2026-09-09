@@ -16,13 +16,14 @@ undiscoverable from the device — is never guessed by ``profile='auto'``.
 
 ``backend`` names the physical kernel family behind the profile:
 
-* ``indexed`` — the humming-native indexed kernel (MMA/WGMMA int32 layout);
-  the only backend published on ``main`` today.
-* ``grouped_masked`` / ``grouped_contiguous`` — reserved for the grouped SM90
-  W4A16 kernels (DeepGEMM-derived, decode/prefill).  Their profiles register
-  through the same table when the grouped backend lands; the selection policy
-  (:func:`chord_kernels.operator.env.resolve_backend_name`) already routes to
-  these names when ``CHORD_USE_GROUPED`` is set.
+* ``indexed`` — the humming-native indexed kernel (MMA/WGMMA int32 layout).
+* ``grouped_masked`` / ``grouped_contiguous`` — the grouped SM90 W4A16 kernels
+  (DeepGEMM-derived, decode/prefill), published as ``h200_grouped_decode`` and
+  ``h200_grouped_prefill``.  The selection policy
+  (:func:`chord_kernels.operator.env.resolve_backend_name`) routes to these
+  names when ``CHORD_USE_GROUPED`` is set.  Unlike the indexed profiles they
+  publish no tuning table: tile selection belongs to the grouped heuristic at
+  dispatch time, so ``block_m`` here is metadata only.
 """
 
 from __future__ import annotations
@@ -195,6 +196,19 @@ class IndexedLayerProfile:
     def is_grouped(self) -> bool:
         return self.backend != "indexed"
 
+    @property
+    def grouped_mode(self) -> str | None:
+        """The grouped kernel/layout name, or ``None`` on the indexed backend.
+
+        The packing and dispatch layers key on the short spelling
+        (``masked``/``contiguous``), since the reorder width is what the packed
+        buffer actually carries.
+        """
+        return {
+            "grouped_masked": "masked",
+            "grouped_contiguous": "contiguous",
+        }.get(self.backend)
+
     def validate_device(self, device: torch.device) -> None:
         device = torch.device(device)
         if device.type != "cuda":
@@ -323,6 +337,12 @@ class IndexedLayerMeta:
         )
 
     def kernel_config(self, valid_shape_m: int = 0) -> IndexedKernelConfig:
+        if self.profile.is_grouped:
+            # The grouped dispatch runs its own SM90 heuristic per call; there
+            # is no per-M tuning table to resolve on this layer contract.
+            raise ValueError(
+                "grouped-backend metas do not publish indexed kernel configs"
+            )
         from chord_kernels.operator.tuning import _select_indexed_kernel_config
 
         return _select_indexed_kernel_config(self, valid_shape_m)
@@ -462,6 +482,36 @@ _PROFILES: dict[str, IndexedLayerProfile] = {
         block_m=8,
         compute_capabilities=((9, 0),),
     ),
+    # grouped paths (EP-width agnostic up to the pack-side checks):
+    # masked decode (BLOCK_K=128 buffer) and contiguous prefill (BLOCK_K=64
+    # buffer), selected explicitly or through CHORD_USE_GROUPED.
+    # ``expert_parallel_size`` records the canonical value; EP16/32 shards are
+    # accepted by ``select_indexed_profile``.
+    "h200_grouped_prefill": IndexedLayerProfile(
+        name="h200_grouped_prefill",
+        device_major=9,
+        mode="prefill",
+        expert_parallel_size=8,
+        layout="wgmma",
+        swap_ab=False,
+        # Metadata only: the grouped heuristic (not the profile) picks the
+        # real tile from (m, n, k) at dispatch time; 128 anchors the table's
+        # prefill BM=128 default documented by the upstream tuning notes.
+        block_m=128,
+        compute_capabilities=((9, 0),),
+        backend="grouped_contiguous",
+    ),
+    "h200_grouped_decode": IndexedLayerProfile(
+        name="h200_grouped_decode",
+        device_major=9,
+        mode="decode",
+        expert_parallel_size=8,
+        layout="wgmma",
+        swap_ab=False,
+        block_m=8,
+        compute_capabilities=((9, 0),),
+        backend="grouped_masked",
+    ),
     "blackwell_decode_ep8": IndexedLayerProfile(
         name="blackwell_decode_ep8",
         device_major=10,
@@ -481,6 +531,8 @@ H200_PREFILL_EP8 = _PROFILES["h200_prefill_ep8"]
 H200_TP8 = _PROFILES["h200_tp8"]
 H200_DECODE_EP8 = _PROFILES["h200_decode_ep8"]
 BLACKWELL_DECODE_EP8 = _PROFILES["blackwell_decode_ep8"]
+H200_GROUPED_PREFILL = _PROFILES["h200_grouped_prefill"]
+H200_GROUPED_DECODE = _PROFILES["h200_grouped_decode"]
 INDEXED_PROFILES = dict(_PROFILES)
 
 # Per-expert ``(shape_n, shape_k)`` projection pairs each shard axis publishes a
@@ -577,7 +629,7 @@ def _auto_profile_name(
     as one block: an explicit mode wins; otherwise the ``CHORD_SM90_DECODE``
     role bit decides, defaulting to prefill when unset/0.  With
     ``CHORD_USE_GROUPED=1`` both roles reroute to the grouped backend's
-    profiles once that kernel is vendored.
+    profiles.
 
     The shard axis is not a property of the *device*, so it is never inferred
     from ``capability``; the caller resolves it with :func:`resolve_shard_axis`
@@ -732,6 +784,8 @@ def select_indexed_profile(
 __all__ = [
     "BLACKWELL_DECODE_EP8",
     "H200_DECODE_EP8",
+    "H200_GROUPED_DECODE",
+    "H200_GROUPED_PREFILL",
     "H200_PREFILL_EP8",
     "H200_TP8",
     "INDEXED_PROFILES",

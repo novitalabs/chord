@@ -20,10 +20,11 @@ so each branch consumes only its own and rejects the others loudly — a packed
 weight serves exactly one family, so a mismatched call is a config error, never
 a silent fallback.
 
-The grouped branches are entry points only: the DeepGEMM kernel package is not
-vendored here yet, so they raise :class:`NotImplementedError` with the tag that
-must be wired in.  The indexed branch is complete and is the single dispatch
-shared by both the layer forward and the framework-method forward.
+All three branches are live, and this module is the single dispatch shared by
+both the layer forward and the framework-method forward.  The grouped branches
+additionally validate the requested ``gemm_type`` against the mode baked into
+the packed buffer, and they reject the indexed tuning knobs (``tuning_config``,
+``block_m``) because the grouped SM90 heuristic owns tile selection per call.
 """
 
 from __future__ import annotations
@@ -34,23 +35,20 @@ import torch
 
 from chord_kernels.operator.api import IndexedKernelConfig, w4a16_indexed
 from chord_kernels.operator.env import IndexedMode, resolve_backend_name
+from chord_kernels.operator.grouped.api import w4a16_contiguous, w4a16_masked
+from chord_kernels.operator.grouped.packing import (
+    GroupedPreparedWeight,
+    pack_w4a16_grouped,
+)
 from chord_kernels.operator.packing import PreparedWeight, WeightLayout, pack_w4a16
 from chord_kernels.operator.profiles import IndexedLayerMeta
 from chord_kernels.operator.tuning import (
     _resolve_tuning_config,
+    _validate_grouped_compute_config,
     _validate_indexed_compute_config,
 )
 
 _GROUPED_BACKENDS = ("grouped_contiguous", "grouped_masked")
-
-
-def _grouped_not_available(backend: str) -> NotImplementedError:
-    """A grouped tag selected on a build that does not vendor the kernel."""
-    return NotImplementedError(
-        f"W4A16 backend {backend!r} is not available in this build: the "
-        "DeepGEMM-derived grouped kernel package is not vendored yet. Unset "
-        "CHORD_USE_GROUPED to stay on the indexed backend."
-    )
 
 
 def profile_name_for_role(backend: str, role: IndexedMode) -> str:
@@ -65,7 +63,9 @@ def profile_name_for_role(backend: str, role: IndexedMode) -> str:
             return "h200_tp8"
         return f"h200_{role}_ep8"
     if backend in _GROUPED_BACKENDS:
-        raise _grouped_not_available(backend)
+        # Both grouped profiles are SM90 EP deployments, one per phase, so the
+        # role alone names them.
+        return f"h200_grouped_{role}"
     raise ValueError(f"unknown W4A16 backend {backend!r}")
 
 
@@ -85,7 +85,12 @@ def pack_weight(
             packed=packed,
         )
     if meta.backend in _GROUPED_BACKENDS:
-        raise _grouped_not_available(meta.backend)
+        return pack_w4a16_grouped(
+            weight.contiguous(),
+            weight_scale.contiguous(),
+            mode=meta.profile.grouped_mode,
+            packed=packed,
+        )
     raise ValueError(f"unknown W4A16 backend {meta.backend!r}")
 
 
@@ -99,7 +104,12 @@ def transformed_shapes(
             (meta.num_experts, meta.shape_k // 32, meta.shape_n),
         )
     if meta.backend in _GROUPED_BACKENDS:
-        raise _grouped_not_available(meta.backend)
+        # The grouped buffer keeps the checkpoint's [G, N, ...] orientation and
+        # holds two 4-bit codes per byte; the scale is MN-major like indexed.
+        return (
+            (meta.num_experts, meta.shape_n, meta.shape_k // 2),
+            (meta.num_experts, meta.shape_k // 32, meta.shape_n),
+        )
     raise ValueError(f"unknown W4A16 backend {meta.backend!r}")
 
 
@@ -129,7 +139,21 @@ def forward_w4a16(
     """
     backend = meta.backend
     if backend in _GROUPED_BACKENDS:
-        raise _grouped_not_available(backend)
+        return _forward_grouped(
+            prepared,
+            meta,
+            inputs,
+            outputs=outputs,
+            sorted_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_padded=num_tokens_padded,
+            expert_layout=expert_layout,
+            m_indices=m_indices,
+            valid_shape_m=valid_shape_m,
+            compute_config=compute_config,
+            tuning_config=tuning_config,
+            block_m=block_m,
+        )
     if backend != "indexed":
         raise ValueError(f"unknown W4A16 backend {backend!r}")
 
@@ -173,6 +197,94 @@ def forward_w4a16(
         swap_ab=kernel_config.swap_ab,
         valid_shape_m=valid_shape_m,
         validate_routing=validate_routing,
+    )
+
+
+def _forward_grouped(
+    prepared: object,
+    meta: IndexedLayerMeta,
+    inputs: torch.Tensor,
+    *,
+    outputs: torch.Tensor | None,
+    sorted_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor | None,
+    num_tokens_padded: torch.Tensor | None,
+    expert_layout: torch.Tensor | None,
+    m_indices: torch.Tensor | None,
+    valid_shape_m: int,
+    compute_config: object | None,
+    tuning_config: object | None,
+    block_m: int | None,
+) -> torch.Tensor:
+    """Dispatch grouped-packed buffers to their masked/contiguous kernels.
+
+    The packed buffer's mode must agree with the requested ``gemm_type`` (the
+    reorder perm width is baked into the weight, so a mismatch is a silent
+    wrong answer), and the scheduling tiles are owned by the grouped SM90
+    heuristic rather than the indexed tuning rows.
+    """
+    if not isinstance(prepared, GroupedPreparedWeight):
+        raise TypeError(
+            f"backend {meta.backend!r} requires a GroupedPreparedWeight, got "
+            f"{type(prepared).__name__}"
+        )
+    if sorted_ids is not None or expert_ids is not None or num_tokens_padded is not None:
+        raise ValueError(
+            "the grouped backend consumes expert_layout/m_indices routing, "
+            "not sorted_ids/expert_ids/num_tokens_padded"
+        )
+    if tuning_config is not None:
+        raise ValueError(
+            "the grouped backend has no indexed tuning rows; omit tuning_config"
+        )
+    if block_m is not None:
+        raise ValueError("the grouped heuristic owns the tile shape; omit block_m")
+    if (
+        isinstance(valid_shape_m, bool)
+        or not isinstance(valid_shape_m, int)
+        or valid_shape_m < 0
+    ):
+        raise ValueError(
+            f"valid_shape_m must be a non-negative int, got {valid_shape_m!r}"
+        )
+    _validate_grouped_compute_config(compute_config, prepared.mode)
+
+    if prepared.mode == "masked":
+        if expert_layout is None:
+            raise ValueError(
+                "grouped masked decode requires expert_layout (per-expert "
+                "valid token counts, [G] int32)"
+            )
+        if m_indices is not None:
+            raise ValueError("masked decode does not take m_indices")
+        if valid_shape_m <= 0:
+            raise ValueError(
+                "grouped masked decode requires valid_shape_m > 0 "
+                "(it feeds the launch heuristic's expected_m)"
+            )
+        # Follow the upstream layer: expected_m is the average tokens per
+        # expert, which the masked heuristic turns into the BLOCK_M tile.
+        expected_m = max(1, valid_shape_m // meta.num_experts)
+        return w4a16_masked(
+            inputs,
+            prepared,
+            expert_layout,
+            expected_m,
+            outputs=outputs,
+        )
+
+    if expert_layout is not None:
+        raise ValueError("contiguous prefill takes m_indices, not expert_layout")
+    if m_indices is None:
+        raise ValueError(
+            "grouped contiguous prefill requires m_indices ([m] int32; "
+            "-1 marks the 128-row padding rows)"
+        )
+    return w4a16_contiguous(
+        inputs,
+        prepared,
+        m_indices,
+        outputs=outputs,
     )
 
 
@@ -244,5 +356,12 @@ def build_prepared(
             num_experts=meta.num_experts,
         )
     if meta.backend in _GROUPED_BACKENDS:
-        raise _grouped_not_available(meta.backend)
+        return GroupedPreparedWeight(
+            packed=packed,
+            scale=scale,
+            mode=meta.profile.grouped_mode,
+            n=meta.shape_n,
+            k=meta.shape_k,
+            num_experts=meta.num_experts,
+        )
     raise ValueError(f"unknown W4A16 backend {meta.backend!r}")

@@ -8,7 +8,7 @@ rather than to this file.
 
 Run the file directly and it does everything in one pass::
 
-    python tests/test_w4a16.py
+    python tests/test_w4a16_indexed.py
 
 Every case is checked against a plain-PyTorch W4A16 reference and then timed, so
 each row carries both its accuracy (``cos_diff``) and its throughput.  Rows are
@@ -18,9 +18,9 @@ The same cases are also collected by pytest.  The GPU cases need ``-s`` for the
 table to reach the terminal, and the production-sized ones additionally need
 ``--run-perf`` because they are marked ``perf`` and skipped by default::
 
-    python -m pytest -m "not gpu" tests/test_w4a16.py
-    python -m pytest -m gpu -s tests/test_w4a16.py
-    python -m pytest --run-perf -m "gpu and perf" -s tests/test_w4a16.py
+    python -m pytest -m "not gpu" tests/test_w4a16_indexed.py
+    python -m pytest -m gpu -s tests/test_w4a16_indexed.py
+    python -m pytest --run-perf -m "gpu and perf" -s tests/test_w4a16_indexed.py
 """
 
 from __future__ import annotations
@@ -34,6 +34,17 @@ import pytest
 import torch
 
 from bench import BENCH_METHODS, DEFAULT_BENCH_METHOD, benchmark
+from roofline import (
+    ROOFLINE_PEAKS as _ROOFLINE_PEAKS,
+    device_peaks as _device_peaks,
+    error_metrics as _error_metrics,
+    format_throughput,
+    print_group,
+    print_row,
+    roofline as _roofline,
+    throughput_columns,
+    traffic_bytes,
+)
 from generators import (
     DECODE_TOKENS_PER_GPU,
     PERFORMANCE_CASES,
@@ -50,48 +61,6 @@ from generators import (
 
 _SUPPORTED_COMPUTE_CAPABILITIES = {(9, 0), (10, 0), (10, 3)}
 _COSINE_LIMIT = 5e-3
-
-# Per-architecture roofline peaks.  The INT4 weight is dequantized to BF16
-# before the MMA, so the compute ceiling is the dense BF16 tensor rate rather
-# than an INT4 rate.  H200 SXM: 989 TFLOPS BF16, 4.8 TB/s HBM3e.  B200/B300:
-# 2250 TFLOPS dense BF16; bandwidth follows the shipping memory clock
-# (3996 MHz x 7680-bit = 7.67 TB/s) rather than the 8 TB/s spec-sheet figure.
-_ROOFLINE_PEAKS: dict[tuple[int, int], tuple[float, float]] = {
-    (9, 0): (989.0, 4800.0),
-    (10, 0): (2250.0, 7700.0),
-    (10, 3): (2250.0, 7700.0),
-}
-
-
-def _device_peaks(device: torch.device | None = None) -> tuple[float, float]:
-    capability = torch.cuda.get_device_capability(device)
-    peaks = _ROOFLINE_PEAKS.get(capability)
-    if peaks is None:
-        # An unlisted device still benchmarks; fall back to the H200 numbers
-        # rather than refusing, since the ceilings only scale the util column.
-        peaks = _ROOFLINE_PEAKS[(9, 0)]
-    return peaks
-
-
-def _roofline(
-    flops: int, total_bytes: int, device: torch.device | None = None
-) -> tuple[float, float]:
-    """Return the (TFLOPS, GB/s) ceilings for this arithmetic intensity.
-
-    The workload sits on one ray of slope ``AI = flops / bytes`` in the roofline
-    plane, clipped by the two hardware peaks.  Both ceilings describe the same
-    point, so the utilization percentage is identical in either unit; reporting
-    both shows which wall is the binding one.
-    """
-
-    peak_tflops, peak_gbps = _device_peaks(device)
-    if total_bytes <= 0:
-        return peak_tflops, peak_gbps
-    intensity = flops / total_bytes
-    roof_tflops = min(peak_tflops, peak_gbps * intensity / 1e3)
-    roof_gbps = min(peak_gbps, peak_tflops * 1e3 / intensity)
-    return roof_tflops, roof_gbps
-
 
 @dataclass(frozen=True)
 class BenchmarkResult:
@@ -125,31 +94,10 @@ def _case_flops(case: IndexedCase) -> int:
 
 
 def _case_traffic_bytes(case: IndexedCase, num_active_experts: int) -> int:
-    """Estimate DRAM traffic for the activation, weight, scale and output.
-
-    Only experts actually reached by routing contribute weight and scale bytes;
-    with a random router and a small token count most experts are never read,
-    so counting all of them would overstate achieved bandwidth.
-    """
-
-    weight_bytes = num_active_experts * case.n * (case.k // 2)
-    scale_bytes = num_active_experts * case.n * (case.k // 32) * 2
-    activation_bytes = case.input_rows * case.k * 2
-    output_bytes = case.routed_m * case.n * 2
-    return weight_bytes + scale_bytes + activation_bytes + output_bytes
-
-
-def _error_metrics(
-    actual: torch.Tensor, reference: torch.Tensor
-) -> tuple[float, float]:
-    actual = actual.float()
-    reference = reference.float()
-    denominator = (actual.square() + reference.square()).sum()
-    cosine_diff = 0.0
-    if denominator.item() != 0:
-        cosine_diff = float(1 - (2 * (actual * reference).sum() / denominator).item())
-    max_abs_diff = float((actual - reference).abs().max().item())
-    return cosine_diff, max_abs_diff
+    """DRAM traffic for this case, counting only the experts routing reached."""
+    return traffic_bytes(
+        num_active_experts, case.n, case.k, case.input_rows, case.routed_m
+    )
 
 
 def _check_output(
@@ -254,30 +202,27 @@ _COLUMNS: tuple[tuple[str, int], ...] = (
     ("layout", 6),
     ("blk_m", 5),
     ("us", 9),
+    # Base widths; _columns() widens whichever of the two carries the
+    # utilization percentage for the block being printed.
     ("TFLOPS", 11),
     ("GB/s", 13),
-    ("util", 6),
     ("cos_diff", 9),
 )
 
 
-def _columns(shape_columns: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
+def _columns(
+    shape_columns: tuple[str, ...], *, is_prefill: bool = True
+) -> tuple[tuple[str, int], ...]:
+    """Column table for one block.
+
+    Shape columns are kept only where they vary inside the block; the
+    utilization percentage rides in the column of the binding wall (prefill is
+    compute bound, decode is bandwidth bound).
+    """
     prefix = tuple(
         column for column in _SHAPE_COLUMNS if column[0] in shape_columns
     )
-    return (*prefix, *_COLUMNS)
-
-
-def _print_group(title: str, shape_columns: tuple[str, ...]) -> None:
-    """Start a block of rows with its own heading and column header."""
-
-    columns = _columns(shape_columns)
-    width = sum(size for _, size in columns) + len(columns) - 1
-    header = " ".join(name.rjust(size) for name, size in columns)
-    print(f"\n{title}", flush=True)
-    print("=" * width, flush=True)
-    print(header, flush=True)
-    print("-" * width, flush=True)
+    return (*prefix, *throughput_columns(_COLUMNS, compute_bound=is_prefill))
 
 
 def _print_row(result: BenchmarkResult, shape_columns: tuple[str, ...] = ()) -> None:
@@ -289,6 +234,13 @@ def _print_row(result: BenchmarkResult, shape_columns: tuple[str, ...] = ()) -> 
         "n": str(case.n),
         "k": str(case.k),
     }
+    tflops, gbps = format_throughput(
+        result.tflops,
+        result.roof_tflops,
+        result.gbps,
+        result.roof_gbps,
+        compute_bound=case.is_prefill,
+    )
     values = (
         *(available[name] for name, _ in _SHAPE_COLUMNS if name in shape_columns),
         case.distribution,
@@ -298,18 +250,11 @@ def _print_row(result: BenchmarkResult, shape_columns: tuple[str, ...] = ()) -> 
         result.layout,
         str(result.block_m),
         f"{result.microseconds:.1f}",
-        f"{result.tflops:.0f}/{result.roof_tflops:.0f}",
-        f"{result.gbps:.0f}/{result.roof_gbps:.0f}",
-        f"{result.compute_utilization:.1f}%",
+        tflops,
+        gbps,
         cosine,
     )
-    print(
-        " ".join(
-            value.rjust(size)
-            for value, (_, size) in zip(values, _columns(shape_columns))
-        ),
-        flush=True,
-    )
+    print_row(values, _columns(shape_columns, is_prefill=case.is_prefill))
 
 
 def _group_title(case: IndexedCase) -> str:
@@ -369,12 +314,21 @@ def _run_case_table(
             )
             if len({getter(case) for case in members}) > 1
         )
+        # A block's header commits to one binding wall (TFLOPS for prefill,
+        # GB/s for decode), so every case in it must share the P/D role.  Groups
+        # are keyed by profile and a profile is one role, so this holds by
+        # construction; the check keeps a future case table honest.
+        assert len({case.is_prefill for case in members}) == 1, (
+            f"group {group!r} mixes prefill and decode cases"
+        )
 
     results = []
     current_group: str | None = None
     for case, group in zip(cases, groups):
         if group != current_group:
-            _print_group(group, varying[group])
+            print_group(
+                group, _columns(varying[group], is_prefill=case.is_prefill)
+            )
             current_group = group
         result = run_indexed_case(
             case,
