@@ -4,8 +4,8 @@ How `tests/test_w4a16_indexed.py` times the kernel and what its columns mean.
 `tests/test_w4a16_grouped.py` prints the masked (decode) and contiguous
 (prefill) tables in the same column layout and roofline model, so everything
 below about reading the columns applies to both; its shape columns carry `G` and
-`m/grp` instead of a routing distribution. Both suites default to the `triton`
-timing method.
+`m/grp` instead of a routing distribution, and it fixes the timing method to
+CUDA events.
 
 ## Running
 
@@ -35,16 +35,13 @@ python -m pytest --run-perf -m "gpu and perf" -s tests/test_w4a16_indexed.py
 
 ## Timing methods
 
-`--method` on the indexed suite and `--bench-method` on the grouped suite
-select the timing method (default `triton`):
+`--method` selects the timing method (default `triton`):
 
 - **`triton`** calls `triton.testing.do_bench(warmup=100, rep=1000)`, the exact
-  call the upstream Humming `bench_humming.py` uses. `do_bench` clears L2 with its
-  own cache buffer between iterations and measures CUDA-event intervals,
-  returning their mean by default. Those intervals can include launch/enqueue
-  gaps; they are not CPU wall-clock time or profiler-only kernel duration.
-  A valid comparison also needs matched inputs, routing and software/hardware
-  conditions; using the same timing function alone does not establish that.
+  call the upstream Humming `bench_humming.py` uses, so numbers line up directly
+  with its published tables. `do_bench` clears L2 with its own cache buffer between
+  iterations and times the wall clock around the call, so launch overhead is
+  included.
 - **`kineto`** reads the kernel's own GPU duration from the profiler, excluding
   launch overhead. It reports the kernel's intrinsic speed and reads a few percent
   higher than `triton` on these shapes; use it to compare kernels, not to compare
@@ -80,13 +77,11 @@ even at the same kernel time.
 
 The `us` column is itself sensitive to the routing draw: per-expert block
 padding makes the active block count — and therefore the launched work — vary
-by several percent between seeds. The indexed cases reproduce the upstream
-`bench_humming.py` logical routing draw (the global CUDA RNG seeded with the
-token count). Each implementation must align that draw to its own routing
-block size. Grouped comparisons must explicitly share activations, quantized
-weights, scales and actual expert counts: the two repositories' default
-grouped decode generators do not produce the same distribution. Absolute
-`us` also depends on the GPU and
+by several percent between seeds. The cases here reproduce the upstream
+`bench_humming.py` draw exactly (the global CUDA RNG seeded with the token
+count), so `us` is comparable one-to-one with a Humming run at the same token
+count. A comparison under any other routing must feed both kernels the same
+`sorted_ids`/`expert_ids` buffers. Absolute `us` also depends on the GPU and
 its clock/power state — a shared or thermally throttled card reads slower — so
 cross-implementation comparisons must run on the same idle device.
 

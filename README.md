@@ -29,25 +29,16 @@ INT4 weights.
 | `indexed` | Hopper (H200) | SM90 (9.0) | Single-instance (mix), TP8 | `h200_tp8` |
 | `indexed` | Hopper (H200) | SM90 (9.0) | Decode, EP8 | `h200_decode_ep8` |
 | `indexed` | Blackwell (B200/B300) | B200: SM100 (10.0); B300: SM103 (10.3) | Decode, EP8 | `blackwell_decode_ep8` |
-| Grouped family | Hopper (H200) | SM90 (9.0) | Standalone prefill/decode operator tests | `h200_grouped_*` |
-
-**Grouped vLLM integration is work in progress (WIP).** The current release
-provides grouped kernels for standalone correctness and performance testing;
-it does not provide a completed grouped integration through vLLM's Humming
-backend. The indexed family retains its legacy `HummingMethod` adapter;
-compatibility requires a matching vLLM API and INT4 group-32 support. This
-revision does not implement vLLM's newer functional Humming API.
+| `masked` | Hopper (H200) | SM90 (9.0) | Decode, EP8/EP16/EP32 | `h200_grouped_decode` |
+| `contiguous` | Hopper (H200) | SM90 (9.0) | Prefill, EP8/EP16/EP32 | `h200_grouped_prefill` |
 
 ## Performance
 
 Per-call latency against public Humming, each backend measured against the
-matching Humming path (`indexed` against `indexed`, grouped against Humming's
-grouped paths); on SM100/SM103 public
+matching Humming path (`indexed` against `indexed`, the grouped modes against
+Humming's own `grouped_contiguous`/`grouped_masked`); on SM100/SM103 public
 Humming ships only its default config strategy. Full tables are in
 [docs/performance.md](docs/performance.md).
-
-These are standalone kernel measurements. Grouped performance results do not
-establish grouped vLLM readiness or end-to-end serving speedups.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
@@ -100,21 +91,32 @@ The full API surface — packing layouts, the routing contract, the layer adapte
 for framework integration and per-instance P/D role selection — is in
 [docs/getting_started.md](docs/getting_started.md).
 
-### Grouped operators (SM90; vLLM integration WIP)
+### DeepGEMM-layout grouped paths (SM90)
 
-The grouped family adapts DeepGEMM's W4A16 kernel for standalone operator
-execution on Hopper. The caller provides the grouped activation layout and
-routing tensors. Run its correctness checks and performance tables directly:
+**Grouped integration with vLLM's Humming backend is WIP.**
 
-```bash
-python tests/test_w4a16_grouped.py
+The `masked` (decode) and `contiguous` (prefill) interfaces consume the
+DeepGEMM-native group layouts and pack a different weight buffer via
+`pack_w4a16_grouped`. The two modes are not interchangeable: masked packs
+with BLOCK_K=128, contiguous with BLOCK_K=64, and the packed buffer records
+the mode so a mismatch fails loudly at dispatch.
+
+```python
+from chord_kernels import contiguous, masked
+from chord_kernels.operator import pack_w4a16_grouped
+
+# decode: activations laid out per expert with a fixed row budget per expert
+packed_masked = pack_w4a16_grouped(weight, scale, "masked")
+out = masked(a3, packed_masked, masked_m, expected_m)    # [G, max_m, N]
+
+# prefill: activations concatenated per expert, padded to 128-row boundaries
+packed_contig = pack_w4a16_grouped(weight, scale, "contiguous")
+out = contiguous(a2, packed_contig, m_indices)           # [m, N]
 ```
 
-Integrating this family with vLLM's existing Humming backend is ongoing work.
-`CHORD_USE_GROUPED=1` selects the grouped kernels inside Chord, but is not a
-ready-to-use vLLM integration switch. Keep it unset or `0` for the existing
-indexed Humming adapter, and check that the vLLM version implements the API
-that this release provides.
+Layer-level, `select_indexed_profile("auto")` keeps the indexed phase-1
+profiles by default; setting `CHORD_USE_GROUPED=1` before model
+load reroutes both SM90 roles to `h200_grouped_{prefill,decode}`.
 
 ## Documentation
 
@@ -136,7 +138,7 @@ that this release provides.
 This repository derives from the public `inclusionAI/humming` commit
 [`4351af3a8fcdce1a8dee50104ba49566af2427fb`](https://github.com/inclusionAI/humming/commit/4351af3a8fcdce1a8dee50104ba49566af2427fb);
 "based on Humming" describes source lineage, not a runtime dependency. The
-SM90 grouped backend additionally vendors the W4A16 kernel and
+SM90 `masked`/`contiguous` backend additionally vendors the W4A16 kernel and
 its launch heuristics from `deepseek-ai/DeepGEMM`
 ([public release commit `7f2a703`](https://github.com/deepseek-ai/DeepGEMM/tree/7f2a703ed51ac1f7af07f5e1453b2d3267d37d50),
 secondarily developed; MIT), together with the arch-level CUTLASS/CuTe headers
