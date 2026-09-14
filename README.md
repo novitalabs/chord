@@ -93,6 +93,8 @@ for framework integration and per-instance P/D role selection — is in
 
 ### DeepGEMM-layout grouped paths (SM90)
 
+**Grouped integration with vLLM's Humming backend is WIP.**
+
 The `masked` (decode) and `contiguous` (prefill) interfaces consume the
 DeepGEMM-native group layouts and pack a different weight buffer via
 `pack_w4a16_grouped`. The two modes are not interchangeable: masked packs
