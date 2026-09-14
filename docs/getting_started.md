@@ -200,10 +200,11 @@ shards:
 | `h200_grouped_decode` | masked decode: inputs `[G*max_m, K]`, routing `expert_layout` = per-expert valid counts `[G] int32`, `valid_shape_m` = total routed tokens | INT4 bit-permuted at BLOCK_K=128 |
 | `h200_grouped_prefill` | contiguous prefill: inputs `[m, K]` with per-expert rows padded to a 128-row boundary (padding zeroed), routing `m_indices` `[m] int32` (`-1` marks padding) | the same reorder at BLOCK_K=64 |
 
-The packed buffer carries its mode and the two layouts are NOT interchangeable
-(the reorder perm width is baked in); dispatch validates `compute_config`'s
-`gemm_type` (`grouped_masked` / `grouped_contiguous`) against the packed mode
-and rejects a mismatch instead of mis-computing. Tile selection is owned by
+The prepared weight carries its mode; dispatch validates `compute_config`'s
+`gemm_type` (`grouped_masked` / `grouped_contiguous`) against that API contract.
+The two modes have different activation and routing conventions, although
+BK64/BK128 packing produces identical bytes for shared `K % 128 == 0` shapes.
+Tile selection is owned by
 the ported DeepGEMM SM90 heuristic per call, so the layer's `block_m` and
 tuning rows do not apply to this backend. At the operator level the same paths
 are exposed as `chord_kernels.masked` / `chord_kernels.contiguous` around
@@ -218,6 +219,13 @@ experiments.
 
 ## vLLM integration through the `humming` import root
 
+**Release status:** Grouped currently supports standalone operator evaluation;
+its vLLM integration is WIP. The indexed adapter uses the legacy
+`HummingMethod` API and requires a matching vLLM API and group-32 quantization
+support. This revision does not implement the newer functional Humming API.
+The operator/profile configuration below is not a completed grouped vLLM
+deployment recipe.
+
 The distribution ships two import surfaces over the same operator:
 
 - `chord` — the humming-compatible facade (`chord.{dtypes,config,layer,ops}`)
@@ -226,7 +234,8 @@ The distribution ships two import surfaces over the same operator:
   hardcodes the package name. vLLM's lazy facade (`vllm/utils/humming.py`)
   resolves fixed `humming.{dtypes,config,layer,schema,utils.weight}` module
   paths and gates on `find_spec("humming")`; installing `chord_kernels` makes
-  both resolve to this repository with no framework change. Do not install
+  those paths resolve to this repository. Model loading still requires the
+  matching API and quantization support described above. Do not install
   upstream `inclusionAI/humming` alongside it — the `humming` name is
   claimed by design.
 
@@ -244,26 +253,25 @@ contract vLLM consumes:
 - `humming.schema` implements `HummingWeightSchema` (uint4 + group-32 +
   BF16 scale), the BF16-passthrough `HummingInputSchema`, and a
   compressed-tensors **pack-quantized INT4 group-32** weight schema (the
-  checkpoint format vLLM's CT-quantized MoE models ship, e.g. Kimi K2.x), so
-  both entry points in vLLM — the WNA16 MoE backend oracle and
-  `--quantization humming` — load with no framework change. Every other
+  checkpoint format vLLM's CT-quantized MoE models ship, e.g. Kimi K2.x).
+  These schema conversions do not by themselves establish compatibility with
+  every vLLM backend or release. Every other
   schema name vLLM may import (AWQ/GPTQ/MXFP4/NVFP4/FP8/modelopt/AutoRound/
   Bitnet, online `quantize_weight`, dense GEMM) exists but raises
   `NotImplementedError`, so unsupported quantizations fail closed at load.
   The weight-scale-2 hierarchy (`weight_scale_2_type`) and block/token scale
   types are out of scope.
 - `humming.config` provides the `GemmType`/`WeightScaleType` enums.
-  `GemmType.INDEXED` and both grouped members resolve to working backends, but
+  At the standalone Chord operator/layer level, indexed and grouped backends
+  are implemented, but
   the value must agree with what the weight was packed for: a layer packed
   `indexed` rejects a grouped `gemm_type` and a grouped layer rejects the other
-  mode's, since the packed bytes differ. `GemmType.DENSE` is not implemented.
+  mode's routing contract. `GemmType.DENSE` is not implemented.
 - Profile resolution needs no chord-specific argument from the framework:
   the shard axis is recovered from the published projection shapes (see
   *Selecting the shard axis*), and the SM90 P/D role follows
-  `CHORD_SM90_DECODE`. The grouped backends need no framework argument either:
-  `CHORD_USE_GROUPED=1` reroutes `profile='auto'` to them, and the routing
-  tensors they consume (`expert_layout` / `m_indices`) are already part of the
-  delegation signature vLLM passes.
+  `CHORD_SM90_DECODE`. `CHORD_USE_GROUPED=1` selects the standalone grouped
+  profiles. Their vLLM routing and tuning integration is still WIP.
 
 On the vLLM side two things apply. First, the humming MoE experts must admit
 group-32 INT4 through `HummingExpertsBase._supports_quant_scheme`; upstream
@@ -274,8 +282,9 @@ group-32 keys added explicitly. Second, the Humming backend is selected with
 since the automatic WNA16 priority order tries other backends first. Leave
 `VLLM_HUMMING_USE_F16_ACCUM` / `VLLM_BATCH_INVARIANT` off — neither backend
 implements those compute options. `VLLM_HUMMING_MOE_GEMM_TYPE` must agree with
-what the weight was packed for: its default indexed behavior for an indexed
-layer, or the matching grouped value when `CHORD_USE_GROUPED=1` is set. No
+what the weight was packed for. Keep its default indexed behavior for the
+existing indexed integration; setting a grouped value does not complete the
+WIP adapter. No
 environment variable is needed for TP8: `profile='auto'` recovers the shard
 axis from the projection shapes and lands on `h200_tp8`.
 

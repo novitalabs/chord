@@ -1,17 +1,24 @@
 # Measured performance
 
-`humming` is the public Humming `indexed` path, `chord` is this repository's
-profile for that scenario; both are timed on the same GPU at the same shape and
-the same routing draw. Times are per-call microseconds, lower is better.
-`gate_up + down` is the speedup of the two stages summed, which is what one MoE
-layer actually pays.
+These tables preserve the original benchmark snapshot from revision
+`89f41c0`. Grouped results describe standalone operators; grouped vLLM
+integration is WIP. A later matched H200 audit, including repeat measurements
+and their limits, is documented in
+[release validation](validation/release-audit-2026-09-14.md).
 
-The timing method is the upstream `triton.testing.do_bench` call, so rows are
-comparable one-to-one with Humming's published tables; the methods, the
-`cos_diff` accuracy metric and how to read the throughput columns are in
-[benchmarking.md](benchmarking.md). The chart in the README renders these
-tables; after re-measuring, update the copies in
-`docs/assets/benchmark_chart.py` and re-run that script.
+`humming` denotes the corresponding public Humming interface and `chord` the
+Chord profile for that scenario. Times are per-call microseconds, lower is
+better. `gate_up + down` divides the sums of two independently timed GEMM
+calls. It excludes routing, layout conversion, activation, communication and
+framework work, including shared routing-block choices across projections;
+it is not a measured full MoE-layer or serving speedup.
+
+The timing helper is `triton.testing.do_bench`. Using the same helper alone
+does not establish matched inputs or equivalent runtime conditions. The
+methods, `cos_diff` accuracy metric and throughput columns are explained in
+[benchmarking.md](benchmarking.md). The README chart renders this original
+snapshot; later measurements should identify their source revisions and
+environment separately rather than mixing old and new timings.
 
 ## H200 EP8 prefill (`h200_prefill_ep8`)
 
@@ -114,6 +121,7 @@ row is the one that matches the decode counts in [shapes.md](shapes.md).
 | down | 32 | 214.0 | 164.2 | 2592 | 1.30 | |
 | down | 64 | 269.5 | 233.0 | 1953 | 1.16 | |
 
-EP16 (24 experts) and EP32 (12 experts) run the same tables; the grouped
-profiles are EP-width agnostic and measure 1.18-1.34x and 1.13-1.30x per layer
-over the same baseline.
+The grouped profiles also accept EP16/EP32 configurations. The original
+summary reported 1.18-1.34x and 1.13-1.30x summed-GEMM ratios for those widths,
+but did not include per-point baseline tables. Those ratios have not been
+independently revalidated and are not evidence of grouped vLLM readiness.
