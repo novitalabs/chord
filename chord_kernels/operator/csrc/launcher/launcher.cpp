@@ -52,18 +52,26 @@ inline int32_t *get_locks(int64_t device, cudaStream_t stream) {
   auto &device_locks = g_locks[device];
   auto it = device_locks.find(stream);
   if (it != device_locks.end()) return it->second;
+  // The first stream-K launch on a stream can happen inside a CUDA-graph
+  // capture: vLLM captures on a stream it never ran eagerly.  cudaMalloc is
+  // prohibited under the default capture modes, so allocate in relaxed mode,
+  // and zero on a private stream that is synchronized here, so the fill is
+  // neither recorded into the graph nor racing the first eager or captured
+  // launch on any stream.
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  cudaThreadExchangeStreamCaptureMode(&mode);
   int32_t *locks = nullptr;
-  ASSERT_CHECK(
-      cudaMalloc(reinterpret_cast<void **>(&locks), kNumLocks * sizeof(int32_t)) ==
-          cudaSuccess,
-      "cudaMalloc for stream-K locks failed");
-  // Zero on the launch stream so the first stream-K kernel on this stream is
-  // ordered after the fill; a host-side memset would race a non-blocking
-  // stream.
-  ASSERT_CHECK(
-      cudaMemsetAsync(locks, 0, kNumLocks * sizeof(int32_t), stream) ==
-          cudaSuccess,
-      "cudaMemsetAsync for stream-K locks failed");
+  cudaStream_t fill_stream = nullptr;
+  const size_t nbytes = kNumLocks * sizeof(int32_t);
+  const bool ok =
+      cudaMalloc(reinterpret_cast<void **>(&locks), nbytes) == cudaSuccess &&
+      cudaStreamCreateWithFlags(&fill_stream, cudaStreamNonBlocking) ==
+          cudaSuccess &&
+      cudaMemsetAsync(locks, 0, nbytes, fill_stream) == cudaSuccess &&
+      cudaStreamSynchronize(fill_stream) == cudaSuccess;
+  if (fill_stream != nullptr) cudaStreamDestroy(fill_stream);
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  ASSERT_CHECK(ok, "allocating the stream-K lock buffer failed");
   device_locks[stream] = locks;
   return locks;
 }

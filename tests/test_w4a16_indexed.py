@@ -1112,3 +1112,76 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _stream_k_swap_ab_case(device: torch.device, seed: int):
+    """A small INT4 swap-AB stream-K gate/up problem plus its reference.
+
+    K = 7168 (112 K-blocks) at 4 CTAs/SM leaves the tail tiles split more than
+    three ways, so the stream-K reduction is exercised on every launch.
+    """
+    from chord_kernels.operator import IndexedKernelConfig, pack_w4a16
+
+    num_experts, top_k, m, n, k = 8, 4, 24, 512, 7168
+    gen = torch.Generator(device=device).manual_seed(seed)
+    codes = torch.randint(0, 16, (num_experts, n, k), dtype=torch.int32, device=device,
+                          generator=gen)
+    scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
+             + 0.005).to(torch.bfloat16)
+    weight = pack_w4a16(codes, scale, layout="mma")
+    config = IndexedKernelConfig(
+        block_shape=(8, 256, 64), warp_shape=(8, 64, 64), num_stages=4,
+        num_ctas_per_sm=4, swap_ab=True, use_stream_k=True,
+    )
+    topk_ids = generate_topk_ids(num_tokens=m, top_k=top_k, num_experts=num_experts,
+                                 device=device, generator=gen)
+    sorted_ids, expert_ids, ntp = align_routing_blocks(
+        topk_ids, block_m=config.block_m, num_experts=num_experts)
+    activation = torch.randn((m, k), dtype=torch.bfloat16, device=device, generator=gen)
+    reference, rows = reference_indexed(activation, codes, scale, topk_ids, top_k,
+                                        projection="gate_up")
+    return SimpleNamespace(weight=weight, config=config, sorted_ids=sorted_ids,
+                           expert_ids=expert_ids, ntp=ntp, activation=activation,
+                           top_k=top_k, n=n, rows=rows, reference=reference)
+
+
+@pytest.mark.gpu
+def test_stream_k_first_launch_inside_cuda_graph_capture(supported_gpu: torch.device) -> None:
+    """A stream's first stream-K launch may be inside a CUDA-graph capture.
+
+    vLLM captures decode graphs on a stream that never ran the kernel eagerly,
+    so the per-stream lock buffer is first requested during capture.  The
+    capture must succeed, and both graph replays and an eager launch on the
+    capture stream (whose locks were allocated mid-capture) must match the
+    reference.
+    """
+    from chord_kernels import indexed
+
+    case = _stream_k_swap_ab_case(supported_gpu, seed=20261009)
+
+    def run(out):
+        return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
+                       case.ntp, case.top_k, outputs=out, config=case.config,
+                       validate_routing=False)
+
+    # Compile + load the kernel eagerly on the default stream only.
+    run(torch.empty((case.rows, case.n), dtype=torch.bfloat16, device=supported_gpu))
+    torch.cuda.synchronize(supported_gpu)
+
+    capture_stream = torch.cuda.Stream(device=supported_gpu)
+    graph_out = torch.zeros((case.rows, case.n), dtype=torch.bfloat16, device=supported_gpu)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        run(graph_out)
+    for _ in range(3):
+        graph_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize(supported_gpu)
+        cosine, _ = _check_output(graph_out[: case.rows], case.reference)
+        assert cosine <= _COSINE_LIMIT
+
+    with torch.cuda.stream(capture_stream):
+        eager_out = run(torch.empty_like(graph_out))
+    torch.cuda.synchronize(supported_gpu)
+    cosine, _ = _check_output(eager_out[: case.rows], case.reference)
+    assert cosine <= _COSINE_LIMIT
