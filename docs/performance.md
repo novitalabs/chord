@@ -43,6 +43,37 @@ tables; after re-measuring, update the copies in
 | down | 8196 | 1277.2 | 188.32 | 847.8 | 284 | 1.51 | |
 | down | 16384 | 2187.7 | 219.89 | 1723.5 | 279 | 1.27 | |
 
+### Stream-K reduction on H200
+
+The prefill and TP8 stream-K rows reduce their K-split partials in an FP32
+workspace and round once, like the B300 rows below.  The tables above were
+measured with the inherited BF16 reduction on another H200.  This table times
+both reductions back to back on one H200 SXM with the same cases and tiles
+(triton `do_bench`), and checks bit-identity against a PyTorch BF16 matmul on
+the BF16-dequantized INT4 weight (first 4096 routed rows):
+
+| profile | stage | num_tokens_total | tile | BF16 µs | FP32 µs | Δ | bit-identical, BF16 / FP32 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| prefill | gate_up | 1024 | 40x256x64, 2 CTAs | 321.5 | 323.1 | +0.5% | 88.6% / 99.76% |
+| prefill | gate_up | 2048 | 64x256x64, 2 CTAs | 390.6 | 394.0 | +0.9% | 88.5% / 99.76% |
+| prefill | gate_up | 4096 | 96x256x64 | 552.3 | 554.4 | +0.4% | 97.3% / 99.86% |
+| prefill | gate_up | 8192 | 96x256x64 | 1012.9 | 1012.7 | -0.0% | 97.6% / 99.86% |
+| prefill | gate_up | 16384 | 176x256x64 | 1775.4 | 1746.9 | -1.6% | 97.3% / 99.91% |
+| prefill | down | 1024 | 40x256x64, 2 CTAs | 164.6 | 167.2 | +1.6% | 93.5% / 99.99% |
+| prefill | down | 2048 | 64x256x64, 2 CTAs | 207.7 | 208.9 | +0.6% | 93.1% / 99.99% |
+| prefill | down | 4096 | 96x256x64 | 297.1 | 293.6 | -1.2% | 96.7% / 100.00% |
+| TP8 | gate_up | 1024 | 40x128x128 | 385.0 | 388.1 | +0.8% | 97.8% / 99.84% |
+| TP8 | gate_up | 2048 | 72x256x64 | 434.5 | 446.3 | +2.7% | 94.3% / 99.71% |
+| TP8 | gate_up | 4096 | 96x256x64 | 594.2 | 594.4 | +0.0% | 96.1% / 99.71% |
+| TP8 | down | 16384 | 128x128x64, 2 CTAs | 1774.1 | 1634.8 | -7.9% | 100.0% / 100.0% |
+
+Rows without stream-K (prefill down from 8192, TP8 gate/up from 8192, TP8
+down below 16384) are unchanged.  Over the twelve stream-K rows the FP32
+reduction ranges from 7.9% faster to 2.7% slower (two rows repeated five
+times: TP8 gate/up 2048 +2.7%, prefill down 1024 +1.6%; the rest are within
+noise).  With BF16 reduction the prefill gate/up 4096 output also differed
+between launches.
+
 ## H200 EP8 decode (`h200_decode_ep8`)
 
 Tokens per GPU is `bs * (mtp + 1)`.
@@ -62,14 +93,32 @@ Tokens per GPU is `bs * (mtp + 1)`.
 
 | Stage | tokens/GPU | humming µs | humming GB/s | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 20 | 319.1 | 2385.78 | 146.0 | 5215 | 2.19 | 2.15 |
-| gate_up | 30 | 320.4 | 2481.51 | 162.3 | 4900 | 1.97 | 1.98 |
-| gate_up | 40 | 320.6 | 2482.68 | 175.2 | 4544 | 1.83 | 1.88 |
-| gate_up | 50 | 320.9 | 2482.44 | 182.9 | 4355 | 1.75 | 1.81 |
-| down | 20 | 174.8 | 2190.34 | 83.8 | 4565 | 2.09 | |
-| down | 30 | 181.3 | 2211.10 | 91.3 | 4391 | 1.99 | |
-| down | 40 | 181.4 | 2217.48 | 91.9 | 4379 | 1.97 | |
-| down | 50 | 181.7 | 2221.51 | 95.1 | 4245 | 1.91 | |
+| gate_up | 20 | 319.1 | 2385.78 | 147.5 | 5160 | 2.16 | 2.14 |
+| gate_up | 30 | 320.4 | 2481.51 | 166.3 | 4780 | 1.93 | 1.94 |
+| gate_up | 40 | 320.6 | 2482.68 | 181.4 | 4388 | 1.77 | 1.84 |
+| gate_up | 50 | 320.9 | 2482.44 | 190.2 | 4190 | 1.69 | 1.76 |
+| down | 20 | 174.8 | 2190.34 | 83.8 | 4569 | 2.09 | |
+| down | 30 | 181.3 | 2211.10 | 91.9 | 4361 | 1.97 | |
+| down | 40 | 181.4 | 2217.48 | 92.0 | 4374 | 1.97 | |
+| down | 50 | 181.7 | 2221.51 | 95.2 | 4241 | 1.91 | |
+
+The gate/up rows split K with stream-K and now reduce the partials in an FP32
+workspace (one BF16 rounding, deterministic; see
+[optimizations.md](optimizations.md)).  The
+inherited reduction added BF16 partials into the output instead.  Against it,
+same cases and tiles (B300, triton `do_bench`), down has no stream-K row at
+these sizes:
+
+| gate_up tokens/GPU | tile | BF16 reduction µs | FP32 reduction µs | Δ | bit-identical to PyTorch, BF16 / FP32 |
+| --- | --- | --- | --- | --- | --- |
+| 20 | 8x256x64 swap | 146.6 | 147.4 | +0.6% | 89.1% / 99.76% |
+| 30 | 8x256x64 swap | 165.2 | 166.3 | +0.7% | 85.6% / 99.83% |
+| 40 | 8x256x64 swap | 178.5 | 179.8 | +0.7% | 86.0% / 99.82% |
+| 50 | 16x512x128 | 184.5 | 188.9 | +2.4% | 90.1% / 99.82% |
+
+Bit-identity is against a PyTorch BF16 matmul on the BF16-dequantized INT4
+weight; the down rows are 100% bit-identical either way.  With BF16 reduction
+the 20 and 30 tokens/GPU outputs also differ between launches.
 
 The Blackwell speedups are larger than the H200 ones mostly because of the
 baseline, not because the Blackwell schedule is better tuned than the Hopper

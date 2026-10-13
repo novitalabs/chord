@@ -33,12 +33,15 @@ int64_t compatible_block_n(int64_t shape_n) {
   return candidate;
 }
 
+// api.py _default_stream_k_fp32: FP32 wherever the kernel implements it, which
+// on the MMA layout (warp-N 64) is every stream-K config.
 // tuning.py _indexed_config, MMA layout (warp-N 64).
 GemmConfig indexed_config(const LayerDesc& l, int64_t block_m, int64_t block_n,
                           int64_t num_ctas_per_sm, bool swap_ab, bool use_stream_k,
                           int64_t block_k = 64) {
   return {l.shape_n, l.shape_k,         l.num_experts, block_m, block_n, block_k, block_m,
-          64,        std::min<int64_t>(block_k, 64), 4, num_ctas_per_sm, swap_ab, use_stream_k};
+          64,        std::min<int64_t>(block_k, 64), 4, num_ctas_per_sm, swap_ab, use_stream_k,
+          use_stream_k};
 }
 
 // tuning.py _select_indexed_kernel_config, for the profiles that reach SM100 / SM103.
@@ -76,7 +79,7 @@ GemmConfig table_config(const LayerDesc& l, int64_t table, int64_t m) {
     if (m > r.lower && m <= r.upper) {
       return {l.shape_n,  l.shape_k,  l.num_experts, r.block_m,    r.block_n,
               r.block_k,  r.warp_m,   r.warp_n,      r.warp_k,     r.num_stages,
-              r.num_ctas_per_sm, r.swap_ab, r.use_stream_k};
+              r.num_ctas_per_sm, r.swap_ab, r.use_stream_k, r.stream_k_fp32};
     }
   }
   invalid("no indexed tuning row covers valid_shape_m=" + str(m));
@@ -100,7 +103,7 @@ GemmConfig with_block_m(GemmConfig c, int64_t block_m) {
 GemmConfig default_config(int64_t shape_n, int64_t shape_k, int64_t num_experts, int64_t block_m,
                           bool swap_ab) {
   return {shape_n, shape_k, num_experts, block_m, compatible_block_n(shape_n), 64, block_m,
-          64,      64,      4,           swap_ab ? 4 : 1, swap_ab, false};
+          64,      64,      4,           swap_ab ? 4 : 1, swap_ab, false, false};
 }
 
 int64_t register_table(const std::vector<TableRow>& rows) {

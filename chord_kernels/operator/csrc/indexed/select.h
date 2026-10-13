@@ -28,7 +28,7 @@ struct TableRow {
   int64_t block_m, block_n, block_k;
   int64_t warp_m, warp_n, warp_k;
   int64_t num_stages, num_ctas_per_sm;
-  bool swap_ab, use_stream_k;
+  bool swap_ab, use_stream_k, stream_k_fp32;
 };
 
 // IndexedKernelConfig.default for the MMA layout, block-N from N.

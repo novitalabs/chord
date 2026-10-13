@@ -87,11 +87,11 @@ CHORD_CPP_JIT=1 python tests/test_w4a16_indexed.py      # Blackwell 用例的正
 
 - 选配置：同一组输入（`blackwell_decode_ep8` 两个形状扫 routed-M、表外形状、调优表、block-M 覆盖）两边选出的 `IndexedKernelConfig`、报错类型和提示文字都相同；
 - kernel：两种 JIT 的缓存目录里，同一个配置的 `kernel.cu`、kernel 名字、`kernel.cubin` 逐字节相同；
-- 输出：不带 stream-K 的配置，两条路径的 GEMM 输出逐位相同。带 stream-K 的不要求逐位相同：stream-K 每次跑结果都有很小的差别，两种 JIT 都一样。
+- 输出：两条路径的 GEMM 输出逐位相同。stream-K 默认在 FP32 workspace 里归约，结果是确定的；只有显式 `stream_k_fp32=False` 的 BF16 归约每次跑会有很小的差别。
 
 ## 8. 不支持的、没验证的
 
 - SM90 / WGMMA：不在 C++ JIT 里。
 - 调优表：只有 JSON 字符串（vLLM 的用法）由 C++ 查行；Python 的 dict / list 照旧在 Python 里处理。字符串在第一次用到时整张解析，表里有格式不对的行会在第一次调用时报错（Python JIT 是 m 落到那一行时才报错）。
-- 录 CUDA graph：仓库没有 indexed 的录图测试。调用路径不加主机同步，stream-K 锁的分配方式和 launcher 一样。
+- 录 CUDA graph：调用路径不加主机同步；stream-K 锁和 launcher 一样，在 relaxed 录图模式下分配、在私有 stream 上清零，所以某个 stream 的第一次 stream-K 启动可以发生在录图中（`test_stream_k_first_launch_inside_cuda_graph_capture`）。
 - 从 C++ 直接调用（不经过 Python）：会编、会链，没有实跑。

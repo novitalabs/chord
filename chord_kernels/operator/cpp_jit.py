@@ -164,6 +164,7 @@ def _config_fields(
         config.num_ctas_per_sm,
         int(config.swap_ab),
         int(config.use_stream_k),
+        int(config.stream_k_fp32),
     ]
 
 
@@ -251,6 +252,7 @@ def _to_config(fields: Sequence[int]) -> IndexedKernelConfig:
         num_ctas_per_sm=fields[7],
         swap_ab=bool(fields[8]),
         use_stream_k=bool(fields[9]),
+        stream_k_fp32=bool(fields[10]),
     )
 
 
@@ -304,6 +306,7 @@ def _table_id(tuning_config: str, swap_ab: bool, layout: str) -> int | None:
                 c.num_ctas_per_sm,
                 int(c.swap_ab),
                 int(c.use_stream_k),
+                int(c.stream_k_fp32),
             ]
         )
     return _load().register_table(rows)

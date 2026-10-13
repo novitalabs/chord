@@ -129,7 +129,7 @@ COMMON_TORCH_LIBRARY_IMPL(chord_cpp, CUDA, m) {
 // (creating its primary context if needed), then the library does the rest.
 namespace {
 
-constexpr size_t kConfigFields = 13;
+constexpr size_t kConfigFields = 14;
 
 chord::indexed::GemmConfig to_config(const std::vector<int64_t>& v) {
   if (v.size() != kConfigFields) {
@@ -137,7 +137,7 @@ chord::indexed::GemmConfig to_config(const std::vector<int64_t>& v) {
                                 " fields, got " + std::to_string(v.size()));
   }
   return {v[0], v[1], v[2],  v[3],  v[4],      v[5],      v[6],
-          v[7], v[8], v[9], v[10], v[11] != 0, v[12] != 0};
+          v[7], v[8], v[9], v[10], v[11] != 0, v[12] != 0, v[13] != 0};
 }
 
 void set_device(int64_t device) {
@@ -147,7 +147,8 @@ void set_device(int64_t device) {
 }
 
 // config: (shape_n, shape_k, num_experts, block_m, block_n, block_k, warp_m,
-// warp_n, warp_k, num_stages, num_ctas_per_sm, swap_ab, use_stream_k).
+// warp_n, warp_k, num_stages, num_ctas_per_sm, swap_ab, use_stream_k,
+// stream_k_fp32).
 int64_t register_gemm(int64_t device, const std::vector<int64_t>& config) {
   set_device(device);
   return chord::indexed::register_gemm(to_config(config));
@@ -161,21 +162,22 @@ std::vector<int64_t> precompile_gemm(int64_t device,
   return chord::indexed::precompile_gemm(list);
 }
 
-// Configuration choice (select.h).  A config goes back as its 10
+// Configuration choice (select.h).  A config goes back as its 11
 // IndexedKernelConfig fields: block_m, block_n, block_k, warp_m, warp_n,
-// warp_k, num_stages, num_ctas_per_sm, swap_ab, use_stream_k.
+// warp_k, num_stages, num_ctas_per_sm, swap_ab, use_stream_k, stream_k_fp32.
 std::vector<int64_t> config_fields(const chord::indexed::GemmConfig& c) {
   return {c.block_m, c.block_n, c.block_k,         c.warp_m,  c.warp_n,
-          c.warp_k,  c.num_stages, c.num_ctas_per_sm, c.swap_ab, c.use_stream_k};
+          c.warp_k,  c.num_stages, c.num_ctas_per_sm, c.swap_ab, c.use_stream_k,
+          c.stream_k_fp32};
 }
 
-// rows: (lower, upper, then the 10 config fields above) each.
+// rows: (lower, upper, then the 11 config fields above) each.
 int64_t register_table(const std::vector<std::vector<int64_t>>& rows) {
   std::vector<chord::indexed::TableRow> list;
   for (const auto& r : rows) {
-    if (r.size() != 12) throw std::invalid_argument("a tuning row has 12 fields");
+    if (r.size() != 13) throw std::invalid_argument("a tuning row has 13 fields");
     list.push_back({r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10] != 0,
-                    r[11] != 0});
+                    r[11] != 0, r[12] != 0});
   }
   return chord::indexed::register_table(list);
 }

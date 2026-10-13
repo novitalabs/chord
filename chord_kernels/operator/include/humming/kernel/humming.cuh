@@ -31,6 +31,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     const uint32_t *expert_ids_ptr,
     const uint32_t *num_tokens_padded_ptr,
     int *locks,
+    float *streamk_ws,
     uint32_t shape_m,
     uint32_t top_k) {
 
@@ -64,7 +65,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       smem, top_k, sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr);
   auto mainloop_arith = Arithmetic();
   auto mma = Mma(smem, mainloop_arith);
-  auto epilogue = Epilogue(smem, C, shape_m, top_k, locks);
+  auto epilogue = Epilogue(smem, C, shape_m, top_k, locks, streamk_ws);
   auto producer = ProducerPipeline(smem, A, B, BS, shape_m);
   auto consumer = Consumer();
   auto s2r_pipe = S2RMemoryPipeline(smem, mma);
@@ -82,6 +83,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     epilogue.seek(scheduler.n_block_id);
     epilogue.set_streamk_state(
         scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
+    if constexpr (TuningConfig::kUseStreamK && TuningConfig::kStreamKFp32) {
+      epilogue.set_streamk_geometry(
+          scheduler.k_block_id, scheduler.streamk_mn_index * (ProblemShape::K / BlockShape::K),
+          scheduler.streamk_base, scheduler.streamk_iters_per_cta);
+    }
 
     // swap-AB: count populated 8-token mma-N tiles of this m-block. Tokens are
     // front-packed per expert with sentinel >= shape_m*top_k, so tile j is all

@@ -1112,3 +1112,207 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _stream_k_swap_ab_case(device: torch.device, seed: int):
+    """A small INT4 swap-AB stream-K gate/up problem plus its reference.
+
+    K = 7168 (112 K-blocks) at 4 CTAs/SM leaves the tail tiles split more than
+    three ways, so the stream-K reduction is exercised on every launch.
+    """
+    from chord_kernels.operator import IndexedKernelConfig, pack_w4a16
+
+    num_experts, top_k, m, n, k = 8, 4, 24, 512, 7168
+    gen = torch.Generator(device=device).manual_seed(seed)
+    codes = torch.randint(0, 16, (num_experts, n, k), dtype=torch.int32, device=device,
+                          generator=gen)
+    scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
+             + 0.005).to(torch.bfloat16)
+    weight = pack_w4a16(codes, scale, layout="mma")
+    config = IndexedKernelConfig(
+        block_shape=(8, 256, 64), warp_shape=(8, 64, 64), num_stages=4,
+        num_ctas_per_sm=4, swap_ab=True, use_stream_k=True,
+    )
+    topk_ids = generate_topk_ids(num_tokens=m, top_k=top_k, num_experts=num_experts,
+                                 device=device, generator=gen)
+    sorted_ids, expert_ids, ntp = align_routing_blocks(
+        topk_ids, block_m=config.block_m, num_experts=num_experts)
+    activation = torch.randn((m, k), dtype=torch.bfloat16, device=device, generator=gen)
+    reference, rows = reference_indexed(activation, codes, scale, topk_ids, top_k,
+                                        projection="gate_up")
+    return SimpleNamespace(weight=weight, config=config, sorted_ids=sorted_ids,
+                           expert_ids=expert_ids, ntp=ntp, activation=activation,
+                           top_k=top_k, n=n, rows=rows, reference=reference)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("stream_k_fp32", [False, True])
+def test_stream_k_first_launch_inside_cuda_graph_capture(
+    supported_gpu: torch.device, stream_k_fp32: bool,
+) -> None:
+    """A stream's first stream-K launch may be inside a CUDA-graph capture.
+
+    vLLM captures decode graphs on a stream that never ran the kernel eagerly,
+    so the per-stream lock buffer is first requested during capture.  The
+    capture must succeed, and both graph replays and an eager launch on the
+    capture stream (whose locks were allocated mid-capture) must match the
+    reference.  FP32 stream-K also allocates its workspace there, and its
+    replays must be bit-identical.
+    """
+    import dataclasses
+
+    from chord_kernels import indexed
+
+    case = _stream_k_swap_ab_case(supported_gpu, seed=20261009)
+    config = dataclasses.replace(case.config, stream_k_fp32=stream_k_fp32)
+
+    def run(out):
+        return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
+                       case.ntp, case.top_k, outputs=out, config=config,
+                       validate_routing=False)
+
+    # Compile + load the kernel eagerly on the default stream only.
+    run(torch.empty((case.rows, case.n), dtype=torch.bfloat16, device=supported_gpu))
+    torch.cuda.synchronize(supported_gpu)
+
+    capture_stream = torch.cuda.Stream(device=supported_gpu)
+    graph_out = torch.zeros((case.rows, case.n), dtype=torch.bfloat16, device=supported_gpu)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        run(graph_out)
+    replays = []
+    for _ in range(3):
+        graph_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize(supported_gpu)
+        cosine, _ = _check_output(graph_out[: case.rows], case.reference)
+        assert cosine <= _COSINE_LIMIT
+        replays.append(graph_out.clone())
+
+    with torch.cuda.stream(capture_stream):
+        eager_out = run(torch.empty_like(graph_out))
+    torch.cuda.synchronize(supported_gpu)
+    cosine, _ = _check_output(eager_out[: case.rows], case.reference)
+    assert cosine <= _COSINE_LIMIT
+    if stream_k_fp32:
+        assert all(torch.equal(r, eager_out) for r in replays)
+
+
+@pytest.mark.gpu
+def test_mma_stream_k_fp32_matches_one_pass(supported_gpu: torch.device) -> None:
+    """MMA stream-K reduces in FP32: deterministic, and equal to the same tile run
+    in one pass up to FP32 summation order.  The BF16 reduction it replaces
+    flipped 10-55% of outputs."""
+    import dataclasses
+
+    from chord_kernels import indexed
+
+    case = _stream_k_swap_ab_case(supported_gpu, seed=20261013)
+    assert case.config.stream_k_fp32
+    one_pass = dataclasses.replace(case.config, use_stream_k=False, stream_k_fp32=False)
+
+    def run(config):
+        return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
+                       case.ntp, case.top_k, config=config, validate_routing=False)
+
+    reference = run(one_pass)
+    outputs = [run(case.config) for _ in range(5)]
+    torch.cuda.synchronize(supported_gpu)
+    assert all(torch.equal(out, outputs[0]) for out in outputs[1:])
+    assert (outputs[0] == reference).double().mean().item() >= 0.995
+
+
+def test_stream_k_fp32_is_the_default_for_stream_k() -> None:
+    """Stream-K configs (MMA and WGMMA) reduce in FP32 unless asked not to."""
+    from chord_kernels.operator import IndexedKernelConfig, IndexedLayerMeta
+    from chord_kernels.operator.layer import _PROFILES
+
+    mma = dict(block_shape=(8, 256, 64), warp_shape=(8, 64, 64), num_ctas_per_sm=4,
+               swap_ab=True)
+    stream_k = IndexedKernelConfig(use_stream_k=True, **mma)
+    assert stream_k.stream_k_fp32
+    one_pass = IndexedKernelConfig(**mma)
+    assert not one_pass.stream_k_fp32
+    wgmma = IndexedKernelConfig(block_shape=(64, 128, 64), warp_shape=(64, 32, 64),
+                                use_stream_k=True)
+    assert wgmma.stream_k_fp32
+    bf16 = IndexedKernelConfig(use_stream_k=True, stream_k_fp32=False, **mma)
+    assert not bf16.stream_k_fp32
+
+    # The default does not show up in the serialized rows; an override does and
+    # survives a round trip.
+    assert "stream_k_fp32" not in stream_k.to_dict()
+    assert "stream_k_fp32" not in one_pass.to_dict()
+    for config in (stream_k, one_pass, wgmma, bf16):
+        assert IndexedKernelConfig.from_dict(config.to_dict()) == config
+    assert bf16.to_dict()["stream_k_fp32"] is False
+    with pytest.raises(TypeError, match="stream_k_fp32"):
+        IndexedKernelConfig(use_stream_k=True, stream_k_fp32=1, **mma)
+
+    # Every stream-K row of every published profile reduces in FP32.
+    shapes = {
+        "h200_prefill_ep8": [(4096, 7168, 48), (7168, 2048, 48)],
+        "h200_tp8": [(512, 7168, 384), (7168, 256, 384)],
+        "h200_decode_ep8": [(4096, 7168, 48), (7168, 2048, 48)],
+        "blackwell_decode_ep8": [(4096, 7168, 48), (7168, 2048, 48)],
+    }
+    for name, profile_shapes in shapes.items():
+        for n, k, e in profile_shapes:
+            meta = IndexedLayerMeta(shape_n=n, shape_k=k, num_experts=e,
+                                    profile=_PROFILES[name])
+            for routed_m in list(range(1, 4097, 31)) + [16384, 131072]:
+                config = meta.kernel_config(routed_m)
+                assert config.stream_k_fp32 == config.use_stream_k
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "block_shape,num_ctas_per_sm,num_tokens",
+    [((40, 256, 64), 2, 16), ((96, 256, 64), 1, 128), ((176, 256, 64), 1, 256)],
+    ids=["40x256x2", "96x256", "176x256"],
+)
+def test_wgmma_stream_k_fp32_matches_one_pass(
+    block_shape: tuple[int, int, int], num_ctas_per_sm: int, num_tokens: int,
+) -> None:
+    """WGMMA stream-K reduces in FP32: deterministic, and equal to one pass up to
+    FP32 summation order.  The 176-row tile is the one that needs the
+    accumulator fence after ``wgmma.wait_group`` (without it the epilogue read
+    in-flight accumulators and two launches disagreed)."""
+    import dataclasses
+
+    from chord_kernels import indexed
+    from chord_kernels.operator import IndexedKernelConfig, pack_w4a16
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the WGMMA indexed layout needs SM90")
+    device = torch.device("cuda")
+    num_experts, top_k, n, k = 48, 8, 4096, 7168
+    gen = torch.Generator(device=device).manual_seed(20261013 + num_tokens)
+    codes = torch.randint(0, 16, (num_experts, n, k), dtype=torch.int32, device=device,
+                          generator=gen)
+    scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
+             + 0.005).to(torch.bfloat16)
+    weight = pack_w4a16(codes, scale, layout="wgmma")
+    del codes, scale
+    stream_k = IndexedKernelConfig(
+        block_shape=block_shape, warp_shape=(block_shape[0], 32, 64),
+        num_ctas_per_sm=num_ctas_per_sm, use_stream_k=True,
+    )
+    assert stream_k.stream_k_fp32
+    one_pass = dataclasses.replace(stream_k, use_stream_k=False, stream_k_fp32=False)
+    topk_ids = generate_topk_ids(num_tokens=num_tokens, top_k=top_k,
+                                 num_experts=num_experts, device=device, generator=gen)
+    sorted_ids, expert_ids, ntp = align_routing_blocks(
+        topk_ids, block_m=stream_k.block_m, num_experts=num_experts)
+    activation = torch.randn((num_tokens, k), dtype=torch.bfloat16, device=device,
+                             generator=gen)
+
+    def run(config):
+        return indexed(activation, weight, sorted_ids, expert_ids, ntp, top_k,
+                       config=config, validate_routing=False)
+
+    reference = run(one_pass)
+    outputs = [run(stream_k) for _ in range(5)]
+    torch.cuda.synchronize(device)
+    assert all(torch.equal(out, outputs[0]) for out in outputs[1:])
+    assert (outputs[0] == reference).double().mean().item() >= 0.995
