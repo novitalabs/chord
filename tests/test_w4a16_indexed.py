@@ -1146,22 +1146,29 @@ def _stream_k_swap_ab_case(device: torch.device, seed: int):
 
 
 @pytest.mark.gpu
-def test_stream_k_first_launch_inside_cuda_graph_capture(supported_gpu: torch.device) -> None:
+@pytest.mark.parametrize("stream_k_fp32", [False, True])
+def test_stream_k_first_launch_inside_cuda_graph_capture(
+    supported_gpu: torch.device, stream_k_fp32: bool,
+) -> None:
     """A stream's first stream-K launch may be inside a CUDA-graph capture.
 
     vLLM captures decode graphs on a stream that never ran the kernel eagerly,
     so the per-stream lock buffer is first requested during capture.  The
     capture must succeed, and both graph replays and an eager launch on the
     capture stream (whose locks were allocated mid-capture) must match the
-    reference.
+    reference.  FP32 stream-K also allocates its workspace there, and its
+    replays must be bit-identical.
     """
+    import dataclasses
+
     from chord_kernels import indexed
 
     case = _stream_k_swap_ab_case(supported_gpu, seed=20261009)
+    config = dataclasses.replace(case.config, stream_k_fp32=stream_k_fp32)
 
     def run(out):
         return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
-                       case.ntp, case.top_k, outputs=out, config=case.config,
+                       case.ntp, case.top_k, outputs=out, config=config,
                        validate_routing=False)
 
     # Compile + load the kernel eagerly on the default stream only.
@@ -1173,15 +1180,79 @@ def test_stream_k_first_launch_inside_cuda_graph_capture(supported_gpu: torch.de
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
         run(graph_out)
+    replays = []
     for _ in range(3):
         graph_out.zero_()
         graph.replay()
         torch.cuda.synchronize(supported_gpu)
         cosine, _ = _check_output(graph_out[: case.rows], case.reference)
         assert cosine <= _COSINE_LIMIT
+        replays.append(graph_out.clone())
 
     with torch.cuda.stream(capture_stream):
         eager_out = run(torch.empty_like(graph_out))
     torch.cuda.synchronize(supported_gpu)
     cosine, _ = _check_output(eager_out[: case.rows], case.reference)
     assert cosine <= _COSINE_LIMIT
+    if stream_k_fp32:
+        assert all(torch.equal(r, eager_out) for r in replays)
+
+
+@pytest.mark.gpu
+def test_mma_stream_k_fp32_matches_one_pass(supported_gpu: torch.device) -> None:
+    """MMA stream-K reduces in FP32: deterministic, and equal to the same tile run
+    in one pass up to FP32 summation order.  The BF16 reduction it replaces
+    flipped 10-55% of outputs."""
+    import dataclasses
+
+    from chord_kernels import indexed
+
+    case = _stream_k_swap_ab_case(supported_gpu, seed=20261013)
+    assert case.config.stream_k_fp32
+    one_pass = dataclasses.replace(case.config, use_stream_k=False, stream_k_fp32=False)
+
+    def run(config):
+        return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
+                       case.ntp, case.top_k, config=config, validate_routing=False)
+
+    reference = run(one_pass)
+    outputs = [run(case.config) for _ in range(5)]
+    torch.cuda.synchronize(supported_gpu)
+    assert all(torch.equal(out, outputs[0]) for out in outputs[1:])
+    assert (outputs[0] == reference).double().mean().item() >= 0.995
+
+
+def test_stream_k_fp32_is_the_default_for_mma_stream_k() -> None:
+    """MMA stream-K configs reduce in FP32 unless asked not to; nothing else changes."""
+    from chord_kernels.operator import IndexedKernelConfig, IndexedLayerMeta
+    from chord_kernels.operator.layer import _PROFILES
+
+    mma = dict(block_shape=(8, 256, 64), warp_shape=(8, 64, 64), num_ctas_per_sm=4,
+               swap_ab=True)
+    stream_k = IndexedKernelConfig(use_stream_k=True, **mma)
+    assert stream_k.stream_k_fp32
+    one_pass = IndexedKernelConfig(**mma)
+    assert not one_pass.stream_k_fp32
+    wgmma = IndexedKernelConfig(block_shape=(64, 128, 64), warp_shape=(64, 32, 64),
+                                use_stream_k=True)
+    assert not wgmma.stream_k_fp32
+    bf16 = IndexedKernelConfig(use_stream_k=True, stream_k_fp32=False, **mma)
+    assert not bf16.stream_k_fp32
+
+    # The default does not show up in the serialized rows; an override does and
+    # survives a round trip.
+    assert "stream_k_fp32" not in stream_k.to_dict()
+    assert "stream_k_fp32" not in one_pass.to_dict()
+    for config in (stream_k, one_pass, wgmma, bf16):
+        assert IndexedKernelConfig.from_dict(config.to_dict()) == config
+    assert bf16.to_dict()["stream_k_fp32"] is False
+    with pytest.raises(TypeError, match="stream_k_fp32"):
+        IndexedKernelConfig(use_stream_k=True, stream_k_fp32=1, **mma)
+
+    # Every stream-K row of the B300 table now reduces in FP32.
+    profile = _PROFILES["blackwell_decode_ep8"]
+    for n, k in ((4096, 7168), (7168, 2048)):
+        meta = IndexedLayerMeta(shape_n=n, shape_k=k, num_experts=48, profile=profile)
+        for routed_m in range(1, 2049, 13):
+            config = meta.kernel_config(routed_m)
+            assert config.stream_k_fp32 == config.use_stream_k

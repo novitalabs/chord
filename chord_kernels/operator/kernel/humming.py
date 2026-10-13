@@ -26,6 +26,7 @@ public:
   static constexpr uint32_t kNumThreads = {{num_threads}};
   static constexpr bool kSwapAb = {{swap_ab}};
   static constexpr bool kUseStreamK = {{use_stream_k}};
+  static constexpr bool kStreamKFp32 = {{stream_k_fp32}};
 };
 
 using SharedStorageType = SharedStorage<
@@ -40,6 +41,8 @@ extern "C" __constant__ uint32_t NUM_EXPERTS = {{num_experts}};
 extern "C" __constant__ uint32_t NUM_THREADS = {{num_threads}};
 extern "C" __constant__ uint32_t NUM_CTAS_PER_SM = {{num_ctas_per_sm}};
 extern "C" __constant__ uint32_t USE_STREAM_K = {{use_stream_k_int}};
+extern "C" __constant__ uint32_t STREAM_K_FP32 = {{stream_k_fp32_int}};
+extern "C" __constant__ uint32_t STREAMK_TILE_ELEMS = {{block_shape[0] * block_shape[1]}};
 """)
 
 
@@ -60,6 +63,7 @@ class HummingKernel(KernelRuntime):
     num_ctas_per_sm: int = 1
     swap_ab: bool = False
     use_stream_k: bool = False
+    stream_k_fp32: bool = False
     mma_type: str = "mma"
 
     def __post_init__(self) -> None:
@@ -96,6 +100,10 @@ class HummingKernel(KernelRuntime):
             raise TypeError("swap_ab must be a bool")
         if not isinstance(self.use_stream_k, bool):
             raise TypeError("use_stream_k must be a bool")
+        if not isinstance(self.stream_k_fp32, bool):
+            raise TypeError("stream_k_fp32 must be a bool")
+        if self.stream_k_fp32 and self.mma_type != "mma":
+            raise ValueError("stream_k_fp32 is only available for MMA kernels")
         if self.mma_type not in ("mma", "wgmma"):
             raise ValueError(
                 f"mma_type must be 'mma' or 'wgmma', got {self.mma_type!r}"
@@ -154,6 +162,10 @@ class HummingKernel(KernelRuntime):
             swap_ab=str(self.swap_ab).lower(),
             use_stream_k=str(self.use_stream_k).lower(),
             use_stream_k_int=int(self.use_stream_k),
+            # Only a stream-K kernel has a reduction to switch; folding the
+            # flag keeps one cubin per one-pass config.
+            stream_k_fp32=str(self.use_stream_k and self.stream_k_fp32).lower(),
+            stream_k_fp32_int=int(self.use_stream_k and self.stream_k_fp32),
         )
         self.kernel_expr = (
             "humming<\n"

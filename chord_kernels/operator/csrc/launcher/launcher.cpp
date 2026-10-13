@@ -76,6 +76,29 @@ inline int32_t *get_locks(int64_t device, cudaStream_t stream) {
   return locks;
 }
 
+// FP32 stream-K workspace, keyed like the locks.  A slice only reads tile
+// floats an earlier slice of the same launch wrote, so it needs no zeroing and
+// no reset between launches.  The size is fixed at first use so a buffer a
+// captured CUDA graph points at is never freed or moved.
+static constexpr int64_t kStreamKWorkspaceBytes = 64LL << 20;
+static std::unordered_map<int64_t, std::unordered_map<cudaStream_t, float *>>
+    g_streamk_ws;
+
+inline float *get_streamk_workspace(int64_t device, cudaStream_t stream) {
+  auto &device_ws = g_streamk_ws[device];
+  auto it = device_ws.find(stream);
+  if (it != device_ws.end()) return it->second;
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  float *ws = nullptr;
+  const bool ok = cudaMalloc(reinterpret_cast<void **>(&ws), kStreamKWorkspaceBytes) ==
+      cudaSuccess;
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  ASSERT_CHECK(ok, "allocating the FP32 stream-K workspace failed");
+  device_ws[stream] = ws;
+  return ws;
+}
+
 inline uint32_t get_num_sms(int64_t device) {
   int32_t num_sms = 0;
   ASSERT_CHECK(
@@ -142,6 +165,17 @@ Tensor launch_kernel(
         " lock words but only ", kNumLocks, " are allocated");
     locks_ptr = get_locks(device, stream);
   }
+  float *streamk_ws_ptr = nullptr;
+  if (kernel_data.use_stream_k && kernel_data.stream_k_fp32) {
+    // One partial-segment tile per CTA (see EpiloguePipeline::partial_slot).
+    const int64_t need = static_cast<int64_t>(num_ctas) * kernel_data.streamk_tile_elems *
+        static_cast<int64_t>(sizeof(float));
+    ASSERT_CHECK(
+        need <= kStreamKWorkspaceBytes,
+        "FP32 stream-K launch may need ", need, " workspace bytes but only ",
+        kStreamKWorkspaceBytes, " are allocated");
+    streamk_ws_ptr = get_streamk_workspace(device, stream);
+  }
   void *kernel_args[] = {
       &input_ptr,
       &weight_ptr,
@@ -151,6 +185,7 @@ Tensor launch_kernel(
       &expert_ids_ptr,
       &num_tokens_padded_ptr,
       &locks_ptr,
+      &streamk_ws_ptr,
       &shape_m_u32,
       &top_k_u32,
   };
@@ -215,6 +250,8 @@ int64_t register_kernel(
         num_experts,
         num_ctas_per_sm,
         reader.getUint32("USE_STREAM_K") != 0,
+        reader.getUint32("STREAM_K_FP32") != 0,
+        reader.getUint32("STREAMK_TILE_ELEMS"),
     };
   }
   return kernel_id;

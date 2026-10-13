@@ -17,6 +17,16 @@ from chord_kernels.operator.packing import (
 )
 
 
+def _default_stream_k_fp32(use_stream_k: bool, warp_shape: tuple[int, int, int]) -> bool:
+    """Default stream-K reduction: FP32 wherever the kernel implements it.
+
+    The FP32 workspace reduction exchanges the MMA (warp-N 64) accumulator
+    layout; the WGMMA (warp-N 32) epilogue still reduces in BF16.  One-pass
+    configs have no reduction, so they keep ``False`` and their cubins.
+    """
+    return use_stream_k and warp_shape[1] == 64
+
+
 @dataclasses.dataclass(frozen=True)
 class IndexedKernelConfig:
     """Small immutable launch description for the indexed W4A16 kernel.
@@ -32,6 +42,11 @@ class IndexedKernelConfig:
     num_ctas_per_sm: int = 1
     swap_ab: bool = False
     use_stream_k: bool = False
+    # Reduce stream-K partials in an FP32 workspace (one BF16 rounding per
+    # output, deterministic) instead of BF16 adds into the output.  ``None``
+    # resolves to FP32 for every stream-K config the kernel implements it for
+    # (see _default_stream_k_fp32); ``False`` forces the BF16 reduction.
+    stream_k_fp32: bool | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -65,6 +80,13 @@ class IndexedKernelConfig:
             raise TypeError("swap_ab must be a bool")
         if not isinstance(self.use_stream_k, bool):
             raise TypeError("use_stream_k must be a bool")
+        if self.stream_k_fp32 is None:
+            object.__setattr__(
+                self, "stream_k_fp32",
+                _default_stream_k_fp32(self.use_stream_k, self.warp_shape),
+            )
+        if not isinstance(self.stream_k_fp32, bool):
+            raise TypeError("stream_k_fp32 must be a bool or None")
         # The launcher's device-resident lock buffer holds 1024 words and the
         # scheduler peels at most ~2x the grid in stream-K tiles, so 4 CTAs/SM
         # on a 128-SM part is already the ceiling.  The launcher re-checks the
@@ -117,10 +139,11 @@ class IndexedKernelConfig:
             num_ctas_per_sm=value.get("num_ctas_per_sm", 1),
             swap_ab=value.get("swap_ab", False),
             use_stream_k=value.get("use_stream_k", False),
+            stream_k_fp32=value.get("stream_k_fp32"),
         )
 
     def to_dict(self) -> dict:
-        return {
+        row = {
             "block_shape": self.block_shape,
             "warp_shape": self.warp_shape,
             "num_stages": self.num_stages,
@@ -128,6 +151,11 @@ class IndexedKernelConfig:
             "swap_ab": self.swap_ab,
             "use_stream_k": self.use_stream_k,
         }
+        # Only emitted when it differs from the layout default, so the published
+        # rows serialize as before and an explicit override survives a round trip.
+        if self.stream_k_fp32 != _default_stream_k_fp32(self.use_stream_k, self.warp_shape):
+            row["stream_k_fp32"] = self.stream_k_fp32
+        return row
 
 
 def _compatible_block_n(shape_n: int) -> int:
@@ -184,6 +212,7 @@ def _get_indexed_kernel(
             mma_type=mma_type,
             swap_ab=swap_ab,
             use_stream_k=config.use_stream_k,
+            stream_k_fp32=config.stream_k_fp32,
         )
 
 

@@ -62,14 +62,32 @@ Tokens per GPU is `bs * (mtp + 1)`.
 
 | Stage | tokens/GPU | humming µs | humming GB/s | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 20 | 319.1 | 2385.78 | 146.0 | 5215 | 2.19 | 2.15 |
-| gate_up | 30 | 320.4 | 2481.51 | 162.3 | 4900 | 1.97 | 1.98 |
-| gate_up | 40 | 320.6 | 2482.68 | 175.2 | 4544 | 1.83 | 1.88 |
-| gate_up | 50 | 320.9 | 2482.44 | 182.9 | 4355 | 1.75 | 1.81 |
-| down | 20 | 174.8 | 2190.34 | 83.8 | 4565 | 2.09 | |
-| down | 30 | 181.3 | 2211.10 | 91.3 | 4391 | 1.99 | |
-| down | 40 | 181.4 | 2217.48 | 91.9 | 4379 | 1.97 | |
-| down | 50 | 181.7 | 2221.51 | 95.1 | 4245 | 1.91 | |
+| gate_up | 20 | 319.1 | 2385.78 | 147.5 | 5160 | 2.16 | 2.14 |
+| gate_up | 30 | 320.4 | 2481.51 | 166.3 | 4780 | 1.93 | 1.94 |
+| gate_up | 40 | 320.6 | 2482.68 | 181.4 | 4388 | 1.77 | 1.84 |
+| gate_up | 50 | 320.9 | 2482.44 | 190.2 | 4190 | 1.69 | 1.76 |
+| down | 20 | 174.8 | 2190.34 | 83.8 | 4569 | 2.09 | |
+| down | 30 | 181.3 | 2211.10 | 91.9 | 4361 | 1.97 | |
+| down | 40 | 181.4 | 2217.48 | 92.0 | 4374 | 1.97 | |
+| down | 50 | 181.7 | 2221.51 | 95.2 | 4241 | 1.91 | |
+
+The gate/up rows split K with stream-K and now reduce the partials in an FP32
+workspace (one BF16 rounding, deterministic; see
+[optimizations.md](optimizations.md)).  The
+inherited reduction added BF16 partials into the output instead.  Against it,
+same cases and tiles (B300, triton `do_bench`), down has no stream-K row at
+these sizes:
+
+| gate_up tokens/GPU | tile | BF16 reduction µs | FP32 reduction µs | Δ | bit-identical to PyTorch, BF16 / FP32 |
+| --- | --- | --- | --- | --- | --- |
+| 20 | 8x256x64 swap | 146.6 | 147.4 | +0.6% | 89.1% / 99.76% |
+| 30 | 8x256x64 swap | 165.2 | 166.3 | +0.7% | 85.6% / 99.83% |
+| 40 | 8x256x64 swap | 178.5 | 179.8 | +0.7% | 86.0% / 99.82% |
+| 50 | 16x512x128 | 184.5 | 188.9 | +2.4% | 90.1% / 99.82% |
+
+Bit-identity is against a PyTorch BF16 matmul on the BF16-dequantized INT4
+weight; the down rows are 100% bit-identical either way.  With BF16 reduction
+the 20 and 30 tokens/GPU outputs also differ between launches.
 
 The Blackwell speedups are larger than the H200 ones mostly because of the
 baseline, not because the Blackwell schedule is better tuned than the Hopper

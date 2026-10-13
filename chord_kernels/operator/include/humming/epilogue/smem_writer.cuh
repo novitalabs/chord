@@ -68,6 +68,12 @@ private:
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;
 
 public:
+  // FP32 accumulator floats per thread, and how many threads hold the CTA's
+  // partial once the K-warps are reduced (write() ignores the rest).  The
+  // stream-K FP32 reduction exchanges exactly these registers.
+  static constexpr uint32_t kNumCRegs = sizeof(CRegistersArrayType) / sizeof(float);
+  static constexpr uint32_t kNumRegThreads = kNumThreads / K_WARPS;
+
   int4 *smem_ptr;
 
   CUDA_INLINE
