@@ -190,6 +190,10 @@ std::string kernel_source(const GemmConfig& c, const MmaShape& mma) {
   s += "  static constexpr uint32_t kNumThreads = " + threads + ";\n";
   s += std::string("  static constexpr bool kSwapAb = ") + bool_str(c.swap_ab) + ";\n";
   s += std::string("  static constexpr bool kUseStreamK = ") + bool_str(c.use_stream_k) + ";\n";
+  // Only a stream-K kernel has a reduction to switch; folding the flag keeps
+  // one cubin per one-pass config (kernel/humming.py).
+  const bool fp32 = c.use_stream_k && c.stream_k_fp32;
+  s += std::string("  static constexpr bool kStreamKFp32 = ") + bool_str(fp32) + ";\n";
   s += "};\n\n";
   s += "using SharedStorageType = SharedStorage<\n";
   s += "    Shape<" + str(c.block_m) + ", " + str(c.block_n) + ", " + str(c.block_k) + ">,\n";
@@ -205,6 +209,8 @@ std::string kernel_source(const GemmConfig& c, const MmaShape& mma) {
   constant("NUM_THREADS", threads);
   constant("NUM_CTAS_PER_SM", str(c.num_ctas_per_sm));
   constant("USE_STREAM_K", c.use_stream_k ? "1" : "0");
+  constant("STREAM_K_FP32", fp32 ? "1" : "0");
+  constant("STREAMK_TILE_ELEMS", str(c.block_m * c.block_n));
   s.pop_back();
   return s;
 }
@@ -231,15 +237,17 @@ struct Registered {
   uint32_t num_threads;
   uint32_t num_ctas_per_sm;
   bool use_stream_k;
+  bool stream_k_fp32;
+  uint32_t streamk_tile_elems;
 };
 
 using ConfigKey = std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                             int64_t, int64_t, int64_t, int64_t, bool, bool>;
+                             int64_t, int64_t, int64_t, int64_t, bool, bool, bool>;
 
 ConfigKey config_key(int device, const GemmConfig& c) {
   return {device,      c.shape_n,  c.shape_k,    c.num_experts,     c.block_m,
           c.block_n,   c.block_k,  c.warp_m,     c.warp_n,          c.warp_k,
-          c.num_stages, c.num_ctas_per_sm, c.swap_ab, c.use_stream_k};
+          c.num_stages, c.num_ctas_per_sm, c.swap_ab, c.use_stream_k, c.stream_k_fp32};
 }
 
 std::mutex g_mutex;                  // guards g_registered and g_ids
@@ -260,6 +268,8 @@ int64_t register_locked(const GemmConfig& c) {
   r.num_threads = kernel.constant("NUM_THREADS");
   r.num_ctas_per_sm = kernel.constant("NUM_CTAS_PER_SM");
   r.use_stream_k = kernel.constant("USE_STREAM_K") != 0;
+  r.stream_k_fp32 = kernel.constant("STREAM_K_FP32") != 0;
+  r.streamk_tile_elems = kernel.constant("STREAMK_TILE_ELEMS");
   if (kernel.constant("NUM_EXPERTS") == 0) fail("indexed kernel requires num_experts > 0");
   if (r.num_ctas_per_sm == 0) fail("indexed kernel requires num_ctas_per_sm > 0");
   if (kernel.constant("PROBLEM_SHAPE_N") != uint32_t(c.shape_n) ||
@@ -288,11 +298,46 @@ CUdeviceptr locks_for(int device, CUstream stream) {
   std::lock_guard<std::mutex> hold(mutex);
   auto& device_locks = locks[device];
   if (auto it = device_locks.find(stream); it != device_locks.end()) return it->second;
+  // As launcher.cpp get_locks: the first stream-K launch on a stream can be
+  // inside a CUDA-graph capture, where allocation is prohibited under the
+  // default capture modes.  Allocate in relaxed mode and zero on a private,
+  // synchronized stream, so the fill is neither recorded into the graph nor
+  // racing the first launch.
+  CUstreamCaptureMode mode = CU_STREAM_CAPTURE_MODE_RELAXED;
+  jit::check(cuThreadExchangeStreamCaptureMode(&mode), "cuThreadExchangeStreamCaptureMode");
   CUdeviceptr ptr = 0;
-  jit::check(cuMemAlloc(&ptr, kNumLocks * sizeof(int32_t)), "cuMemAlloc for stream-K locks");
-  // Zero on the launch stream so the first stream-K kernel on it is ordered after the fill.
-  jit::check(cuMemsetD32Async(ptr, 0, kNumLocks, stream), "cuMemsetD32Async for stream-K locks");
+  CUstream fill_stream = nullptr;
+  CUresult result = cuMemAlloc(&ptr, kNumLocks * sizeof(int32_t));
+  if (result == CUDA_SUCCESS) result = cuStreamCreate(&fill_stream, CU_STREAM_NON_BLOCKING);
+  if (result == CUDA_SUCCESS) result = cuMemsetD32Async(ptr, 0, kNumLocks, fill_stream);
+  if (result == CUDA_SUCCESS) result = cuStreamSynchronize(fill_stream);
+  if (fill_stream != nullptr) cuStreamDestroy(fill_stream);
+  cuThreadExchangeStreamCaptureMode(&mode);
+  jit::check(result, "allocating the stream-K lock buffer");
   device_locks[stream] = ptr;
+  return ptr;
+}
+
+// FP32 stream-K workspace (launcher.cpp: get_streamk_workspace), keyed like the
+// locks.  A slice only reads tile floats an earlier slice of the same launch
+// wrote, so it needs no zeroing and no reset between launches.  The size is
+// fixed at first use so a buffer a captured CUDA graph points at is never
+// freed or moved.
+constexpr int64_t kStreamKWorkspaceBytes = 64LL << 20;
+
+CUdeviceptr streamk_workspace_for(int device, CUstream stream) {
+  static std::mutex mutex;
+  static std::unordered_map<int, std::unordered_map<CUstream, CUdeviceptr>> workspaces;
+  std::lock_guard<std::mutex> hold(mutex);
+  auto& device_ws = workspaces[device];
+  if (auto it = device_ws.find(stream); it != device_ws.end()) return it->second;
+  CUstreamCaptureMode mode = CU_STREAM_CAPTURE_MODE_RELAXED;
+  jit::check(cuThreadExchangeStreamCaptureMode(&mode), "cuThreadExchangeStreamCaptureMode");
+  CUdeviceptr ptr = 0;
+  const CUresult result = cuMemAlloc(&ptr, kStreamKWorkspaceBytes);
+  cuThreadExchangeStreamCaptureMode(&mode);
+  jit::check(result, "allocating the FP32 stream-K workspace");
+  device_ws[stream] = ptr;
   return ptr;
 }
 
@@ -353,6 +398,17 @@ void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
     }
     locks = locks_for(device, stream);
   }
+  CUdeviceptr streamk_ws = 0;
+  if (kd.use_stream_k && kd.stream_k_fp32) {
+    // One partial-segment tile per CTA (see EpiloguePipeline::partial_slot).
+    const int64_t need = static_cast<int64_t>(num_ctas) * kd.streamk_tile_elems *
+                         static_cast<int64_t>(sizeof(float));
+    if (need > kStreamKWorkspaceBytes) {
+      fail("FP32 stream-K launch may need " + str(need) + " workspace bytes but only " +
+           str(kStreamKWorkspaceBytes) + " are allocated");
+    }
+    streamk_ws = streamk_workspace_for(device, stream);
+  }
   const void* input = a.input;
   const void* weight = a.weight;
   void* output = a.output;
@@ -361,8 +417,10 @@ void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
   const int32_t* expert_ids = a.expert_ids;
   const int32_t* num_tokens_padded = a.num_tokens_padded;
   void* locks_ptr = reinterpret_cast<void*>(locks);
-  void* kernel_args[] = {&input,      &weight,     &output,            &weight_scale, &sorted_ids,
-                         &expert_ids, &num_tokens_padded, &locks_ptr, &shape_m,      &top_k};
+  void* streamk_ws_ptr = reinterpret_cast<void*>(streamk_ws);
+  void* kernel_args[] = {&input,      &weight,    &output,         &weight_scale,
+                         &sorted_ids, &expert_ids, &num_tokens_padded, &locks_ptr,
+                         &streamk_ws_ptr, &shape_m, &top_k};
 
   CUlaunchConfig config = {};
   config.gridDimX = num_ctas;

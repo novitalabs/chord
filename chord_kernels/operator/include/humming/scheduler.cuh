@@ -36,6 +36,12 @@ private:
   uint32_t top_k;
 
 public:
+  // Stream-K geometry the FP32 fixup uses to locate the partials of a tile:
+  // CTA c owns mnk iterations [base + c * iters, base + (c + 1) * iters).
+  uint32_t streamk_base = 0;
+  uint32_t streamk_iters_per_cta = 0;
+  uint32_t streamk_mn_index = 0;
+
   SharedStorage &smem;
   uint32_t expert_id;
   uint32_t m_block_id;
@@ -81,8 +87,10 @@ public:
 
       const uint32_t streamk_mnk_blocks = streamk_mn_blocks * kKBlocks;
       streamk_mnk_total_iters = CEIL_DIV(streamk_mnk_blocks, gridDim.x);
+      streamk_base = gridDim.x * dp_mn_iters * kKBlocks;
+      streamk_iters_per_cta = streamk_mnk_total_iters;
       streamk_mnk_next_index =
-          gridDim.x * dp_mn_iters * kKBlocks + streamk_mnk_total_iters * blockIdx.x;
+          streamk_base + streamk_mnk_total_iters * blockIdx.x;
 
       if (streamk_mnk_next_index >= mnk_blocks) {
         streamk_mnk_iters = 0;
@@ -130,7 +138,7 @@ private:
   bool get_streamk_next_block() {
     if (!streamk_mnk_iters) return false;
 
-    const uint32_t streamk_mn_index = streamk_mnk_next_index / kKBlocks;
+    streamk_mn_index = streamk_mnk_next_index / kKBlocks;
     m_block_id = streamk_mn_index / kNBlocks;
     n_block_id = streamk_mn_index % kNBlocks;
     k_block_id = streamk_mnk_next_index - streamk_mn_index * kKBlocks;

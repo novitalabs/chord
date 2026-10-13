@@ -53,4 +53,8 @@ struct KernelData {
   uint32_t num_experts;
   uint32_t num_ctas_per_sm;
   bool use_stream_k;
+  // Stream-K partials reduced in an FP32 workspace (one block-M x block-N
+  // tile of floats per stream-K tile) instead of BF16 adds into C.
+  bool stream_k_fp32;
+  uint32_t streamk_tile_elems;
 };

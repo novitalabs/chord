@@ -35,6 +35,9 @@ class EpilogueGmemWriter {
 private:
   static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   static constexpr bool kUseStreamK = TuningConfig::kUseStreamK;
+  // FP32 stream-K reduction: only the last slice reaches write(), with the
+  // whole tile already summed, so it always plain-stores.
+  static constexpr bool kStreamKFp32 = TuningConfig::kStreamKFp32;
 
 public:
   SharedStorage &smem;
@@ -96,7 +99,7 @@ public:
 
       const uint32_t output_offset = routed_row * kOutputStride + output_col;
       const int4 val = smem_ptr[smem_offset_swizzled];
-      if (!kUseStreamK || slice_count == 1 || slice_id == 0) {
+      if (!kUseStreamK || kStreamKFp32 || slice_count == 1 || slice_id == 0) {
         // Data-parallel, or the segment that initializes this tile: plain store.
         gmem_ptr[output_offset] = val;
       } else if (slice_count > 3) {

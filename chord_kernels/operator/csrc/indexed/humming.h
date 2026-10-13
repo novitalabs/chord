@@ -22,6 +22,7 @@ struct GemmConfig {
   int64_t num_ctas_per_sm;
   bool swap_ab;
   bool use_stream_k;
+  bool stream_k_fp32;  // stream-K partials reduced in an FP32 workspace (MMA only)
 };
 
 // Validate, compile (or read the cache), load and register on the current
