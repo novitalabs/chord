@@ -127,6 +127,13 @@ public:
   CUDA_INLINE uint32_t *final_regs_c_as_ptr() {
     // Drain the group left in flight before the epilogue reads the accumulator.
     wgmma_wait<0>();
+    // The wait has no register operands, so without a fence the compiler may
+    // move accumulator reads above it (CUTLASS's warpgroup_fence_operand).
+    float *regs_c_ptr = reinterpret_cast<float *>(regs_c);
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < sizeof(regs_c) / sizeof(float); i++) {
+      asm volatile("" : "+f"(regs_c_ptr[i])::"memory");
+    }
     return regs_c_as_ptr();
   };
 };

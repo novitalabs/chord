@@ -102,8 +102,6 @@ class HummingKernel(KernelRuntime):
             raise TypeError("use_stream_k must be a bool")
         if not isinstance(self.stream_k_fp32, bool):
             raise TypeError("stream_k_fp32 must be a bool")
-        if self.stream_k_fp32 and self.mma_type != "mma":
-            raise ValueError("stream_k_fp32 is only available for MMA kernels")
         if self.mma_type not in ("mma", "wgmma"):
             raise ValueError(
                 f"mma_type must be 'mma' or 'wgmma', got {self.mma_type!r}"

@@ -18,13 +18,14 @@ from chord_kernels.operator.packing import (
 
 
 def _default_stream_k_fp32(use_stream_k: bool, warp_shape: tuple[int, int, int]) -> bool:
-    """Default stream-K reduction: FP32 wherever the kernel implements it.
+    """Default stream-K reduction: FP32 for every stream-K config.
 
-    The FP32 workspace reduction exchanges the MMA (warp-N 64) accumulator
-    layout; the WGMMA (warp-N 32) epilogue still reduces in BF16.  One-pass
-    configs have no reduction, so they keep ``False`` and their cubins.
+    The FP32 workspace reduction exchanges each thread's accumulator registers
+    as-is, so it serves the MMA and WGMMA layouts alike.  One-pass configs have
+    no reduction, so they keep ``False`` and their cubins.
     """
-    return use_stream_k and warp_shape[1] == 64
+    del warp_shape
+    return use_stream_k
 
 
 @dataclasses.dataclass(frozen=True)

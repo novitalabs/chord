@@ -55,6 +55,15 @@ warps, hiding the cp.async-gather + dequant latency: measured +5..14% on down
 and +3..13% on gate/up in that window. Outside the window it regresses and
 stays at 1 CTA/SM.
 
+**FP32 stream-K reduction.** The baseline (and current upstream Humming)
+adds each slice's BF16-rounded partial into the output.  The prefill and TP8
+stream-K rows now reduce in an FP32 workspace and round once, the same
+reduction the Blackwell rows use; the WGMMA epilogue fences the accumulator
+registers after `wgmma.wait_group` so the reduction never reads an in-flight
+accumulator.  It raises bit-identity with a PyTorch BF16 matmul from 88-98% to
+99.7-100% and costs between -7.9% and +2.7% per row
+([performance.md](performance.md)).
+
 **Shape-aware stream-K gate.** The baseline enables stream-K unconditionally.
 For the mid-K down projection (512 < K < 4096) at `routed_m >= 5120` the M*N
 tiles already fill the grid, so the K-split only adds lock and reduction
@@ -182,7 +191,7 @@ GPU.
 The stream-K reduction inherited from Humming adds each slice's BF16-rounded
 partial into the output (`__hadd2`, or BF16 `atomicAdd` past three slices),
 so split gate/up tiles take extra BF16 roundings and, past three slices,
-launch-dependent results.  Every MMA stream-K row now reduces in an FP32
+launch-dependent results.  Every stream-K row now reduces in an FP32
 workspace instead and rounds once (`IndexedKernelConfig.stream_k_fp32`, the
 default).  On the INT4 decode cases it costs 0.6-2.4% on gate/up and raises
 bit-identity with a PyTorch BF16 matmul from 86-90% to 99.8% (table in
