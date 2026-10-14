@@ -190,12 +190,24 @@ Two lock protocols sequence the CTAs sharing a tile, selected by slice count
   and bump the lock back toward 0.
 
 Both leave the lock at 0 when the tile finishes, so a device-resident
-zero-initialized int32 lock buffer is reused across launches without a reset.
-Because launches are ordered only within one CUDA stream, the launcher keeps one
-lock buffer per (device, stream) and zero-fills it asynchronously on that stream
-before its first stream-K launch. Because the reduction accumulates across CTAs
-in an undefined float order, the output is not bit-identical to one-pass, but
-stays within the correctness tolerance.
+zero-initialized int32 lock buffer is reused across launches without a reset,
+provided the launches sharing it are ordered. As in upstream Humming, the owner
+is the caller: `IndexedW4A16Layer` registers a zeroed 1024-word `locks` buffer
+(non-persistent, freed with the layer), `forward_layer` passes a host layer's
+own `locks` when it has one, and `indexed(..., locks=...)` takes one directly.
+A launch without one falls back to a buffer the launcher keeps per
+(device, stream) for the life of the process, since launches are ordered only
+within one CUDA stream.
+
+That reduction adds BF16-rounded partials, so the output is not bit-identical
+to one-pass. The default FP32 reduction (`IndexedKernelConfig.stream_k_fp32`)
+replaces it: every slice but the one at `k = 0` stores its FP32 partial and
+bumps the tile's lock, and the `k = 0` slice waits for the others, adds their
+partials in CTA order and rounds once. The partials live in per-launch scratch,
+one `block_m x block_n` FP32 tile per CTA, taken from the PyTorch caching
+allocator like upstream's own per-launch scratch: it returns to the pool as
+soon as the launch is queued, and under CUDA-graph capture it comes from the
+graph's private pool.
 
 ## Relationship to the upstream kernel
 

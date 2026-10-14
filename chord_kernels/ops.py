@@ -20,6 +20,7 @@ def indexed(
     config: Any | None = None,
     valid_shape_m: int = 0,
     validate_routing: bool = True,
+    locks: Any | None = None,
 ) -> Any:
     """Run the indexed BF16 x INT4 MoE operator."""
     from .operator import w4a16_indexed
@@ -31,6 +32,7 @@ def indexed(
         swap_ab=swap_ab,
         valid_shape_m=valid_shape_m,
         validate_routing=validate_routing,
+        locks=locks,
     )
     if config is not None:
         call_kwargs["config"] = config

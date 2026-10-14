@@ -53,6 +53,11 @@ uint4 = DataType(
     is_signed=False,
     is_integer_type=True,
 )
+# uint5..uint7 exist only so framework lookup tables keyed by every Humming
+# integer width resolve; no chord kernel consumes them.
+uint5 = DataType(name="uint5", num_bits=5, is_signed=False, is_integer_type=True)
+uint6 = DataType(name="uint6", num_bits=6, is_signed=False, is_integer_type=True)
+uint7 = DataType(name="uint7", num_bits=7, is_signed=False, is_integer_type=True)
 uint8 = DataType(name="uint8", num_bits=8, is_signed=False, is_integer_type=True)
 int4 = DataType(name="int4", num_bits=4, is_signed=True, is_integer_type=True)
 int8 = DataType(name="int8", num_bits=8, is_signed=True, is_integer_type=True)
@@ -119,6 +124,9 @@ _BY_NAME = {
         uint2,
         uint3,
         uint4,
+        uint5,
+        uint6,
+        uint7,
         uint8,
         int4,
         int8,
@@ -146,5 +154,8 @@ __all__ = [
     "uint2",
     "uint3",
     "uint4",
+    "uint5",
+    "uint6",
+    "uint7",
     "uint8",
 ]

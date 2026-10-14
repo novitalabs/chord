@@ -141,7 +141,16 @@ class TestShardAxisReachability:
     passes and no chord-specific arguments.  Since each shard axis has its own
     tuned schedule, landing on the wrong one would silently pack the weight
     against the wrong table -- so these pin the shape-driven axis recovery.
+
+    TP8 is published for SM90 only, so ``profile='auto'`` is resolved as on an
+    H200 whatever GPU runs the suite (on a CPU host the provisional path never
+    asks).  On Blackwell the TP8 shapes are rejected; see
+    ``test_tp8_shapes_are_rejected_on_blackwell``.
     """
+
+    @pytest.fixture(autouse=True)
+    def _sm90(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_, **__: (9, 0))
 
     @staticmethod
     def _meta(shape_n: int, shape_k: int, num_experts: int, **kwargs):
@@ -229,6 +238,19 @@ class TestShardAxisReachability:
         routed_m = 384 * 300
         assert tp8.kernel_config(routed_m).block_m == 128
         assert ep8.kernel_config(routed_m).block_m == 168
+
+    @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+    def test_tp8_shapes_are_rejected_on_blackwell(
+        self, monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+    ) -> None:
+        """Blackwell has no TP8 table, so a TP8 layer fails instead of packing
+        against the decode EP8 one."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(
+            torch.cuda, "get_device_capability", lambda *_, **__: capability
+        )
+        with pytest.raises(RuntimeError, match="SM90 only"):
+            self._meta(512, 7168, 384)
 
 
 class TestBackendPolicy:

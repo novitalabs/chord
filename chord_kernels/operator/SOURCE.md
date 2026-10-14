@@ -235,7 +235,8 @@ ported Python and launcher files, which are rewritten rather than copied):
   goes through `dispatch.py`.
 - The launcher now accepts only the tensors needed by indexed W4A16. Generic
   bias, zero-point, input-scale, global-scale, and TMA descriptor handling was
-  removed; it does allocate and pass the int32 stream-K lock buffer (see below).
+  removed; it takes the int32 stream-K lock buffer as an optional tensor (see
+  below).
 - `include/humming/kernel/repack.cuh` is the retained INT4-to-W4A16 weight
   layout path extracted from the upstream generic processing kernel. The
   Python repacker supplies only packed/unpacked input and MMA/WGMMA layout
@@ -252,11 +253,15 @@ ported Python and launcher files, which are rewritten rather than copied):
   routed_m 5120). The indexed, non-multicast subset of the upstream mechanism is
   kept — the two lock protocols (`utils/ptx/barrier.cuh`), the scheduler K-split,
   and the epilogue reduction — using a device-resident zero-initialized int32
-  lock buffer that the barrier protocol resets to 0 for reuse; the launcher
-  keys the buffer per (device, stream) because reuse-without-reset requires
-  ordered launches. Decode stays
-  one-pass. Cross-CTA float accumulation makes stream-K output non-bit-identical
-  to one-pass, within the group-32 correctness tolerance.
+  lock buffer that the barrier protocol resets to 0 for reuse. As upstream,
+  the caller owns it (the layer registers a `locks` buffer and passes it per
+  launch); a launch without one falls back to a buffer the launcher keys per
+  (device, stream), because reuse-without-reset requires ordered launches.
+  Decode stays one-pass. The reduction itself is replaced by default: partials
+  are summed in FP32 in per-launch scratch from the PyTorch allocator and
+  rounded once (`stream_k_fp32`), so stream-K output differs from one-pass only
+  by FP32 summation order; `stream_k_fp32=False` keeps the inherited BF16
+  partial adds, which are not bit-identical to one-pass.
 - The inner kernel (WGMMA/MMA mainloop, g2s/s2r pipelines, group-32 dequant)
   keeps the upstream WGMMA batched `wait<1>` pipelining and group-32 dequant
   rounding. The BF16-activation/INT4-weight path is functionally equivalent to

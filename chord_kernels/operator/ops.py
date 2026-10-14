@@ -90,6 +90,7 @@ def launch_kernel(
     top_k: int,
     outputs: torch.Tensor | None = None,
     valid_shape_m: int = 0,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     init_launcher()
     # Kernel selection is already performed by the indexed Python API.  Keep
@@ -106,6 +107,7 @@ def launch_kernel(
         expert_ids,
         num_tokens_padded,
         top_k,
+        locks,
     )
 
 

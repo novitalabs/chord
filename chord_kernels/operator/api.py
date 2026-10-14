@@ -304,6 +304,7 @@ def w4a16_indexed(
     config: IndexedKernelConfig | dict | None = None,
     valid_shape_m: int = 0,
     validate_routing: bool = True,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run BF16 x INT4 group-32 indexed MoE GEMM.
 
@@ -316,6 +317,11 @@ def w4a16_indexed(
     between 128 and 256 and MMA defaults to swap-AB. ``valid_shape_m`` is
     accepted for layer-path compatibility (where it selects the tuning bracket)
     and has no kernel-level effect here.
+    ``locks`` is the stream-K lock buffer: a zero-initialized int32 CUDA tensor
+    with a word per stream-K tile a launch may peel (1024 covers every
+    published profile), which the caller keeps across its launches as upstream
+    Humming's layers do.  Without one the launcher uses a buffer it keeps per
+    (device, stream) for the life of the process.
     ``sorted_ids`` and ``expert_ids`` may be overallocated routing buffers as
     returned by vLLM's ``moe_align_block_size``.  ``num_tokens_padded`` gives the
     active prefix length; only that prefix is consumed by the kernel.  Each active
@@ -354,6 +360,8 @@ def w4a16_indexed(
     _check_cuda_int32("sorted_ids", sorted_ids, inputs.device)
     _check_cuda_int32("expert_ids", expert_ids, inputs.device)
     _check_cuda_int32("num_tokens_padded", num_tokens_padded, inputs.device)
+    if locks is not None:
+        _check_cuda_int32("locks", locks, inputs.device)
     if sorted_ids.ndim != 1:
         raise ValueError(f"sorted_ids must be 1D, got shape {tuple(sorted_ids.shape)}")
     if expert_ids.ndim != 1:
@@ -551,6 +559,7 @@ def w4a16_indexed(
             top_k=top_k,
             outputs=outputs,
             valid_shape_m=valid_shape_m,
+            locks=locks,
         )
 
 

@@ -67,6 +67,28 @@ from chord_kernels.operator.tuning import (
 # ``_PROFILES``, ``_h200_prefill_block_m``, ``_indexed_tuning_rows``,
 # ``pack_w4a16``, ``w4a16_indexed`` etc. through ``chord_kernels.operator.layer``.
 
+# Stream-K lock words a layer owns: one per stream-K tile, and a launch peels
+# at most ~1.1x its grid (4 CTAs/SM on 148 SMs needs 651).  The launcher
+# rejects a launch that could need more.
+_NUM_STREAM_K_LOCKS = 1024
+
+
+def _layer_locks(layer: object, device: torch.device) -> torch.Tensor | None:
+    """The layer's stream-K lock buffer, when it can serve a launch on ``device``.
+
+    Upstream Humming layers own one (``locks``).  A layer without a usable one
+    (absent, or left on another device) gets the launcher's per-stream buffer,
+    as every launch did before layers owned their locks.
+    """
+    locks = getattr(layer, "locks", None)
+    if (
+        isinstance(locks, torch.Tensor)
+        and locks.dtype == torch.int32
+        and locks.device == device
+    ):
+        return locks
+    return None
+
 
 def unpack_packed_uint4(
     weight: torch.Tensor, shape_k: int | None = None
@@ -250,6 +272,15 @@ class IndexedW4A16Layer(torch.nn.Module):
                 device=alloc_device,
             ),
             requires_grad=False,
+        )
+        # Stream-K lock words, owned by the layer as in upstream Humming: the
+        # barrier protocol leaves them at 0 after every launch, and PyTorch
+        # frees them with the layer.  The layer's launches must therefore be
+        # ordered (one stream at a time).  Runtime state, not checkpoint data.
+        self.register_buffer(
+            "locks",
+            torch.zeros(_NUM_STREAM_K_LOCKS, dtype=torch.int32, device=alloc_device),
+            persistent=False,
         )
         self._weight_format = "checkpoint_packed"
         self._prepared_weight: object | None = None
@@ -578,6 +609,7 @@ class IndexedW4A16Layer(torch.nn.Module):
             tuning_config=tuning_config,
             block_m=block_m,
             validate_routing=validate_routing,
+            locks=_layer_locks(self, inputs.device),
         )
 
     def forward_indexed(self, *args, **kwargs):
@@ -1103,6 +1135,8 @@ class IndexedW4A16Method:
             tuning_config=tuning_config,
             block_m=block_m,
             validate_routing=validate_routing,
+            # Upstream Humming's forward_layer reads ``layer.locks`` too.
+            locks=_layer_locks(layer, inputs.device),
         )
 
 

@@ -130,12 +130,14 @@ def forward_w4a16(
     tuning_config: object | None = None,
     block_m: int | None = None,
     validate_routing: bool = False,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch one W4A16 GEMM on the prepared weight's backend.
 
     The full Humming delegation argument set is accepted so a framework passes
     the same named arguments to every family; each branch consumes only its own
-    routing tensors.
+    routing tensors.  ``locks`` (the stream-K lock buffer) is indexed-only; the
+    grouped kernels have no stream-K.
     """
     backend = meta.backend
     if backend in _GROUPED_BACKENDS:
@@ -197,6 +199,7 @@ def forward_w4a16(
         swap_ab=kernel_config.swap_ab,
         valid_shape_m=valid_shape_m,
         validate_routing=validate_routing,
+        locks=locks,
     )
 
 

@@ -45,8 +45,20 @@ _FACADE_EXPORTS = {
 }
 
 
+# vLLM 0.29's facade switched to Humming's functional interface; these are the
+# additional paths its humming MoE experts and weight loader resolve.
+_FUNCTIONAL_EXPORTS = {
+    "LayerConfig": "humming.config:LayerConfig",
+    "humming_forward": "humming.forward:humming_forward",
+    "may_quant_input": "humming.forward:may_quant_input",
+    "prepare_layer_config": "humming.transform:prepare_layer_config",
+    "transform_humming_tensors": "humming.transform:transform_humming_tensors",
+    "get_heuristics_config": "humming.tune:get_heuristics_config",
+}
+
+
 def test_facade_surface_resolves() -> None:
-    for name, spec in _FACADE_EXPORTS.items():
+    for name, spec in {**_FACADE_EXPORTS, **_FUNCTIONAL_EXPORTS}.items():
         if ":" in spec:
             module_path, attr = spec.split(":", 1)
             assert hasattr(importlib.import_module(module_path), attr), name
@@ -405,6 +417,47 @@ def test_forward_layer_consumes_vllm_call_shape(monkeypatch) -> None:
     # The JSON tuning row keeps the routing-aligned block-M at the selected m.
     assert kwargs13["config"].block_m == _covering_row(rows13, 32)["block_shape"][0]
     assert kwargs2["config"].block_m == _covering_row(rows2, 16)["block_shape"][0]
+    # This host registers no ``locks`` buffer, so the launcher supplies its own.
+    assert kwargs13["locks"] is None and kwargs2["locks"] is None
+
+    # vLLM registers one (``layer.locks``) the way upstream Humming layers do;
+    # forward_layer hands it to the launch, as upstream's forward_layer does.
+    layer.register_buffer("locks", torch.zeros(1024, dtype=torch.int32))
+    calls.clear()
+    HummingMethod.forward_layer(
+        layer=layer,
+        inputs=inputs,
+        input_scale=None,
+        outputs=None,
+        sorted_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_padded=num_tokens_padded,
+        compute_config=compute_config,
+        valid_shape_m=32,
+        top_k=4,
+        tuning_config=tuning13,
+        sublayer_name="w13",
+    )
+    assert calls[0][1]["locks"] is layer.locks
+
+    # One left on another device is not handed over; the launcher's own serves.
+    layer.locks = torch.zeros(1024, dtype=torch.int32, device="meta")
+    calls.clear()
+    HummingMethod.forward_layer(
+        layer=layer,
+        inputs=inputs,
+        input_scale=None,
+        outputs=None,
+        sorted_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_padded=num_tokens_padded,
+        compute_config=compute_config,
+        valid_shape_m=32,
+        top_k=4,
+        tuning_config=tuning13,
+        sublayer_name="w13",
+    )
+    assert calls[0][1]["locks"] is None
 
 
 def test_forward_layer_rejects_unsupported_paths() -> None:
@@ -450,15 +503,20 @@ def test_forward_layer_rejects_unsupported_paths() -> None:
         )
 
 
-def test_auto_profile_recovers_shard_axis_from_shapes() -> None:
+def test_auto_profile_recovers_shard_axis_from_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """prepare_layer_meta('auto') lands on TP8 for TP8 projection shapes.
 
     vLLM passes only shape_n/shape_k of the local partition; TP8 slices
     moe_intermediate, so (512, 7168)/(7168, 256) is unreachable by EP8.  The
     published EP8/TP8 shape pairs are disjoint, which is what makes the axis
-    recoverable without a chord-specific argument.
+    recoverable without a chord-specific argument.  Both are H200 tables, so
+    'auto' is resolved as on SM90 whatever GPU runs the suite.
     """
     from humming.layer import HummingMethod
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_, **__: (9, 0))
 
     tp_layer = torch.nn.Module()
     meta = HummingMethod.prepare_layer_meta(
@@ -491,3 +549,169 @@ def test_humming_input_schema_used_by_moe_wna16_path() -> None:
 
     schema = HummingInputSchema()
     assert schema.a_dtype is None or schema.a_dtype.num_bits >= 16
+
+
+def _kimi_schemas():
+    from humming.schema import BaseWeightSchema, HummingInputSchema
+
+    weight_schema = BaseWeightSchema.from_config(
+        {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "type": "int",
+            "num_bits": 4,
+            "strategy": "group",
+            "group_size": 32,
+            "symmetric": True,
+        }
+    )
+    return weight_schema, HummingInputSchema()
+
+
+def _functional_config(monkeypatch, shape_n, shape_k, num_experts, capability=(9, 0)):
+    """prepare_layer_config as vLLM 0.29 calls it, on a pinned capability."""
+    from humming.transform import prepare_layer_config
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_, **__: capability)
+    weight_schema, input_schema = _kimi_schemas()
+    weight_schema, _ = weight_schema.convert_humming(
+        tensors={
+            "weight_packed": torch.zeros((num_experts, shape_n, shape_k // 8), dtype=torch.int32),
+            "weight_scale": torch.ones((num_experts, shape_n, shape_k // 32)),
+        },
+        shape_n_stacks=[shape_n],
+        shape_k_stacks=[shape_k],
+        param_dtype=torch.bfloat16,
+        num_experts=num_experts,
+    )
+    return prepare_layer_config(
+        shape_n=shape_n,
+        shape_k=shape_k,
+        pad_n_to_multiple=256,
+        pad_k_to_multiple=128,
+        input_schema=input_schema,
+        weight_schema=weight_schema,
+        has_bias=False,
+        num_experts=num_experts,
+        torch_dtype=torch.bfloat16,
+    )
+
+
+def test_prepare_layer_config_exposes_the_fields_vllm_reads(monkeypatch) -> None:
+    """vLLM sizes its workspace buffers from these LayerConfig attributes."""
+    from humming import dtypes
+
+    config = _functional_config(monkeypatch, 4096, 7168, 48)
+    assert (config.shape_n, config.shape_k, config.num_experts) == (4096, 7168, 48)
+    # No padding: buffers vLLM sizes as shape - pad_shape stay the real dims.
+    assert config.pad_shape_n == 0 and config.pad_shape_k == 0
+    assert config.a_dtype is dtypes.bfloat16 and config.c_dtype is dtypes.bfloat16
+    assert config.as_dtype is None and config.input_scale_group_size == 0
+    assert config.meta.profile.name == "h200_prefill_ep8"
+    assert dtypes.torch_dtype_map[config.c_dtype] is torch.bfloat16
+
+    monkeypatch.setenv("CHORD_SM90_DECODE", "1")
+    assert _functional_config(monkeypatch, 4096, 7168, 48).meta.profile.name == "h200_decode_ep8"
+    # The shard axis comes from the shapes, as on the layer path.
+    assert _functional_config(monkeypatch, 512, 7168, 384).meta.profile.name == "h200_tp8"
+    blackwell = _functional_config(monkeypatch, 4096, 7168, 48, capability=(10, 3))
+    assert blackwell.meta.profile.name == "blackwell_decode_ep8"
+
+
+def test_prepare_layer_config_fails_closed_outside_w4a16(monkeypatch) -> None:
+    from humming import dtypes
+    from humming.schema import HummingInputSchema, HummingWeightSchema
+    from humming.transform import prepare_layer_config
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_, **__: (9, 0))
+
+    def prepare(weight_schema, input_schema=None, num_experts=48, **kwargs):
+        return prepare_layer_config(
+            shape_n=4096, shape_k=7168, weight_schema=weight_schema,
+            input_schema=input_schema or HummingInputSchema(),
+            num_experts=num_experts, torch_dtype=torch.bfloat16, **kwargs,
+        )
+
+    group128 = HummingWeightSchema(b_dtype=dtypes.uint4, weight_scale_group_size=128)
+    with pytest.raises(NotImplementedError, match="group-32"):
+        prepare(group128)
+    w4a16 = HummingWeightSchema(b_dtype=dtypes.uint4, weight_scale_group_size=32)
+    with pytest.raises(NotImplementedError, match="BF16 activations"):
+        prepare(w4a16, HummingInputSchema(a_dtype=dtypes.float8e4m3))
+    with pytest.raises(NotImplementedError, match="dense"):
+        prepare(w4a16, num_experts=0)
+    with pytest.raises(NotImplementedError, match="bias"):
+        prepare(w4a16, has_bias=True)
+    monkeypatch.setenv("CHORD_USE_GROUPED", "1")
+    with pytest.raises(NotImplementedError, match="grouped"):
+        prepare(w4a16)
+
+
+def test_get_heuristics_config_follows_w13_routing_block_m(monkeypatch) -> None:
+    """vLLM routes both projections with the w13 table's block-M."""
+    from humming.config import GemmType
+    from humming.tune import get_heuristics_config
+
+    w13 = _functional_config(monkeypatch, 4096, 7168, 48)
+    w2 = _functional_config(monkeypatch, 7168, 2048, 48)
+    rows13 = get_heuristics_config(layer_config=w13, gemm_type=GemmType.INDEXED)
+    rows2 = get_heuristics_config(layer_config=w2, gemm_type=GemmType.INDEXED)
+    json.dumps(rows13)  # vLLM serializes the table once.
+    for routed_m in (8, 160, 1024, 4096, 16384, 1 << 20):
+        r13 = _covering_row(rows13, routed_m)
+        r2 = _covering_row(rows2, routed_m)
+        assert r2["block_shape"][0] == r13["block_shape"][0], routed_m
+        assert get_heuristics_config(w2, shape_m=routed_m, gemm_type="indexed") == r2
+    for unsupported in ({"gemm_type": GemmType.GROUPED_CONTIGUOUS},
+                        {"gemm_type": "indexed", "use_f16_accum": True},
+                        {"gemm_type": "indexed", "use_batch_invariant": True}):
+        with pytest.raises(NotImplementedError):
+            get_heuristics_config(layer_config=w13, **unsupported)
+
+
+def test_humming_forward_uses_chord_tile_at_the_routing_block_m(monkeypatch) -> None:
+    """Only block-M is taken from the framework's (edited) row; the tile is
+    chord's own, and the experts' lock buffer reaches the launch."""
+    import chord_kernels.operator.dispatch as dispatch_module
+    from humming.forward import humming_forward, may_quant_input
+    from humming.tune import get_heuristics_config
+
+    w13 = _functional_config(monkeypatch, 4096, 7168, 48)
+    rows = get_heuristics_config(layer_config=w13, gemm_type="indexed")
+    edited = json.loads(json.dumps(rows))
+    for _, _, row in edited:  # what vLLM's _fixup_moe_tuning_config does
+        row["block_shape"][2] = min(row["block_shape"][2], 128)
+        row["warp_shape"][1] = 32
+    calls = []
+    monkeypatch.setattr(
+        dispatch_module, "w4a16_indexed",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "out",
+    )
+    inputs = torch.zeros((20, 7168), dtype=torch.bfloat16)
+    assert may_quant_input(w13, inputs=inputs, input_scale=None) == (inputs, None)
+    locks = torch.zeros(1024, dtype=torch.int32)
+    out = humming_forward(
+        w13,
+        inputs=inputs,
+        weight=torch.zeros((48, 7168 // 16, 4096 * 2), dtype=torch.int32),
+        weight_scale=torch.zeros((48, 7168 // 32, 4096), dtype=torch.bfloat16),
+        outputs=None,
+        locks=locks,
+        sorted_ids=torch.zeros((64,), dtype=torch.int32),
+        expert_ids=torch.zeros((8,), dtype=torch.int32),
+        num_tokens_padded=torch.tensor([64], dtype=torch.int32),
+        compute_config=json.dumps({"gemm_type": "indexed"}),
+        valid_shape_m=160,
+        top_k=8,
+        tuning_config=json.dumps(edited),
+    )
+    assert out == "out"
+    (args, kwargs), = calls
+    expected = w13.meta.kernel_config(160)
+    assert kwargs["config"].block_shape == expected.block_shape
+    assert kwargs["config"].block_m == _covering_row(edited, 160)["block_shape"][0]
+    assert kwargs["locks"] is locks and kwargs["validate_routing"] is False
+    with pytest.raises(NotImplementedError):
+        may_quant_input(w13, inputs=inputs, input_scale=torch.ones(1))

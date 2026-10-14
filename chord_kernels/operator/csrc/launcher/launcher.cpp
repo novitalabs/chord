@@ -31,8 +31,11 @@ inline KernelData &find_kernel_data(int64_t kernel_id) {
 // tile counts these profiles launch; launch_kernel still checks the bound
 // before every stream-K launch.
 //
-// The buffer is keyed by (device, stream): the reuse-without-reset contract
-// holds only when launches sharing a buffer are ordered, which CUDA
+// As in upstream Humming, the caller normally owns the buffer: a layer keeps
+// one zeroed int32 tensor, passes it to every launch, and PyTorch frees it
+// with the layer.  A launch without one falls back to the buffer below, kept
+// per (device, stream) for the life of the process: the reuse-without-reset
+// contract holds only when launches sharing a buffer are ordered, which CUDA
 // guarantees within one stream but not across streams.
 static constexpr int64_t kNumLocks = 1024;
 static std::unordered_map<int64_t, std::unordered_map<cudaStream_t, int32_t *>>
@@ -76,29 +79,6 @@ inline int32_t *get_locks(int64_t device, cudaStream_t stream) {
   return locks;
 }
 
-// FP32 stream-K workspace, keyed like the locks.  A slice only reads tile
-// floats an earlier slice of the same launch wrote, so it needs no zeroing and
-// no reset between launches.  The size is fixed at first use so a buffer a
-// captured CUDA graph points at is never freed or moved.
-static constexpr int64_t kStreamKWorkspaceBytes = 64LL << 20;
-static std::unordered_map<int64_t, std::unordered_map<cudaStream_t, float *>>
-    g_streamk_ws;
-
-inline float *get_streamk_workspace(int64_t device, cudaStream_t stream) {
-  auto &device_ws = g_streamk_ws[device];
-  auto it = device_ws.find(stream);
-  if (it != device_ws.end()) return it->second;
-  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
-  cudaThreadExchangeStreamCaptureMode(&mode);
-  float *ws = nullptr;
-  const bool ok = cudaMalloc(reinterpret_cast<void **>(&ws), kStreamKWorkspaceBytes) ==
-      cudaSuccess;
-  cudaThreadExchangeStreamCaptureMode(&mode);
-  ASSERT_CHECK(ok, "allocating the FP32 stream-K workspace failed");
-  device_ws[stream] = ws;
-  return ws;
-}
-
 inline uint32_t get_num_sms(int64_t device) {
   int32_t num_sms = 0;
   ASSERT_CHECK(
@@ -117,7 +97,8 @@ Tensor launch_kernel(
     Tensor sorted_ids,
     Tensor expert_ids,
     Tensor num_tokens_padded,
-    int64_t top_k) {
+    int64_t top_k,
+    std::optional<Tensor> locks_) {
   KernelData &kernel_data = find_kernel_data(kernel_id);
   ASSERT_CHECK(input.is_cuda(), "input must be a CUDA tensor");
   ASSERT_CHECK(input.dim() == 2, "input must be a 2D tensor");
@@ -155,26 +136,34 @@ Tensor launch_kernel(
   // most mn_blocks % gridDim.x stream-K tiles, folding in one extra grid only
   // while the remainder is <= gridDim.x / 10, so the lock requirement is
   // bounded by gridDim.x + gridDim.x / 10.
-  int32_t *locks_ptr = nullptr;
+  void *locks_ptr = nullptr;
   if (kernel_data.use_stream_k) {
     const int64_t max_streamk_tiles =
         static_cast<int64_t>(num_ctas) + num_ctas / 10;
-    ASSERT_CHECK(
-        max_streamk_tiles <= kNumLocks,
-        "stream-K launch may need ", max_streamk_tiles,
-        " lock words but only ", kNumLocks, " are allocated");
-    locks_ptr = get_locks(device, stream);
+    if (locks_.has_value()) {
+      check_locks_tensor(locks_.value(), device, max_streamk_tiles);
+      locks_ptr = locks_->data_ptr();
+    } else {
+      ASSERT_CHECK(
+          max_streamk_tiles <= kNumLocks,
+          "stream-K launch may need ", max_streamk_tiles,
+          " lock words but only ", kNumLocks, " are allocated");
+      locks_ptr = get_locks(device, stream);
+    }
   }
-  float *streamk_ws_ptr = nullptr;
+  // FP32 stream-K partials, one block-M x block-N tile of floats per CTA (see
+  // EpiloguePipeline::partial_slot).  A slice only reads floats an earlier
+  // slice of the same launch wrote, so the buffer is never zeroed.  Like
+  // upstream's per-launch scratch it comes from the PyTorch caching allocator,
+  // which recycles it in stream order once the launch is queued and, under
+  // CUDA-graph capture, draws it from the graph's private pool.
+  std::optional<Tensor> streamk_ws;
+  void *streamk_ws_ptr = nullptr;
   if (kernel_data.use_stream_k && kernel_data.stream_k_fp32) {
-    // One partial-segment tile per CTA (see EpiloguePipeline::partial_slot).
-    const int64_t need = static_cast<int64_t>(num_ctas) * kernel_data.streamk_tile_elems *
-        static_cast<int64_t>(sizeof(float));
-    ASSERT_CHECK(
-        need <= kStreamKWorkspaceBytes,
-        "FP32 stream-K launch may need ", need, " workspace bytes but only ",
-        kStreamKWorkspaceBytes, " are allocated");
-    streamk_ws_ptr = get_streamk_workspace(device, stream);
+    streamk_ws = torch_empty(
+        {static_cast<int64_t>(num_ctas) * kernel_data.streamk_tile_elems},
+        ScalarType::Float, input.device());
+    streamk_ws_ptr = streamk_ws->data_ptr();
   }
   void *kernel_args[] = {
       &input_ptr,
@@ -603,7 +592,8 @@ COMMON_TORCH_LIBRARY(chord, m) {
   m.def(
       "launch_kernel(int kernel_id, Tensor input, Tensor weight, "
       "Tensor? output, Tensor weight_scale, Tensor sorted_ids, "
-      "Tensor expert_ids, Tensor num_tokens_padded, SymInt top_k) -> Tensor");
+      "Tensor expert_ids, Tensor num_tokens_padded, SymInt top_k, "
+      "Tensor? locks=None) -> Tensor");
   m.def("register_kernel(str cubin_path, str func_name) -> int");
   m.def(
       "launch_grouped_w4a16_masked(int kernel_id, Tensor a, Tensor packed_weight, "

@@ -89,3 +89,16 @@ inline void check_indexed_w4a16_tensors(
       num_tokens_padded.dim() == 0 ? std::vector<int64_t>{}
                                    : std::vector<int64_t>{1});
 }
+
+// A caller-owned stream-K lock buffer: zero-initialized int32 words, at least
+// one per stream-K tile the launch may peel.
+inline void check_locks_tensor(
+    const Tensor &locks,
+    int64_t expected_device,
+    int64_t min_words) {
+  check_tensor(
+      locks, "locks", expected_device, ScalarType::Int, {locks.numel()});
+  ASSERT_CHECK(
+      locks.numel() >= min_words, "stream-K launch may need ", min_words,
+      " lock words but locks holds ", locks.numel());
+}

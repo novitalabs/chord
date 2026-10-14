@@ -224,11 +224,31 @@ The distribution ships two import surfaces over the same operator:
   for adapters written against chord directly.
 - `humming` — the upstream import root itself, for frameworks whose integration
   hardcodes the package name. vLLM's lazy facade (`vllm/utils/humming.py`)
-  resolves fixed `humming.{dtypes,config,layer,schema,utils.weight}` module
-  paths and gates on `find_spec("humming")`; installing `chord_kernels` makes
-  both resolve to this repository with no framework change. Do not install
-  upstream `inclusionAI/humming` alongside it — the `humming` name is
-  claimed by design.
+  resolves fixed `humming.*` module paths and gates on `find_spec("humming")`;
+  installing `chord_kernels` makes both resolve to this repository with no
+  framework change. Do not install upstream `vllm-project/humming` (formerly
+  `inclusionAI/humming`) alongside it — the `humming` name is claimed by
+  design.
+
+vLLM has used two Humming interfaces, and the `humming` root provides both:
+
+- **Functional (vLLM 0.29+).** `humming.transform.prepare_layer_config` /
+  `transform_humming_tensors` at load, `humming.tune.get_heuristics_config`
+  once per sublayer, and `humming.forward.may_quant_input` /
+  `humming_forward` per step, carrying a `humming.config.LayerConfig`.
+  `prepare_layer_config` resolves the indexed profile the way
+  `profile='auto'` does (shard axis from the shapes, SM90 role from
+  `CHORD_SM90_DECODE`) and rejects anything outside BF16 x INT4 group-32 at
+  load. `humming_forward` takes only the routing block-M from the tuning row
+  vLLM serializes (vLLM edits those rows — it caps block-K at 128 and widens
+  warp-N for upstream's TMA descriptors) and launches chord's own tile for that
+  block-M, with the stream-K lock buffer the vLLM experts object owns. Verified
+  with `vllm serve` 0.29.0 `--moe-backend humming` on a Kimi K2.6 checkpoint cut
+  to 4 layers (H200): the experts run through `HummingIndexedExperts` on this
+  root, and teacher-forced token logprobs differ from `--moe-backend marlin`
+  by a mean of 0.012 (max 0.13) over 333 tokens, against 0.014 (max 0.20)
+  between marlin and triton.
+- **Layer-delegation (earlier vLLM).** `humming.layer.HummingMethod`, below.
 
 Under the `humming` root the shimming scope is exactly the indexed W4A16 MoE
 contract vLLM consumes:
@@ -278,6 +298,14 @@ what the weight was packed for: its default indexed behavior for an indexed
 layer, or the matching grouped value when `CHORD_USE_GROUPED=1` is set. No
 environment variable is needed for TP8: `profile='auto'` recovers the shard
 axis from the projection shapes and lands on `h200_tp8`.
+
+On the functional interface (vLLM 0.29+) only the indexed path is wired:
+vLLM's grouped experts hand Humming a compact `expert_first_token_offset`
+layout (no 128-row alignment) and expect its fused input processing, neither
+of which the grouped backends here implement yet, so `prepare_layer_config`
+fails closed under `CHORD_USE_GROUPED=1` and `get_heuristics_config` rejects a
+grouped `gemm_type`. Keep `VLLM_HUMMING_MOE_GEMM_TYPE` unset or `indexed`;
+vLLM's default (no override) is indexed there.
 
 ## Tests and benchmarks
 

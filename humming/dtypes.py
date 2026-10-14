@@ -8,6 +8,8 @@ indexed W4A16 kernel only consumes ``bfloat16`` activations/scales and
 metadata compares equal whichever import root produced it.
 """
 
+import torch
+
 from chord_kernels.operator.dtypes import (
     DataType,
     bfloat16,
@@ -22,6 +24,9 @@ from chord_kernels.operator.dtypes import (
     uint2,
     uint3,
     uint4,
+    uint5,
+    uint6,
+    uint7,
     uint8,
 )
 
@@ -39,5 +44,20 @@ __all__ = [
     "uint2",
     "uint3",
     "uint4",
+    "uint5",
+    "uint6",
+    "uint7",
     "uint8",
 ]
+
+# vLLM's humming experts size their workspace buffers through this map.
+torch_dtype_map = {
+    float16: torch.float16,
+    bfloat16: torch.bfloat16,
+    float32: torch.float32,
+    float8e4m3: torch.float8_e4m3fn,
+    float8e5m2: torch.float8_e5m2,
+    int8: torch.int8,
+    int4: torch.uint8,
+}
+__all__.append("torch_dtype_map")

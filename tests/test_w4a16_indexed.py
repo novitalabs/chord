@@ -1027,6 +1027,12 @@ def test_layer_adapter_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     assert layer(inputs, sorted_ids, expert_ids, count, 1) is expected
     assert calls["args"][1] is layer._prepared_weight
     assert calls["kwargs"]["validate_routing"] is False
+    # The layer owns its stream-K locks (upstream Humming's convention): zeroed
+    # int32 runtime state, kept out of the checkpoint and passed to every launch.
+    assert calls["kwargs"]["locks"] is layer.locks
+    assert layer.locks.dtype == torch.int32 and not layer.locks.any()
+    assert layer.locks.numel() >= 1024
+    assert "locks" not in layer.state_dict()
 
 
 def test_checkpoint_uint4_layout() -> None:
@@ -1316,3 +1322,56 @@ def test_wgmma_stream_k_fp32_matches_one_pass(
     torch.cuda.synchronize(device)
     assert all(torch.equal(out, outputs[0]) for out in outputs[1:])
     assert (outputs[0] == reference).double().mean().item() >= 0.995
+
+
+@pytest.mark.gpu
+def test_stream_k_caller_owned_locks_and_scratch_workspace(
+    supported_gpu: torch.device,
+) -> None:
+    """Upstream Humming's buffer ownership: the caller's lock tensor, and FP32
+    partials in per-launch scratch from the PyTorch allocator.
+
+    Eager launches and a captured graph on the caller's locks match the
+    launcher-owned path bit for bit and leave every lock word at 0.  The
+    scratch returns to the caching allocator after each launch, so repeated
+    launches do not grow allocated memory, and the graph's copy lives in its
+    private pool.  A lock tensor smaller than the launch's tile bound is
+    rejected.
+    """
+    from chord_kernels import indexed
+
+    case = _stream_k_swap_ab_case(supported_gpu, seed=20261014)
+    assert case.config.stream_k_fp32
+    locks = torch.zeros(1024, dtype=torch.int32, device=supported_gpu)
+
+    def run(out=None, owned_locks=None):
+        return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
+                       case.ntp, case.top_k, outputs=out, config=case.config,
+                       validate_routing=False, locks=owned_locks)
+
+    launcher_owned = run()
+    caller_owned = run(owned_locks=locks)
+    torch.cuda.synchronize(supported_gpu)
+    assert torch.equal(caller_owned, launcher_owned)
+    assert not locks.any()
+
+    before = torch.cuda.memory_allocated(supported_gpu)
+    for _ in range(4):
+        run(caller_owned, locks)
+    torch.cuda.synchronize(supported_gpu)
+    assert torch.cuda.memory_allocated(supported_gpu) == before
+
+    capture_stream = torch.cuda.Stream(device=supported_gpu)
+    graph_out = torch.zeros_like(caller_owned)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        run(graph_out, locks)
+    for _ in range(3):
+        graph_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize(supported_gpu)
+        assert torch.equal(graph_out, launcher_owned)
+        assert not locks.any()
+
+    with pytest.raises(RuntimeError, match="lock words"):
+        run(owned_locks=torch.zeros(8, dtype=torch.int32, device=supported_gpu))
