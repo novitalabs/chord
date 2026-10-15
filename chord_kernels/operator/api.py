@@ -170,20 +170,26 @@ def _compatible_block_n(shape_n: int) -> int:
     return candidate
 
 
+def _config_layout(config: IndexedKernelConfig) -> WeightLayout:
+    """The MMA family a config launches: warp-N 32 is WGMMA, 64 is mma.sync."""
+    return "wgmma" if config.warp_shape[1] == 32 else "mma"
+
+
 @functools.lru_cache(maxsize=128)
 def _get_indexed_kernel(
     device_index: int,
     shape_n: int,
     shape_k: int,
     num_experts: int,
-    layout: WeightLayout,
     config: IndexedKernelConfig,
 ) -> HummingKernel:
     block_m, block_n, block_k = config.block_shape
-    warp_shape = config.warp_shape
     swap_ab = config.swap_ab
+    # The packed bytes are the same for both MMA families; the config's warp-N
+    # picks the instruction (32 = WGMMA, 64 = mma.sync).
+    layout = _config_layout(config)
     if swap_ab and layout != "mma":
-        raise ValueError("swap_ab requires an MMA-packed weight")
+        raise ValueError("swap_ab requires the MMA kernel (warp-N 64)")
     if layout == "mma" and not swap_ab and config.block_m % 16 == 8:
         raise ValueError(
             "MMA indexed configs with block_m=8 (or another 16q+8 tile) "
@@ -195,9 +201,9 @@ def _get_indexed_kernel(
             f"indexed block-K must be a positive multiple of 64, got {block_k}"
         )
 
-    mma_type = "wgmma" if layout == "wgmma" else "mma"
+    mma_type = layout
     if mma_type == "wgmma" and block_n < 128:
-        raise ValueError("the WGMMA layout requires shape_n/block_n >= 128")
+        raise ValueError("the WGMMA kernel requires shape_n/block_n >= 128")
 
     # WGMMA instructions execute across a full four-warp group. With the
     # minimum block-N of 128, warp-N 32 produces exactly those 128 threads.
@@ -234,17 +240,15 @@ def _validate_prepared_weight(
     if not isinstance(weight, PreparedWeight):
         raise TypeError(
             "weight must be a PreparedWeight from pack_w4a16(); "
-            "this preserves the MMA/WGMMA layout contract"
+            "this carries the packed W4A16 layout contract"
         )
 
+    # Both MMA families read the same packed bytes, so the weight's recorded
+    # layout and a requested one only choose the default kernel family; they
+    # never have to agree.
     layout = _validate_layout(weight.layout)
     if requested_layout is not None:
-        requested_layout = _validate_layout(requested_layout)
-        if layout != requested_layout:
-            raise ValueError(
-                f"weight uses layout={layout!r}, but layout={requested_layout!r} "
-                "was requested; repack or select the matching layout"
-            )
+        layout = _validate_layout(requested_layout)
 
     metadata = {
         "n": weight.n,
@@ -389,7 +393,7 @@ def w4a16_indexed(
     if config is None:
         swap_ab = layout == "mma" if swap_ab is None else swap_ab
         if layout == "wgmma" and swap_ab:
-            raise ValueError("WGMMA-packed weights cannot be used by swap_ab")
+            raise ValueError("the WGMMA kernel cannot use swap_ab")
         if block_m is None:
             block_m = 8 if swap_ab else 16
         elif isinstance(block_m, bool) or not isinstance(block_m, int):
@@ -415,14 +419,15 @@ def w4a16_indexed(
         else:
             config_dict = dict(config)
             config_layout = config_dict.get("layout")
-            if config_layout is not None and _validate_layout(config_layout) != layout:
-                raise ValueError(
-                    "config layout does not match the packed weight: "
-                    f"config={config_layout!r}, weight={layout!r}"
-                )
+            if config_layout is not None:
+                _validate_layout(config_layout)
             # The legacy short form omitted swap_ab; preserve its historical
-            # MMA decode default while keeping WGMMA non-swap.
-            config_dict.setdefault("swap_ab", layout == "mma")
+            # MMA decode default while keeping WGMMA non-swap.  The row's own
+            # warp-N names its family, since any family reads the weight.
+            row_layout = (
+                "wgmma" if tuple(config_dict["warp_shape"])[1] == 32 else "mma"
+            )
+            config_dict.setdefault("swap_ab", row_layout == "mma")
             kernel_config = IndexedKernelConfig.from_dict(config_dict)
         # Explicit config is authoritative; accepting a second, conflicting
         # schedule makes routing alignment ambiguous.
@@ -432,8 +437,6 @@ def w4a16_indexed(
             raise ValueError("swap_ab conflicts with config")
         block_m = kernel_config.block_m
         swap_ab = kernel_config.swap_ab
-        if layout == "wgmma" and swap_ab:
-            raise ValueError("WGMMA-packed weights cannot be used by swap_ab")
         if block_m <= 0 or block_m % 8:
             raise ValueError(
                 f"config block_m must be a positive multiple of 8, got {block_m}"
@@ -545,7 +548,6 @@ def w4a16_indexed(
             shape_n,
             shape_k,
             num_experts,
-            layout,
             kernel_config,
         )
         return launch_kernel(

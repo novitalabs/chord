@@ -37,10 +37,11 @@ output = indexed(
 )
 ```
 
-`inputs` is a contiguous CUDA BF16 `[M, K]` tensor; `packed` carries the physical
-layout and `[E, N, K]` metadata. `N` must be a multiple of 128 and `K` a multiple
-of 64. Use `layout="mma"` for the decode profiles and `layout="wgmma"` for H200
-prefill; the two packings are not interchangeable. When calling the low-level API
+`inputs` is a contiguous CUDA BF16 `[M, K]` tensor; `packed` carries the layout
+label and `[E, N, K]` metadata. `N` must be a multiple of 128 and `K` a multiple
+of 64. `layout="mma"` and `layout="wgmma"` pack identical bytes: one packed
+weight serves the MMA/swap-AB decode tiles and the WGMMA prefill/TP8 tiles, and
+the label only picks the kernel family for a launch without `config`. When calling the low-level API
 directly, `config` can override the profile's tile; the MMA shorthand adopts the
 decode swap-AB default when `swap_ab` is omitted, and block-N defaults to the
 largest compatible power of two between 128 and 256.
@@ -158,7 +159,7 @@ layer = IndexedW4A16Layer(
 ```
 
 The axes also imply different deployments. The EP8 profiles are disaggregated P/D
-roles, each packing its own layout; TP8 targets a single instance (`mode="mix"`)
+roles, each with its own tuning table; TP8 targets a single instance (`mode="mix"`)
 serving both phases from one packed weight, so it takes no role and ignores both
 `CHORD_SM90_DECODE` and `CHORD_USE_GROUPED` (each grouped kernel serves one
 phase, so none can back a mix weight).
@@ -180,11 +181,12 @@ SM90:
 | `0` or unset | `h200_prefill_ep8` |
 
 An explicit `profile=...` or `mode=...` argument always wins over the variable.
-Because the profile fixes the physical weight layout, the variable is read when
-the profile is resolved and must be set before model load; it cannot switch an
-already packed layer at runtime. Blackwell publishes only the decode profile,
-so `profile="auto"` resolves to `blackwell_decode_ep8` there and the variable
-is ignored.
+The variable is read when the profile is resolved, so set it before model load.
+On the indexed backend it only picks the tuning table: the WGMMA prefill and
+MMA decode kernels read one packed layout, so the packed bytes do not depend
+on the role. Blackwell publishes only the decode profile, so
+`profile="auto"` resolves to `blackwell_decode_ep8` there and the variable is
+ignored.
 
 The table covers the EP8 axis only; `h200_tp8` takes no role, as above.
 
@@ -200,10 +202,18 @@ shards:
 | `h200_grouped_decode` | masked decode: inputs `[G*max_m, K]`, routing `expert_layout` = per-expert valid counts `[G] int32`, `valid_shape_m` = total routed tokens | INT4 bit-permuted at BLOCK_K=128 |
 | `h200_grouped_prefill` | contiguous prefill: inputs `[m, K]` with per-expert rows padded to a 128-row boundary (padding zeroed), routing `m_indices` `[m] int32` (`-1` marks padding) | the same reorder at BLOCK_K=64 |
 
-The packed buffer carries its mode and the two layouts are NOT interchangeable
-(the reorder perm width is baked in); dispatch validates `compute_config`'s
-`gemm_type` (`grouped_masked` / `grouped_contiguous`) against the packed mode
-and rejects a mismatch instead of mis-computing. Tile selection is owned by
+The masked kernel has two known limits, both present since the vendored kernel:
+a per-group row budget `max_m` below the heuristic's BLOCK_M (16 at small
+`expected_m`) lets one group's tile store run into the next group's rows, and a
+group whose `masked_m` exceeds that BLOCK_M gets wrong first rows. Keep
+`max_m >= 16` and `expected_m` close to the real per-group counts.
+
+Both modes pack the same bytes (the BLOCK_K=128 reorder is two BLOCK_K=64
+reorders side by side), so `chord_kernels.masked` / `chord_kernels.contiguous`
+accept a weight packed for either mode. The layer still records the mode as its
+routing convention, and dispatch validates `compute_config`'s `gemm_type`
+(`grouped_masked` / `grouped_contiguous`) against it, because each mode takes a
+different routing tensor. Tile selection is owned by
 the ported DeepGEMM SM90 heuristic per call, so the layer's `block_m` and
 tuning rows do not apply to this backend. At the operator level the same paths
 are exposed as `chord_kernels.masked` / `chord_kernels.contiguous` around

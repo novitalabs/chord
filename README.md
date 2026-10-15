@@ -97,9 +97,10 @@ for framework integration and per-instance P/D role selection — is in
 
 The `masked` (decode) and `contiguous` (prefill) interfaces consume the
 DeepGEMM-native group layouts and pack a different weight buffer via
-`pack_w4a16_grouped`. The two modes are not interchangeable: masked packs
-with BLOCK_K=128, contiguous with BLOCK_K=64, and the packed buffer records
-the mode so a mismatch fails loudly at dispatch.
+`pack_w4a16_grouped`. The masked (BLOCK_K=128) and contiguous (BLOCK_K=64)
+kernels read the same packed bytes, so either mode's buffer serves both
+kernels; the packed buffer records the mode for the layer's routing
+convention.
 
 ```python
 from chord_kernels import contiguous, masked

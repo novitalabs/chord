@@ -124,8 +124,8 @@ tile runs at 4 CTAs/SM. `block_m` becomes the token dimension on mma-N, which
 legalizes block-M 8 (mma-N floor) — the non-swap MMA path would need an
 illegal `m8n8k8` BF16 instruction. The activation tile is read straight into
 the B-fragment with non-transposing `ldmatrix.x2` over the same shared-memory
-swizzle the cp.async writer produced. Weights are packed in the MMA layout at
-transform time, so the profile is a pack-time choice. Measured vs the WGMMA
+swizzle the cp.async writer produced. The packed weight is the same one the
+WGMMA prefill kernel reads (see *P/D role selection* below). Measured vs the WGMMA
 baseline at decode token counts: down 1.10-1.34x, gate/up 1.05-1.24x.
 
 **Semi-static token-tile schedule.** Each m-block counts its populated 8-token
@@ -150,10 +150,13 @@ coherently over K.
 to 13, else 24, with tile `(block_m, 256, 64)`, warp `(block_m, 64, 64)`,
 4 CTAs/SM, one-pass (no stream-K).
 
-**P/D role selection.** Because prefill and decode want different physical
-weight layouts, the role must be fixed before weights are packed.
-`CHORD_SM90_DECODE=1` selects the decode profile for `profile="auto"` on SM90;
-unset/0 selects prefill. See [getting_started.md](getting_started.md).
+**P/D role selection.** `CHORD_SM90_DECODE=1` selects the decode profile for
+`profile="auto"` on SM90; unset/0 selects prefill. On the indexed backend the
+role only picks the tuning table: the WGMMA prefill/TP8 kernels and the MMA
+decode kernels read one packed layout (the WGMMA dequant reads each word's
+nibble pairs in its register-A order, so the repack no longer transposes the
+mini-block), so a weight packed for any SM90 indexed profile serves all three.
+See [getting_started.md](getting_started.md).
 
 ## Blackwell EP8 indexed decode (`blackwell_decode_ep8`)
 
@@ -216,10 +219,10 @@ weight buffer and in how the launch schedule is chosen:
 - **A bit-permuted INT4 weight buffer.** The weight is reordered at pack time
   into the layout the dequant path consumes (`pack_w4a16_grouped`), so the
   mainloop turns four-bit codes into BF16 operands with shifts and a
-  `prmt`-style nibble map instead of gathering scattered nibbles. The perm
-  width is baked into the buffer, which is why the two modes are separate
-  profiles: masked packs at BLOCK_K=128 and contiguous at BLOCK_K=64, and the
-  buffers are not interchangeable.
+  `prmt`-style nibble map instead of gathering scattered nibbles. Masked runs
+  BLOCK_K=128 and contiguous BLOCK_K=64, but the reorder keeps every K bit
+  below 6 inside one 64-wide slab, so the BLOCK_K=128 buffer is two BLOCK_K=64
+  buffers side by side and both kernels read the same bytes.
 - **Weight-scale TMA in MN-major order.** Humming checkpoints store scales
   N-major `[G, N, K/32]`; the kernel's SFA descriptor reads
   `[G, K/32, N]`. That transpose happens once at pack time, so the forward hot

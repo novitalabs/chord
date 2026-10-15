@@ -22,7 +22,10 @@ from chord_kernels.operator.grouped.heuristics import (
     select_w4a16_config,
 )
 from chord_kernels.operator.grouped.kernel import GroupedW4A16Kernel
-from chord_kernels.operator.grouped.packing import GroupedPreparedWeight
+from chord_kernels.operator.grouped.packing import (
+    GroupedPreparedWeight,
+    block_k_for_mode,
+)
 
 
 def _check_weight(
@@ -32,13 +35,15 @@ def _check_weight(
         raise TypeError(
             "weight must be a GroupedPreparedWeight from pack_w4a16_grouped()"
         )
-    if weight.mode != mode:
-        # The reorder perm width (= BLOCK_K) is baked into the packed buffer;
-        # running the other mode's kernel is a silent wrong answer.
+    # Both modes pack identical bytes (the BLOCK_K=128 reorder is two BLOCK_K=64
+    # reorders side by side, see packing.py), so either kernel reads a weight
+    # packed for either mode.  The only per-kernel constraint is that K covers
+    # whole BLOCK_K tiles.
+    block_k = block_k_for_mode(mode)
+    if weight.k % block_k:
         raise ValueError(
-            f"weight was packed for mode={weight.mode!r} (BLOCK_K={weight.block_k}) "
-            f"but the {mode!r} kernel requires BLOCK_K="
-            f"{128 if mode == 'masked' else 64}; repack the weight"
+            f"the {mode!r} kernel uses BLOCK_K={block_k}, which does not divide "
+            f"the weight's K={weight.k}"
         )
     packed, scale = weight.packed, weight.scale
     if packed.dtype != torch.float8_e4m3fn or scale.dtype != torch.bfloat16:
@@ -134,6 +139,13 @@ def w4a16_masked(
     Rows beyond a group's ``masked_m[g]`` are not written by the kernel; when
     ``outputs`` is omitted they are left UNINITIALIZED (matching upstream —
     a consumer must gather valid rows by the counts).
+
+    Known limitations (measured on H200, present since the vendored kernel):
+    ``max_m`` smaller than the heuristic's BLOCK_M (16 at small
+    ``expected_m``) makes a group's tile store run into the next group's
+    rows, and a group whose ``masked_m`` exceeds BLOCK_M gets wrong first
+    rows.  Keep ``max_m >= 16`` and ``expected_m`` close to the real
+    per-group counts; vLLM's batched experts use ``max_m`` in the hundreds.
     """
     _check_weight(weight, "masked", inputs.device)
     _check_activation(inputs, weight.k)

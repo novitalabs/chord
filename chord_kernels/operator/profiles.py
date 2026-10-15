@@ -3,10 +3,13 @@
 
 """Published serving profiles and per-layer metadata.
 
-A profile is a *load-time contract*: it fixes the physical weight layout, the
-kernel backend that consumes it, and the launch-schedule family for one
-serving regime.  Changing a profile changes the packed bytes, so profiles are
-selected before the weight is packed and never switch at runtime.
+A profile is a *load-time contract*: it fixes the kernel backend that consumes
+the packed weight and the launch-schedule family for one serving regime.  The
+indexed profiles all pack the same bytes (MMA and WGMMA read one layout; the
+profile's ``layout`` only names its kernel family), so an SM90 indexed weight
+serves ``h200_prefill_ep8``, ``h200_tp8`` and ``h200_decode_ep8`` alike.  The
+grouped backends pack a different buffer, so indexed-vs-grouped is still
+decided before the weight is packed.
 
 A profile also fixes the *shard axis*: the EP8 profiles split the expert list
 and leave each expert's N/K whole, while ``h200_tp8`` keeps every expert on
@@ -16,7 +19,8 @@ undiscoverable from the device — is never guessed by ``profile='auto'``.
 
 ``backend`` names the physical kernel family behind the profile:
 
-* ``indexed`` — the humming-native indexed kernel (MMA/WGMMA int32 layout).
+* ``indexed`` — the humming-native indexed kernel (one int32 layout read by
+  both MMA and WGMMA).
 * ``grouped_masked`` / ``grouped_contiguous`` — the grouped SM90 W4A16 kernels
   (DeepGEMM-derived, decode/prefill), published as ``h200_grouped_decode`` and
   ``h200_grouped_prefill``.  The selection policy
@@ -42,8 +46,8 @@ from chord_kernels.operator.packing import (
     WeightLayout,
 )
 
-# Physical weight-buffer backends behind a profile.  Like ``layout``, this is
-# a load-time contract: the backends pack mutually incompatible weight buffers.
+# Physical weight-buffer backends behind a profile.  This is a load-time
+# contract: the indexed and grouped backends pack incompatible weight buffers.
 IndexedBackend = Literal["indexed", "grouped_masked", "grouped_contiguous"]
 
 _KNOWN_BACKENDS = ("indexed", "grouped_masked", "grouped_contiguous")
@@ -51,7 +55,7 @@ _KNOWN_BACKENDS = ("indexed", "grouped_masked", "grouped_contiguous")
 
 @dataclasses.dataclass(frozen=True)
 class IndexedLayerProfile:
-    """A fixed weight layout and launch schedule for one serving regime."""
+    """A fixed kernel backend and launch schedule for one serving regime."""
 
     name: str
     device_major: int
@@ -447,8 +451,8 @@ class IndexedLayerMeta:
         )
 
 
-# Names are intentionally explicit: changing a profile changes the physical
-# weight layout, so an implicit architecture guess would be unsafe at load time.
+# Names are intentionally explicit: a profile fixes the backend and the tuning
+# table, so an implicit architecture guess would be unsafe at load time.
 _PROFILES: dict[str, IndexedLayerProfile] = {
     "h200_prefill_ep8": IndexedLayerProfile(
         name="h200_prefill_ep8",

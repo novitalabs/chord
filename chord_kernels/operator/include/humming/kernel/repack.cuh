@@ -43,7 +43,10 @@ CUDA_INLINE uint32_t load_uint4(const uint32_t *row, uint32_t index) {
 }
 
 
-template <bool kPackedInput, bool kTransposeMiniBlock>
+// One layout serves both MMA families: mma.sync reads each word's nibble pairs
+// as its B fragment (and swap-AB as its A fragment), and WGMMA scatters them
+// into its register-A fragment order while dequantizing (see mma/wgmma.cuh).
+template <bool kPackedInput>
 __global__ void repack_w4a16(
     const uint32_t *input, uint32_t *output,
     uint32_t shape_n, uint32_t shape_k,
@@ -94,11 +97,7 @@ __global__ void repack_w4a16(
         const uint32_t i3 = (i * 8) % 64 / 16;
         const uint32_t i4 = i % 2;
         const uint32_t i5 = j % 2;
-        if constexpr (kTransposeMiniBlock) {
-          fragment[i1][0][i3][i5][i4][k] = value;
-        } else {
-          fragment[i1][0][i3][i4][i5][k] = value;
-        }
+        fragment[i1][0][i3][i4][i5][k] = value;
       }
     }
   }

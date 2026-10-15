@@ -6,7 +6,7 @@ tables or the kernel; day-to-day use does not need it.
 
 ## Instruction paths and swap-AB
 
-| Profile | Tensor core instruction | Weight layout |
+| Profile | Tensor core instruction | Kernel family label |
 | --- | --- | --- |
 | `h200_prefill_ep8` | WGMMA (`wgmma.mma_async`) | `wgmma` |
 | `h200_tp8` | WGMMA (`wgmma.mma_async`) | `wgmma` |
@@ -14,16 +14,17 @@ tables or the kernel; day-to-day use does not need it.
 | `blackwell_decode_ep8` | MMA (`mma.sync`) | `mma` |
 
 Prefill and decode differ in more than their routed-M range: they use different
-tensor core instruction families, so the physical weight order differs too.
-Prefill sees a large routed-M, where WGMMA's asynchronous large tiles amortize
-instruction overhead. Decode sees a very small routed-M — often only a few rows
-per expert — where MMA gives finer control over the narrow dimension. The layout
-is baked into the weight when it is packed, so the profile must be chosen at
-packing time and cannot be switched at runtime; a mismatched layout is rejected
-before launch. A production deployment prepares the matching profile per P/D
-instance, or keeps two packed copies of the weight. When the profile is left at
-`"auto"` on SM90, the per-instance role comes from the `CHORD_SM90_DECODE`
-environment variable (`1` decode; `0`/unset prefill; see
+tensor core instruction families. Prefill sees a large routed-M, where WGMMA's
+asynchronous large tiles amortize instruction overhead. Decode sees a very small
+routed-M — often only a few rows per expert — where MMA gives finer control over
+the narrow dimension. Both families read one packed weight layout: the WGMMA
+dequant reads each word's nibble pairs in its register-A order, so the repack no
+longer transposes the mini-block (upstream Humming unified the layout the same
+way). One SM90 indexed weight therefore serves the prefill, TP8 and decode
+profiles, and a tuning row's warp-N (32 WGMMA, 64 MMA) picks the family; the
+profile only picks the tuning table. When the profile is left at `"auto"` on
+SM90, the per-instance role comes from the `CHORD_SM90_DECODE` environment
+variable (`1` decode; `0`/unset prefill; see
 [getting_started.md](getting_started.md)). Blackwell publishes only the
 decode profile, so `"auto"` needs no role bit there.
 

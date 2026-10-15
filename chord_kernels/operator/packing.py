@@ -11,7 +11,9 @@ import torch
 
 from chord_kernels.operator.kernel.repack_weight import RepackWeightKernel
 
-# The operator has only two physical layouts.
+# The MMA family a weight is labelled for.  Both families read ONE physical
+# packed layout (the WGMMA kernel permutes registers while dequantizing), so
+# the label only names a default kernel family; it never changes the bytes.
 WeightLayout = Literal["mma", "wgmma"]
 
 SUPPORTED_INDEXED_COMPUTE_CAPABILITIES = frozenset(
@@ -49,7 +51,12 @@ def _validate_supported_architecture(device: torch.device) -> None:
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class PreparedWeight:
-    """Packed tensors plus the physical layout required by the W4A16 kernel."""
+    """Packed tensors plus the W4A16 kernel-family label.
+
+    ``layout`` records the family the weight was packed for and is the default
+    for launches that pass no config; every indexed kernel (MMA, swap-AB MMA,
+    WGMMA) reads the same packed bytes.
+    """
 
     packed: torch.Tensor
     scale: torch.Tensor
@@ -97,11 +104,12 @@ def pack_w4a16(
 
     ``weight_scale`` is BF16 ``[E, N, K/32]``. The returned object carries an
     int32 kernel layout ``[E, K/16, 2*N]``, a BF16 scale layout
-    ``[E, K/32, N]``, and the physical MMA layout metadata required to prevent
-    incompatible launches.
+    ``[E, K/32, N]``, and the ``layout`` label.
 
-    MMA and WGMMA weights use different mini-block layouts and are not
-    interchangeable. The indexed swap-AB API uses ``layout="mma"``.
+    ``layout`` is kept for API compatibility: ``"mma"`` and ``"wgmma"`` pack
+    identical bytes, so one weight serves the MMA (incl. swap-AB) and WGMMA
+    kernels alike.  The label only picks the default family for a launch that
+    passes no explicit config.
     """
     layout = _validate_layout(layout)
     if not isinstance(packed, bool):
@@ -161,10 +169,7 @@ def pack_w4a16(
         device=weight_uint4.device,
     )
     with torch.cuda.device(weight_uint4.device):
-        kernel = RepackWeightKernel(
-            is_weight_packed=packed,
-            use_wgmma=layout == "wgmma",
-        )
+        kernel = RepackWeightKernel(is_weight_packed=packed)
         kernel(inputs=weight_uint4, outputs=packed_weight)
 
     return PreparedWeight(

@@ -10,11 +10,14 @@ atom index so that after TMA + ldmatrix + the kernel's int4->bf16 dequant the
 fragments line up with the BF16 RS-WGMMA A-operand; nibbles are pre-flipped
 to excess-8 (``^0x08``) because the kernel's LOP3 dequant expects that.
 
-The reorder perm width MUST equal the kernel's ``BLOCK_K``, and the vendored
-heuristic fixes ``BLOCK_K`` per mode (128 for masked decode, 64 for contiguous
-prefill), so the two modes pack DIFFERENT weight buffers.  The mode recorded
-on :class:`GroupedPreparedWeight` is the guard that keeps a masked-packed
-weight from ever being fed to the contiguous kernel (a silent wrong answer).
+The vendored heuristic fixes ``BLOCK_K`` per mode (128 for masked decode, 64
+for contiguous prefill), but the reorder does not actually depend on it: K bit
+6 maps to nibble bit 6 and every other bit stays inside one 64-wide K slab, so
+the BLOCK_K=128 perm is exactly two BLOCK_K=64 perms side by side and the two
+modes pack byte-identical buffers.  Either kernel therefore reads a weight
+packed for either mode; ``mode`` on :class:`GroupedPreparedWeight` records the
+routing convention the layer dispatches with, and the pack-time K check keeps
+the requested mode's BLOCK_K whole.
 The BF16 scale layout ``[G, K/32, N]`` (N contiguous) is shared by both modes —
 it is exactly what the kernel's SFA TMA descriptor reads, so no per-forward
 transpose happens on the hot path.

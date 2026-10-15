@@ -84,9 +84,9 @@ Ported to Python/C++ (rewritten against the upstream sources, not copied):
   MN-major BF16 scale layout, plus the cluster/PDL launch plumbing of
   `csrc/jit/handle.hpp`.
 - `grouped/api.py` — the tensor contracts of `csrc/apis/gemm.hpp`
-  (`sm90_m_grouped_w4a16_gemm_nt_masked` / `..._contiguous`), with the
-  packed-mode guard reversed into a hard error (masked BLOCK_K=128 vs
-  contiguous BLOCK_K=64 buffers are not interchangeable).
+  (`sm90_m_grouped_w4a16_gemm_nt_masked` / `..._contiguous`). The masked
+  BLOCK_K=128 and contiguous BLOCK_K=64 packs are byte-identical, so the
+  operators accept either mode's buffer and only check that K tiles whole.
 
 Weight-pack semantics were independently re-derived from the vendored kernel:
 the packed nibble equals the unsigned checkpoint code, and the reorder is a
@@ -239,8 +239,13 @@ ported Python and launcher files, which are rewritten rather than copied):
   below).
 - `include/humming/kernel/repack.cuh` is the retained INT4-to-W4A16 weight
   layout path extracted from the upstream generic processing kernel. The
-  Python repacker supplies only packed/unpacked input and MMA/WGMMA layout
-  choices.
+  Python repacker supplies only the packed/unpacked input choice: as in
+  upstream Humming 5a585e6 ("unify tensor layouts"), the BF16-activation
+  WGMMA path reads the MMA layout, so the WGMMA mini-block transpose is gone.
+  Upstream swaps the middle two dequantized registers in
+  `mma/wgmma.cuh::transform_b`; chord folds that permutation into the nibble
+  extraction order of `datatype/dequant.cuh` (only shift immediates change),
+  which keeps the WGMMA SASS schedule identical to the transposed layout.
 - The GEMM templates were specialized to BF16 activation, INT4 weight, BF16
   group-32 weight scale, indexed routing, and `cp.async` loads. Dense/grouped
   scheduling, other data types, bias and zero-point paths, activation scaling,

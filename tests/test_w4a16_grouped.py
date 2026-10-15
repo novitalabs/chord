@@ -479,18 +479,36 @@ def test_pack_layout_shape_and_mode_guard(hopper: torch.device) -> None:
     assert masked_weight.scale.is_contiguous()
     assert masked_weight.scale.dtype == torch.bfloat16
 
-    # A contiguous-packed weight must never reach the masked kernel: that is
-    # the classic silent-wrong-answer the mode guard exists for.
+    # The BLOCK_K=128 reorder is two BLOCK_K=64 reorders side by side, so both
+    # modes pack the same bytes and each kernel reads the other mode's buffer
+    # with a bit-identical result.
     contiguous_weight = pack_w4a16_grouped(codes, scale, "contiguous", packed=False)
-    a3 = torch.randn((g, 8, k), device=hopper, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="repack"):
-        w4a16_masked(a3, contiguous_weight, torch.full((g,), 4, dtype=torch.int32, device=hopper), 4)
-    with pytest.raises(ValueError, match="repack"):
-        w4a16_contiguous(
-            torch.randn((128, k), device=hopper, dtype=torch.bfloat16),
-            masked_weight,
-            torch.zeros((128,), dtype=torch.int32, device=hopper),
-        )
+    assert torch.equal(
+        masked_weight.packed.view(torch.uint8), contiguous_weight.packed.view(torch.uint8)
+    )
+    assert torch.equal(masked_weight.scale, contiguous_weight.scale)
+    # max_m holds one whole BLOCK_M=16 tile per group: with fewer rows than the
+    # tile, a group's tile store runs into the next group's rows (a known
+    # masked-kernel limitation, independent of the packing).
+    max_m = 16
+    a3 = torch.randn((g, max_m, k), device=hopper, dtype=torch.bfloat16)
+    masked_m = torch.full((g,), 4, dtype=torch.int32, device=hopper)
+    masked_out = w4a16_masked(a3, masked_weight, masked_m, 4).view(g, max_m, n)[:, :4]
+    cross_masked = w4a16_masked(a3, contiguous_weight, masked_m, 4).view(g, max_m, n)[:, :4]
+    assert torch.equal(masked_out, cross_masked)
+    a2 = torch.randn((128, k), device=hopper, dtype=torch.bfloat16)
+    m_indices = torch.zeros((128,), dtype=torch.int32, device=hopper)
+    assert torch.equal(
+        w4a16_contiguous(a2, contiguous_weight, m_indices),
+        w4a16_contiguous(a2, masked_weight, m_indices),
+    )
+
+    # The masked kernel's BLOCK_K=128 must still tile K whole.
+    short_k = pack_w4a16_grouped(
+        codes[..., :192].contiguous(), scale[..., :6].contiguous(), "contiguous"
+    )
+    with pytest.raises(ValueError, match="BLOCK_K=128"):
+        w4a16_masked(a3[..., :192].contiguous(), short_k, masked_m, 4)
 
 
 @pytest.mark.gpu

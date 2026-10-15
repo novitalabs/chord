@@ -1375,3 +1375,47 @@ def test_stream_k_caller_owned_locks_and_scratch_workspace(
 
     with pytest.raises(RuntimeError, match="lock words"):
         run(owned_locks=torch.zeros(8, dtype=torch.int32, device=supported_gpu))
+
+
+@pytest.mark.gpu
+def test_one_packed_weight_serves_mma_and_wgmma() -> None:
+    """MMA and WGMMA read one packed layout, so an SM90 layer packs once.
+
+    ``layout="mma"`` and ``layout="wgmma"`` pack identical bytes, and that single
+    buffer feeds the WGMMA prefill/TP8 tile, the MMA non-swap tile, and the
+    swap-AB decode tile, each matching the BF16 dequant reference.
+    """
+    from chord_kernels import indexed
+    from chord_kernels.operator import IndexedKernelConfig, pack_w4a16
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the WGMMA indexed kernel needs SM90")
+    device = torch.device("cuda")
+    num_experts, top_k, num_tokens, n, k = 8, 4, 64, 256, 1024
+    gen = torch.Generator(device=device).manual_seed(20261014)
+    codes = torch.randint(0, 16, (num_experts, n, k), dtype=torch.int32, device=device,
+                          generator=gen)
+    scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
+             + 0.005).to(torch.bfloat16)
+    mma_weight = pack_w4a16(codes, scale, layout="mma")
+    wgmma_weight = pack_w4a16(codes, scale, layout="wgmma")
+    assert torch.equal(mma_weight.packed, wgmma_weight.packed)
+    assert torch.equal(mma_weight.scale, wgmma_weight.scale)
+
+    activation = torch.randn((num_tokens, k), dtype=torch.bfloat16, device=device,
+                             generator=gen)
+    topk_ids = generate_topk_ids(num_tokens=num_tokens, top_k=top_k,
+                                 num_experts=num_experts, device=device, generator=gen)
+    reference, rows = reference_indexed(activation, codes, scale, topk_ids, top_k)
+    configs = (
+        IndexedKernelConfig(block_shape=(16, 128, 64), warp_shape=(16, 32, 64)),
+        IndexedKernelConfig(block_shape=(16, 256, 64), warp_shape=(16, 64, 64)),
+        IndexedKernelConfig(block_shape=(8, 256, 64), warp_shape=(8, 64, 64),
+                            num_ctas_per_sm=4, swap_ab=True),
+    )
+    for config in configs:
+        sorted_ids, expert_ids, ntp = align_routing_blocks(
+            topk_ids, block_m=config.block_m, num_experts=num_experts)
+        actual = indexed(activation, mma_weight, sorted_ids, expert_ids, ntp, top_k,
+                         config=config, validate_routing=False)
+        _check_output(actual[:rows], reference)

@@ -5,7 +5,8 @@
 
 chord hosts three W4A16 MoE kernel families:
 
-* ``indexed`` — the humming-native indexed kernel (MMA/WGMMA int32 layout),
+* ``indexed`` — the humming-native indexed kernel (one int32 layout read by
+  both MMA and WGMMA),
   routed by ``sorted_ids`` / ``expert_ids`` / ``num_tokens_padded``;
 * ``grouped_contiguous`` — the DeepGEMM-derived SM90 prefill kernel, routed by
   a per-row ``m_indices`` map;
@@ -22,8 +23,8 @@ a silent fallback.
 
 All three branches are live, and this module is the single dispatch shared by
 both the layer forward and the framework-method forward.  The grouped branches
-additionally validate the requested ``gemm_type`` against the mode baked into
-the packed buffer, and they reject the indexed tuning knobs (``tuning_config``,
+additionally validate the requested ``gemm_type`` against the layer's
+recorded grouped mode (its routing convention), and they reject the indexed tuning knobs (``tuning_config``,
 ``block_m``) because the grouped SM90 heuristic owns tile selection per call.
 """
 
@@ -33,14 +34,18 @@ import dataclasses
 
 import torch
 
-from chord_kernels.operator.api import IndexedKernelConfig, w4a16_indexed
+from chord_kernels.operator.api import (
+    IndexedKernelConfig,
+    _config_layout,
+    w4a16_indexed,
+)
 from chord_kernels.operator.env import IndexedMode, resolve_backend_name
 from chord_kernels.operator.grouped.api import w4a16_contiguous, w4a16_masked
 from chord_kernels.operator.grouped.packing import (
     GroupedPreparedWeight,
     pack_w4a16_grouped,
 )
-from chord_kernels.operator.packing import PreparedWeight, WeightLayout, pack_w4a16
+from chord_kernels.operator.packing import PreparedWeight, pack_w4a16
 from chord_kernels.operator.profiles import IndexedLayerMeta
 from chord_kernels.operator.tuning import (
     _resolve_tuning_config,
@@ -185,7 +190,7 @@ def forward_w4a16(
     if block_m is not None and block_m != kernel_config.block_m:
         # An explicit routing block-M (e.g. the shared w13 table's) overrides
         # the row's M tile while keeping the projection's N/K tile.
-        kernel_config = _config_with_block_m(kernel_config, block_m, layout=meta.layout)
+        kernel_config = _config_with_block_m(kernel_config, block_m)
     return w4a16_indexed(
         inputs,
         prepared,
@@ -221,10 +226,10 @@ def _forward_grouped(
 ) -> torch.Tensor:
     """Dispatch grouped-packed buffers to their masked/contiguous kernels.
 
-    The packed buffer's mode must agree with the requested ``gemm_type`` (the
-    reorder perm width is baked into the weight, so a mismatch is a silent
-    wrong answer), and the scheduling tiles are owned by the grouped SM90
-    heuristic rather than the indexed tuning rows.
+    The layer's recorded mode must agree with the requested ``gemm_type``: the
+    bytes are the same for both modes, but each mode takes a different routing
+    tensor, so a mismatch is a caller error.  The scheduling tiles are owned by
+    the grouped SM90 heuristic rather than the indexed tuning rows.
     """
     if not isinstance(prepared, GroupedPreparedWeight):
         raise TypeError(
@@ -295,9 +300,14 @@ def _config_with_block_m(
     config: IndexedKernelConfig,
     block_m: int,
     *,
-    layout: WeightLayout,
+    layout: str | None = None,
 ) -> IndexedKernelConfig:
-    """Keep a projection's tile choice while matching the shared route blocks."""
+    """Keep a projection's tile choice while matching the shared route blocks.
+
+    ``layout`` is accepted for compatibility and ignored: every indexed kernel
+    reads one packed layout, so the config's own warp-N names its family.
+    """
+    del layout
     if block_m == config.block_m:
         return config
     if (
@@ -310,10 +320,10 @@ def _config_with_block_m(
             f"routing block_m must be a positive multiple of 8, got {block_m!r}"
         )
     swap_ab = config.swap_ab
-    if layout == "mma" and block_m % 16 == 8:
+    if _config_layout(config) == "mma" and block_m % 16 == 8:
         # MMA's non-swap path cannot issue an m8n8k8 BF16 instruction.  The
-        # swap layout accepts these small token tiles and is compatible with
-        # the same packed weight buffer.
+        # swap kernel accepts these small token tiles and reads the same
+        # packed weight buffer.
         swap_ab = True
     return dataclasses.replace(
         config,

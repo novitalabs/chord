@@ -29,10 +29,11 @@ The two switches combine into one per-layer backend:
 ``1``                  ``0``/unset            ``grouped_contiguous`` (BK64)
 ====================  ====================  =================================
 
-Two variables rather than one because the weight layout is frozen at pack time
-while the two grouped kernels need DIFFERENT reorder widths (BLOCK_K 128 vs
-64), and the gemm type is not known until forward: the role bit is what maps
-an instance to its kernel, and the master switch is the on/off gate.
+Two variables rather than one because the backend (indexed vs grouped) is
+frozen at pack time, and the grouped gemm type (masked vs contiguous) is not
+known until forward: the role bit is what maps an instance to its kernel, and
+the master switch is the on/off gate.  On the indexed backend the role bit only
+picks the tuning table: every SM90 indexed profile packs the same bytes.
 
 Neither variable applies to a TP8 layer.  TP8 is a single-instance ``mix`` role
 serving both phases from one packed weight, so there is no P/D bit to read, and
@@ -45,7 +46,7 @@ import os
 from typing import Literal
 
 # A profile's serving role.  ``prefill``/``decode`` are the disaggregated roles,
-# each packing its own weight layout; ``mix`` is a single instance serving both
+# each with its own tuning table; ``mix`` is a single instance serving both
 # phases from one packed weight, so its schedule must hold across the whole
 # routed-M range instead of one phase's bracket.
 IndexedMode = Literal["prefill", "decode", "mix"]
@@ -120,7 +121,8 @@ def resolve_backend_name(
     Upstream Humming has no equivalent function.  It derives the MMA type from
     dtype and SM version and takes the GEMM family as a per-call ``GemmType``
     argument, so it never needs to map a process to a backend; chord does,
-    because its weight layout is frozen when the profile is chosen at pack time.
+    because its backend (indexed vs grouped weight buffer) is frozen when the
+    profile is chosen at pack time.
 
     ``mix`` (the single-instance TP8 role) always resolves to ``indexed``: the
     two grouped kernels are each tied to one phase, so there is no grouped

@@ -22,15 +22,12 @@ CODE_TEMPLATE = jinja2.Template("""
 class RepackWeightKernel(KernelRuntime):
     name: ClassVar[str] = "repack_w4a16"
     is_weight_packed: bool
-    use_wgmma: bool = False
 
     def init_kernel(self):
         self.code = CODE_TEMPLATE.render()
-        self.kernel_expr = (
-            f"repack_w4a16<\n"
-            f"    {int(self.is_weight_packed)},\n"
-            f"    {int(self.use_wgmma)}>"
-        )
+        # MMA and WGMMA read the same packed layout, so the only template
+        # parameter is the input form.
+        self.kernel_expr = f"repack_w4a16<{int(self.is_weight_packed)}>"
         self.arg_types = (
             ctypes.c_void_p,
             ctypes.c_void_p,

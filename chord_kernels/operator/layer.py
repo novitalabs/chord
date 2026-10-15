@@ -310,8 +310,8 @@ class IndexedW4A16Layer(torch.nn.Module):
                 # the prefill default, routed through the backend policy
                 # (CHORD_USE_GROUPED reroutes both roles to the grouped
                 # profiles).  An auto layer moved to Blackwell
-                # must be recreated with the explicit Blackwell profile so
-                # weights are never silently repacked for another layout.
+                # must be recreated with the explicit Blackwell profile so a
+                # weight is never silently run on another architecture's table.
                 #
                 # A TP8 layer keeps the TP8 provisional layout so the CPU-side
                 # metadata matches the table it will resolve to; being a mix
@@ -536,9 +536,9 @@ class IndexedW4A16Layer(torch.nn.Module):
                 scale=self.weight_scale,
             )
             if self.weight.is_cuda:
-                # The physical layout is profile-specific.  A packed H200 layer
-                # cannot be migrated to another architecture and silently keep
-                # using the old schedule.
+                # The profile's schedule is architecture-specific.  A packed
+                # H200 layer cannot be migrated to another architecture and
+                # silently keep using the old schedule.
                 self.indexed_profile.validate_device(self.weight.device)
         return result
 

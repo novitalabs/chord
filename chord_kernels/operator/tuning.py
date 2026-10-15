@@ -450,9 +450,8 @@ def _validate_grouped_compute_config(
 
     Accepts the framework spellings ``grouped_masked`` / ``grouped_contiguous``
     (matching upstream Humming's ``GemmType`` values) and requires them to
-    agree with the mode that was packed into the weight.  The reorder perm
-    width is baked into the buffer, so a mismatch is a silent wrong answer
-    rather than a slow path.
+    agree with the layer's recorded mode.  Both modes pack the same bytes, but
+    each takes its own routing tensor, so a mismatch is a caller error.
     """
     if compute_config is None:
         return
@@ -492,6 +491,23 @@ def _validate_grouped_compute_config(
         )
 
 
+def _tuning_row_config(meta: IndexedLayerMeta, row: Mapping) -> IndexedKernelConfig:
+    """Build one tuning row's config.
+
+    Every indexed profile packs the same bytes, so a row may name either MMA
+    family regardless of the layer's profile; its warp-N picks the family.  An
+    omitted ``swap_ab`` follows the profile, except that WGMMA never swaps.
+    """
+    from chord_kernels.operator.packing import _validate_layout
+
+    row = dict(row)
+    if row.get("layout") is not None:
+        _validate_layout(row["layout"])
+    is_mma_row = tuple(row["warp_shape"])[1] != 32
+    row.setdefault("swap_ab", meta.swap_ab and is_mma_row)
+    return IndexedKernelConfig.from_dict(row)
+
+
 def _resolve_tuning_config(
     meta: IndexedLayerMeta,
     selected_shape_m: int,
@@ -509,21 +525,11 @@ def _resolve_tuning_config(
         except json.JSONDecodeError as exc:
             raise ValueError("tuning_config must be valid JSON") from exc
     if isinstance(value, Mapping):
-        row = dict(value)
-        row.setdefault("swap_ab", meta.swap_ab)
-        if row.get("layout", meta.layout) != meta.layout:
-            raise ValueError("tuning_config layout does not match the packed weight")
-        return IndexedKernelConfig.from_dict(row)
+        return _tuning_row_config(meta, value)
     if isinstance(value, list):
         for lower, upper, row in value:
             if selected_shape_m > int(lower) and selected_shape_m <= int(upper):
-                row = dict(row)
-                row.setdefault("swap_ab", meta.swap_ab)
-                if row.get("layout", meta.layout) != meta.layout:
-                    raise ValueError(
-                        "tuning_config layout does not match the packed weight"
-                    )
-                return IndexedKernelConfig.from_dict(row)
+                return _tuning_row_config(meta, row)
         raise ValueError(
             f"no indexed tuning row covers valid_shape_m={selected_shape_m}"
         )
