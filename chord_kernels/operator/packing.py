@@ -9,6 +9,7 @@ from typing import Literal
 
 import torch
 
+from chord_kernels.operator import cpp_jit
 from chord_kernels.operator.kernel.repack_weight import RepackWeightKernel
 
 # The operator has only two physical layouts.
@@ -161,11 +162,17 @@ def pack_w4a16(
         device=weight_uint4.device,
     )
     with torch.cuda.device(weight_uint4.device):
-        kernel = RepackWeightKernel(
-            is_weight_packed=packed,
-            use_wgmma=layout == "wgmma",
-        )
-        kernel(inputs=weight_uint4, outputs=packed_weight)
+        if cpp_jit.enabled(weight_uint4.device):
+            # CHORD_CPP_JIT=1 on SM100 / SM103: the C++ JIT (cpp_jit.py).
+            cpp_jit.repack_w4a16(
+                weight_uint4, packed_weight, packed=packed, wgmma_layout=layout == "wgmma"
+            )
+        else:
+            kernel = RepackWeightKernel(
+                is_weight_packed=packed,
+                use_wgmma=layout == "wgmma",
+            )
+            kernel(inputs=weight_uint4, outputs=packed_weight)
 
     return PreparedWeight(
         packed=packed_weight,

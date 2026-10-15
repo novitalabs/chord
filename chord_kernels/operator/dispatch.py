@@ -33,6 +33,7 @@ import dataclasses
 
 import torch
 
+from chord_kernels.operator import cpp_jit
 from chord_kernels.operator.api import IndexedKernelConfig, w4a16_indexed
 from chord_kernels.operator.env import IndexedMode, resolve_backend_name
 from chord_kernels.operator.grouped.api import w4a16_contiguous, w4a16_masked
@@ -174,16 +175,21 @@ def forward_w4a16(
     selected_shape_m = valid_shape_m
     if selected_shape_m <= 0:
         selected_shape_m = inputs.size(0) * top_k
-    kernel_config = _resolve_tuning_config(
-        meta,
-        selected_shape_m,
-        tuning_config,
-        default=meta.kernel_config(selected_shape_m),
+    # CHORD_CPP_JIT=1 on SM100 / SM103: the same choice made in C++ (cpp_jit.py).
+    kernel_config = cpp_jit.select_layer_config(
+        meta, inputs.device, selected_shape_m, tuning_config, block_m
     )
-    if block_m is not None and block_m != kernel_config.block_m:
-        # An explicit routing block-M (e.g. the shared w13 table's) overrides
-        # the row's M tile while keeping the projection's N/K tile.
-        kernel_config = _config_with_block_m(kernel_config, block_m, layout=meta.layout)
+    if kernel_config is None:
+        kernel_config = _resolve_tuning_config(
+            meta,
+            selected_shape_m,
+            tuning_config,
+            default=meta.kernel_config(selected_shape_m),
+        )
+        if block_m is not None and block_m != kernel_config.block_m:
+            # An explicit routing block-M (e.g. the shared w13 table's) overrides
+            # the row's M tile while keeping the projection's N/K tile.
+            kernel_config = _config_with_block_m(kernel_config, block_m, layout=meta.layout)
     return w4a16_indexed(
         inputs,
         prepared,
@@ -288,7 +294,7 @@ def _forward_grouped(
     )
 
 
-def _config_with_block_m(
+def _config_with_block_m(  # ported to csrc/indexed/select.cpp: change both
     config: IndexedKernelConfig,
     block_m: int,
     *,

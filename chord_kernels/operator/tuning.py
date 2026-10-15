@@ -285,6 +285,7 @@ def _select_indexed_kernel_config(
         (4096, 7168, 48),
         (7168, 2048, 48),
     }:
+        # Ported to csrc/indexed/select.cpp (CHORD_CPP_JIT=1): change both.
         # SM100 and SM103 share this table.  The two projections are tuned
         # independently; a host that shares one routing across both passes the
         # routing's block-M through the ``block_m`` forward argument, which
@@ -499,7 +500,10 @@ def _resolve_tuning_config(
     *,
     default: IndexedKernelConfig,
 ) -> IndexedKernelConfig:
-    """Parse the small tuning format used by Humming/vLLM."""
+    """Parse the small tuning format used by Humming/vLLM.
+
+    The row lookup is ported to csrc/indexed/select.cpp and the row parsing to
+    cpp_jit._table_id (CHORD_CPP_JIT=1): change both."""
     if tuning_config is None:
         return default
     value = tuning_config
