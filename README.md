@@ -34,11 +34,13 @@ INT4 weights.
 
 ## Performance
 
-Per-call latency against public Humming, each backend measured against the
-matching Humming path (`indexed` against `indexed`, the grouped modes against
-Humming's own `grouped_contiguous`/`grouped_masked`); on SM100/SM103 public
-Humming ships only its default config strategy. Full tables are in
-[docs/performance.md](docs/performance.md).
+Per-call latency against public Humming main
+([`vllm-project/humming@c00b2e6`](https://github.com/vllm-project/humming/commit/c00b2e645a4b5ef57174f40254968a2996944217),
+2026-10-16), each backend measured against the matching Humming path
+(`indexed` against `indexed`, the grouped modes against Humming's own
+`grouped_contiguous`/`grouped_masked`) on the same GPU. Full tables, and how
+this baseline differs from the July revision this repository derives from, are
+in [docs/performance.md](docs/performance.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
@@ -135,8 +137,9 @@ load reroutes both SM90 roles to `h200_grouped_{prefill,decode}`.
 
 ## Provenance and license
 
-This repository derives from the public `inclusionAI/humming` commit
-[`4351af3a8fcdce1a8dee50104ba49566af2427fb`](https://github.com/inclusionAI/humming/commit/4351af3a8fcdce1a8dee50104ba49566af2427fb);
+This repository derives from the public `inclusionAI/humming` (now
+`vllm-project/humming`) commit
+[`4351af3a8fcdce1a8dee50104ba49566af2427fb`](https://github.com/vllm-project/humming/commit/4351af3a8fcdce1a8dee50104ba49566af2427fb);
 "based on Humming" describes source lineage, not a runtime dependency. The
 SM90 `masked`/`contiguous` backend additionally vendors the W4A16 kernel and
 its launch heuristics from `deepseek-ai/DeepGEMM`

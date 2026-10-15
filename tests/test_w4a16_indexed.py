@@ -617,10 +617,15 @@ def test_decode_tokens_are_already_per_gpu() -> None:
 @pytest.mark.parametrize(
     "routed_m,shape_k,expected",
     [
-        # tok_e < 80 minimizes block count instead of modelling padding; the
-        # sampled routing reproduces upstream's, so these match Humming exactly.
-        (1024, 7168, 40),
-        (2048, 7168, 64),
+        # Below the mid-size window: minimize block count; the sampled
+        # routing reproduces upstream's draw.
+        (512, 7168, 24),
+        # Mid-size window (row-work block-M 32..80): the row-work argmin.
+        (1024, 7168, 32),
+        (2048, 7168, 56),
+        (3370, 7168, 80),
+        # Past it, tok_e < 80 is back on the block-count argmin.
+        (3371, 7168, 104),
         # tok_e >= 80: one or two blocks under the 176 register ceiling.
         (4096, 7168, 96),
         (8192, 7168, 96),
@@ -633,35 +638,77 @@ def test_decode_tokens_are_already_per_gpu() -> None:
 def test_prefill_block_m_follows_tokens_per_expert(
     routed_m: int, shape_k: int, expected: int
 ) -> None:
-    """Prefill block-M must track tok_e, matching the upstream Humming rule."""
+    """Prefill block-M must track tok_e."""
 
     from chord_kernels.operator.layer import _h200_prefill_block_m
 
     assert _h200_prefill_block_m(routed_m, 48, shape_k) == expected
 
 
+def test_mid_tile_window_bounds() -> None:
+    """The mid-size window is where the row-work argmin asks for 32..80 rows.
+
+    Both shard axes share the rule; the bounds below are the routed-M edges of
+    the sampled routing for 48 (EP8) and 384 (TP8) experts.
+    """
+
+    from chord_kernels.operator.tuning import _uses_mid_tiles
+
+    for experts, first, last in ((48, 980, 3370), (384, 7725, 26148)):
+        assert not _uses_mid_tiles(first - 1, experts)
+        assert _uses_mid_tiles(first, experts)
+        assert _uses_mid_tiles(last, experts)
+        assert not _uses_mid_tiles(last + 1, experts)
+
+
+def test_sampled_expert_counts_match_the_upstream_draw() -> None:
+    """The cached prefix-sum routing equals a fresh upstream draw at every m."""
+
+    import numpy as np
+
+    from chord_kernels.operator.tuning import (
+        _SAMPLED_ROUTING_ROWS,
+        _sampled_expert_counts,
+    )
+
+    for experts in (48, 384):
+        for routed_m in (1, 7, 1023, 1024, 1025, 4097, 131072,
+                         _SAMPLED_ROUTING_ROWS, _SAMPLED_ROUTING_ROWS + 1):
+            draw = np.random.RandomState(seed=0).randint(0, experts, size=routed_m)
+            expected = np.bincount(draw, minlength=experts)
+            assert np.array_equal(
+                _sampled_expert_counts(routed_m, experts), expected
+            ), (experts, routed_m)
+
+
 @pytest.mark.parametrize(
-    "routed_m,expected",
+    "routed_m,shape_k,expected",
     [
-        # tok_e < 80 falls back to the block-count argmin, same as EP8.
-        (8192, 40),
-        (16384, 72),
-        (30719, 120),
-        # tok_e >= 80: one block per expert while tok_e <= 128 ...
-        (30720, 88),
-        (32768, 96),
-        (49152, 144),
-        # ... then a flat 96 window to tok_e 190 ...
-        (49153, 96),
-        (65536, 96),
-        (72960, 96),
+        # Below the mid-size window: the block-count argmin, same as EP8.
+        (4096, 7168, 24),
+        # Mid-size window: the row-work argmin, both projections.
+        (8192, 7168, 32),
+        (16384, 7168, 56),
+        (16384, 256, 56),
+        (26148, 7168, 80),
+        # Past it, tok_e < 80 is back on the block-count argmin.
+        (26149, 256, 104),
+        # tok_e 80..128: gate/up keeps the row-work argmin, down sizes one
+        # block per expert to its padded rows.
+        (30720, 7168, 96),
+        (30720, 256, 88),
+        (49152, 7168, 152),
+        (49152, 256, 144),
+        # Then a flat 96 window to tok_e 190 ...
+        (49153, 7168, 96),
+        (72960, 256, 96),
         # ... then 128 for good.
-        (72961, 128),
-        (131072, 128),
+        (72961, 7168, 128),
+        (131072, 256, 128),
     ],
 )
 def test_tp8_block_m_follows_tokens_per_expert(
-    routed_m: int, expected: int
+    routed_m: int, shape_k: int, expected: int
 ) -> None:
     """TP8 block-M uses the flatter TP-scale windows, not EP8's padding model.
 
@@ -672,53 +719,60 @@ def test_tp8_block_m_follows_tokens_per_expert(
 
     from chord_kernels.operator.layer import _h200_tp8_block_m
 
-    assert _h200_tp8_block_m(routed_m, 384) == expected
+    assert _h200_tp8_block_m(routed_m, 384, shape_k) == expected
 
 
 @pytest.mark.parametrize(
     "shape_k,routed_m,expected",
     [
-        # down (K=256): only 4 K-blocks to split, so one-pass until the workload
-        # is imbalanced enough that load balancing repays the locks.
+        # down (K=256): only 4 K-blocks to split, so one-pass everywhere ...
         (256, 8192, False),
         (256, 65536, False),
-        (256, 65537, True),
-        (256, 131072, True),
-        # gate/up (K=7168): the mirror image -- split until the M*N tiles fill
-        # the grid on their own at 65536.
-        (7168, 8192, True),
-        (7168, 65535, True),
-        (7168, 65536, False),
-        (7168, 131072, False),
+        (256, 131072, False),
+        # ... except the mid-size window's 256-wide tiles from block-M 56.
+        (256, 13090, False),
+        (256, 16384, True),
+        (256, 21235, True),
+        (256, 24061, False),
+        # gate/up (K=7168): split everywhere except the mid-size window's
+        # 512-wide one-pass tile, which splits only on a partial last wave.
+        (7168, 4096, True),
+        (7168, 8192, False),
+        (7168, 10240, True),
+        (7168, 16384, False),
+        (7168, 26149, True),
+        (7168, 65536, True),
+        (7168, 131072, True),
     ],
 )
 def test_tp8_stream_k_gate(
     shape_k: int, routed_m: int, expected: bool
 ) -> None:
-    """The two TP8 projections cross over in opposite directions at 65536."""
+    """down is one-pass outside the mid-size window; gate/up splits outside it."""
 
     from chord_kernels.operator.layer import _h200_tp8_use_stream_k
 
-    assert _h200_tp8_use_stream_k(routed_m, shape_k) is expected
+    assert _h200_tp8_use_stream_k(routed_m, 384, shape_k) is expected
 
 
 @pytest.mark.parametrize(
-    "shape_n,shape_k,routed_m,block_shape,num_ctas_per_sm,use_stream_k",
+    "shape_n,shape_k,routed_m,block_shape,num_stages,num_ctas_per_sm,use_stream_k",
     [
-        # gate/up: block-K compensates for the narrow N while block-M is short,
-        # then the wide 256 tile takes over past block-M 64.
-        (512, 7168, 8192, (40, 128, 128), 1, True),
-        (512, 7168, 16384, (72, 256, 64), 1, True),
-        (512, 7168, 32768, (96, 256, 64), 1, True),
-        (512, 7168, 65536, (96, 256, 64), 1, False),
-        (512, 7168, 131072, (128, 256, 64), 1, False),
-        # down: block-N halved to 128 unlocks 2 CTAs/SM at every size, and the
-        # short K keeps block-K one notch shallower than gate/up's.
-        (7168, 256, 8192, (40, 128, 64), 2, False),
-        (7168, 256, 16384, (72, 128, 64), 2, False),
-        (7168, 256, 32768, (96, 128, 64), 2, False),
-        (7168, 256, 65536, (96, 128, 64), 2, False),
-        (7168, 256, 131072, (128, 128, 64), 2, True),
+        # gate/up: the mid-size window's one-pass 512-wide tile covers the
+        # whole output per m-block; past it the 256 tile with stream-K.
+        (512, 7168, 8192, (32, 512, 64), 6, 1, False),
+        (512, 7168, 16384, (56, 512, 64), 6, 1, False),
+        (512, 7168, 32768, (104, 256, 64), 6, 1, True),
+        (512, 7168, 65536, (96, 256, 64), 6, 1, True),
+        (512, 7168, 131072, (128, 256, 64), 6, 1, True),
+        # down: 2 CTAs/SM at every size -- 256 wide in the mid-size window,
+        # block-N 128 beyond it; one-pass except the window's 56..72 rows.
+        (7168, 256, 8192, (32, 256, 64), 6, 2, False),
+        (7168, 256, 16384, (56, 256, 64), 4, 2, True),
+        (7168, 256, 32768, (96, 128, 64), 6, 2, False),
+        (7168, 256, 65536, (96, 128, 64), 6, 2, False),
+        # 6 stages would leave room for one CTA; 5 keeps two.
+        (7168, 256, 131072, (128, 128, 64), 5, 2, False),
     ],
 )
 def test_tp8_configs_at_benchmark_points(
@@ -726,6 +780,7 @@ def test_tp8_configs_at_benchmark_points(
     shape_k: int,
     routed_m: int,
     block_shape: tuple[int, int, int],
+    num_stages: int,
     num_ctas_per_sm: int,
     use_stream_k: bool,
 ) -> None:
@@ -747,6 +802,7 @@ def test_tp8_configs_at_benchmark_points(
     config = meta.kernel_config(routed_m)
     assert config.block_shape == block_shape
     assert config.warp_shape == (block_shape[0], 32, 64)
+    assert config.num_stages == num_stages
     assert config.num_ctas_per_sm == num_ctas_per_sm
     assert config.use_stream_k is use_stream_k
     # TP8 is a WGMMA profile, so the swap-AB decode schedule never applies.
@@ -754,23 +810,63 @@ def test_tp8_configs_at_benchmark_points(
 
 
 def test_tp8_down_never_drops_to_one_cta() -> None:
-    """Block-N 128 is what buys down its 2 CTAs/SM, so it must hold everywhere.
+    """down's short K needs 2 CTAs/SM at every size, so every row must fit two.
 
-    At block-N 256 the accumulator plus B-smem pin occupancy at 1 CTA/SM, which is
-    the regression this checks for across the sweep, not just the table's points.
+    Block-N 256 fits two CTAs only up to block-M 72 (the mid-size window);
+    past it block-N 128 is what keeps the second CTA.  The shared-memory check
+    covers the stage depth too, across the sweep and not just the table's
+    points.
     """
 
     from chord_kernels.operator import IndexedLayerMeta
     from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.tuning import (
+        _H200_SMEM_PER_SM,
+        _H200_SMEM_RESERVED_PER_CTA,
+        _indexed_smem_bytes,
+    )
 
     meta = IndexedLayerMeta(
         shape_n=7168, shape_k=256, num_experts=384,
         profile=_PROFILES["h200_tp8"],
     )
-    for routed_m in (1, 512, 8192, 32768, 65536, 131072, 262144):
+    for routed_m in (1, 512, 8192, 16384, 26148, 32768, 65536, 131072, 262144):
         config = meta.kernel_config(routed_m)
-        assert config.block_n == 128, routed_m
         assert config.num_ctas_per_sm == 2, routed_m
+        if config.block_n == 256:
+            assert config.block_m <= 72, routed_m
+        else:
+            assert config.block_n == 128, routed_m
+        per_cta = _indexed_smem_bytes(*config.block_shape, config.num_stages)
+        assert 2 * (per_cta + _H200_SMEM_RESERVED_PER_CTA) <= _H200_SMEM_PER_SM
+
+
+def test_stage_depth_never_costs_a_resident_cta() -> None:
+    """Every published H200 row fits its CTAs/SM in shared memory."""
+
+    from chord_kernels.operator import IndexedLayerMeta
+    from chord_kernels.operator.layer import _PROFILES, _indexed_tuning_rows
+    from chord_kernels.operator.tuning import (
+        _H200_SMEM_PER_SM,
+        _H200_SMEM_RESERVED_PER_CTA,
+        _indexed_smem_bytes,
+    )
+
+    for name, shapes, experts in (
+        ("h200_prefill_ep8", ((4096, 7168), (7168, 2048)), 48),
+        ("h200_tp8", ((512, 7168), (7168, 256)), 384),
+    ):
+        for shape_n, shape_k in shapes:
+            meta = IndexedLayerMeta(
+                shape_n=shape_n, shape_k=shape_k, num_experts=experts,
+                profile=_PROFILES[name],
+            )
+            for _, _, row in _indexed_tuning_rows(meta):
+                per_cta = _indexed_smem_bytes(*row["block_shape"], row["num_stages"])
+                resident = row["num_ctas_per_sm"] * (
+                    per_cta + _H200_SMEM_RESERVED_PER_CTA
+                )
+                assert resident <= _H200_SMEM_PER_SM, (name, shape_n, row)
 
 
 def test_prefill_block_m_is_deterministic() -> None:
@@ -786,11 +882,20 @@ def test_prefill_block_m_is_deterministic() -> None:
 @pytest.mark.parametrize(
     "shape_n,shape_k,routed_m,expected",
     [
-        # gate/up (deep K): stream-K helps at every prefill size.
-        (4096, 7168, 1024, True),
+        # gate/up (deep K): stream-K helps at every prefill size outside the
+        # mid-size window ...
+        (4096, 7168, 512, True),
+        (4096, 7168, 4096, True),
         (4096, 7168, 16384, True),
-        # down (mid K, 512 < K < 4096): stream-K only until routed_m hits the
-        # crossover, then the K-split is pure overhead.
+        # ... and inside it only when the 512-wide grid ends in a partial wave.
+        (4096, 7168, 1024, False),
+        (4096, 7168, 1280, True),
+        (4096, 7168, 2048, False),
+        # down (mid K, 512 < K < 4096): one-pass in the mid-size window, then
+        # stream-K only until routed_m hits the crossover.
+        (7168, 2048, 512, True),
+        (7168, 2048, 1024, False),
+        (7168, 2048, 2048, False),
         (7168, 2048, 4096, True),
         (7168, 2048, 5120, False),
         (7168, 2048, 16384, False),
@@ -799,11 +904,43 @@ def test_prefill_block_m_is_deterministic() -> None:
 def test_prefill_stream_k_gate(
     shape_n: int, shape_k: int, routed_m: int, expected: bool
 ) -> None:
-    """Prefill enables stream-K everywhere except large mid-K down shapes."""
+    """Prefill enables stream-K except the mid-size window and large mid-K down."""
 
     from chord_kernels.operator.layer import _h200_prefill_use_stream_k
 
-    assert _h200_prefill_use_stream_k(routed_m, shape_n, shape_k) == expected
+    assert _h200_prefill_use_stream_k(routed_m, 48, shape_n, shape_k) == expected
+
+
+@pytest.mark.parametrize(
+    "shape_n,shape_k,routed_m,block_m,num_ctas_per_sm",
+    [
+        # gate/up (deep K): 3 CTAs/SM at every decode size.
+        (4096, 7168, 160, 8, 3),
+        (4096, 7168, 400, 16, 3),
+        (4096, 7168, 800, 24, 3),
+        # down: the block-M 8 tile keeps the fourth CTA, larger tiles take 3.
+        (7168, 2048, 160, 8, 4),
+        (7168, 2048, 240, 8, 4),
+        (7168, 2048, 320, 16, 3),
+        (7168, 2048, 800, 24, 3),
+    ],
+)
+def test_h200_decode_ctas_per_sm(
+    shape_n: int, shape_k: int, routed_m: int, block_m: int, num_ctas_per_sm: int
+) -> None:
+    """H200 decode runs 3 CTAs/SM except down's block-M 8 swap-AB tile."""
+
+    from chord_kernels.operator import IndexedLayerMeta
+    from chord_kernels.operator.layer import _PROFILES
+
+    meta = IndexedLayerMeta(
+        shape_n=shape_n, shape_k=shape_k, num_experts=48,
+        profile=_PROFILES["h200_decode_ep8"],
+    )
+    config = meta.kernel_config(routed_m)
+    assert config.block_shape == (block_m, 256, 64)
+    assert config.swap_ab is True
+    assert config.num_ctas_per_sm == num_ctas_per_sm
 
 
 def test_decode_stream_k_policy() -> None:
@@ -845,21 +982,26 @@ def test_prefill_forces_two_ctas_in_block_m_window() -> None:
     """Prefill runs 2 CTAs/SM for the 40..80 block-M window at block_n=256.
 
     Doubling resident CTAs there hides the cp.async + dequant latency and is
-    ~11% faster on the down 1024/2048 tiles. Outside the window (small block_m at
-    block_n=128, or block_m > 80) it stays at 1 CTA/SM.
+    ~11% faster on the down 1024/2048 tiles.  The mid-size window's down tile
+    runs 2 CTAs/SM from block-M 32 for the same reason, while its gate/up
+    512-wide tile and everything else (small block_m at block_n=128, or
+    block_m > 80) stays at 1 CTA/SM.
     """
 
     from chord_kernels.operator import IndexedLayerMeta
     from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.tuning import _uses_mid_tiles
 
     profile = _PROFILES["h200_prefill_ep8"]
     for shape_n, shape_k in ((4096, 7168), (7168, 2048)):
         meta = IndexedLayerMeta(
             shape_n=shape_n, shape_k=shape_k, num_experts=48, profile=profile
         )
-        for routed_m in (512, 1024, 2048, 4096, 8192, 16384, 65536):
+        for routed_m in (512, 900, 1024, 2048, 3500, 4096, 8192, 16384, 65536):
             config = meta.kernel_config(routed_m)
             in_window = config.block_n == 256 and 40 <= config.block_m <= 80
+            if _uses_mid_tiles(routed_m, 48):
+                in_window = config.block_n == 256
             expected = 2 if in_window else 1
             assert config.num_ctas_per_sm == expected, (
                 f"n={shape_n} k={shape_k} routed_m={routed_m} "
