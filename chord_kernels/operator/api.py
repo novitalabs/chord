@@ -6,6 +6,7 @@ import functools
 
 import torch
 
+from chord_kernels.operator import cpp_jit
 from chord_kernels.operator.kernel.humming import HummingKernel
 from chord_kernels.operator.ops import launch_kernel
 from chord_kernels.operator.packing import (
@@ -131,6 +132,7 @@ class IndexedKernelConfig:
 
 
 def _compatible_block_n(shape_n: int) -> int:
+    # Ported, with IndexedKernelConfig.default, to csrc/indexed/select.cpp: change both.
     candidate = 1 << min(shape_n, 256).bit_length() - 1
     while candidate > 1 and shape_n % candidate:
         candidate //= 2
@@ -360,12 +362,18 @@ def w4a16_indexed(
             )
         if block_m <= 0 or block_m % 8:
             raise ValueError(f"block_m must be a positive multiple of 8, got {block_m}")
-        kernel_config = IndexedKernelConfig.default(
-            layout=layout,
-            block_m=block_m,
-            block_n=_compatible_block_n(shape_n),
-            swap_ab=swap_ab,
-        )
+        if layout == "mma" and cpp_jit.enabled(inputs.device):
+            # CHORD_CPP_JIT=1 on SM100 / SM103: the same default chosen in C++.
+            kernel_config = cpp_jit.default_config(
+                shape_n, shape_k, num_experts, block_m=block_m, swap_ab=swap_ab
+            )
+        else:
+            kernel_config = IndexedKernelConfig.default(
+                layout=layout,
+                block_m=block_m,
+                block_n=_compatible_block_n(shape_n),
+                swap_ab=swap_ab,
+            )
     else:
         if not isinstance(config, (IndexedKernelConfig, dict)):
             raise TypeError(
@@ -502,6 +510,22 @@ def w4a16_indexed(
         raise ValueError(f"config block-N={block_n} must divide shape_n={shape_n}")
 
     with torch.cuda.device(inputs.device):
+        if layout == "mma" and cpp_jit.enabled(inputs.device):
+            # CHORD_CPP_JIT=1 on SM100 / SM103: the C++ JIT (cpp_jit.py).
+            kernel_id = cpp_jit.get_indexed_kernel(
+                inputs.get_device(), shape_n, shape_k, num_experts, kernel_config
+            )
+            return cpp_jit.indexed_gemm(
+                kernel_id,
+                inputs,
+                packed_weight,
+                packed_scale,
+                sorted_ids,
+                expert_ids,
+                num_tokens_padded,
+                top_k,
+                outputs,
+            )
         kernel = _get_indexed_kernel(
             inputs.get_device(),
             shape_n,

@@ -179,6 +179,21 @@ CUDA launcher:
 - `csrc/launcher/torch_api.h`
 - `csrc/launcher/utils.h`
 
+C++ JIT for the indexed path on SM100 / SM103 (`CHORD_CPP_JIT=1`; chord
+code, no upstream counterpart).  `csrc/indexed/` regenerates the same kernel
+sources as `kernel/humming.py`, `config/mma.py` (MMA only) and
+`kernel/repack_weight.py`, and launches as `csrc/launcher/launcher.cpp` and
+`RepackWeightKernel` do:
+
+- `cpp_jit.py`
+- `csrc/jit/jit.h`, `csrc/jit/jit.cpp`
+- `csrc/indexed/humming.h`, `csrc/indexed/humming.cpp`
+- `csrc/indexed/repack.h`, `csrc/indexed/repack.cpp`
+- `csrc/indexed/select.h`, `csrc/indexed/select.cpp` (the per-call
+  configuration choice of `dispatch.py` / `tuning.py` / `api.py` for the
+  profiles that reach Blackwell)
+- `csrc/indexed/torch_ops.cpp`
+
 CUDA operator and repacking kernels:
 
 - `include/humming/arith/mainloop_arith.cuh`
