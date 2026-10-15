@@ -274,18 +274,13 @@ def _layout_candidates(desc: W4A16GemmDesc) -> list[W4A16Layout]:
         block_k = 128
         # BN rule: BN=256 amortizes int4 dequant when enough tiles exist to
         # fill the machine (wave-quantization guard); small tiles keep BN=128.
-        bm = block_m_candidates[0]
         n_tiles_256 = desc.exp_num_groups * _ceil_div(desc.n, 256)
         enough_2w = n_tiles_256 >= 2 * desc.num_sms
-        enough_3w = n_tiles_256 >= 3 * desc.num_sms
-        if desc.k >= 4096:
-            use_bn256 = enough_2w
-        elif bm < 32:
-            use_bn256 = enough_2w
-        elif bm < 72:
-            use_bn256 = enough_3w
-        else:
-            use_bn256 = False
+        # Both projections use the two-wave guard.  The short-K down
+        # projection used to require three waves in the mid-M range and drop
+        # to BN=128 from BM 72; on H200 BN=256 measures 5.7% faster at EP8
+        # em=64 and 7% at EP32 em=32, neutral at EP16.
+        use_bn256 = enough_2w
         block_n_candidates = [256] if use_bn256 else [128]
     else:
         block_k = 64

@@ -1,7 +1,11 @@
 # Operator source provenance
 
-- Public upstream: <https://github.com/inclusionAI/humming>
+- Public upstream: <https://github.com/inclusionAI/humming> (now
+  <https://github.com/vllm-project/humming>)
 - Public baseline: `4351af3a8fcdce1a8dee50104ba49566af2427fb`
+- Performance baseline: the tables in `docs/performance.md` compare against
+  upstream main `f35c5ffdf60c34abbaa9c44508c272c2832958e8` (2026-10-13); this
+  directory is still derived from the public baseline above
 - License: Apache-2.0 (see `LICENSE` in this directory)
 - Upstream NOTICE: none at the public baseline
 
@@ -67,7 +71,9 @@ Ported to Python/C++ (rewritten against the upstream sources, not copied):
   `csrc/jit_kernels/heuristics/sm90.hpp` (`SM90ArchSpec`): masked/contiguous
   BLOCK_M/N/K tables, stage targeting, the L1/L2 cycle model for the
   (cluster-1/2) layout candidate pick, and the environment override hooks
-  renamed `CHORD_W4A16_*`.
+  renamed `CHORD_W4A16_*`.  Modified: the masked BLOCK_N rule uses the
+  two-wave guard on both projections (upstream holds down to three waves in
+  its mid-M range and to BLOCK_N 128 from BLOCK_M 72).
 - `grouped/packing.py` — the closed-form `(row, nibble)` bit-permutation
   weight reorder from `tests/generators.py::reorder_w4a16` (excess-8
   pre-flip), checkpoint-unpacked and INT32-packed input forms, and the

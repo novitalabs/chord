@@ -1,10 +1,27 @@
 # Measured performance
 
-`humming` is the public Humming `indexed` path, `chord` is this repository's
-profile for that scenario; both are timed on the same GPU at the same shape and
-the same routing draw. Times are per-call microseconds, lower is better.
+`humming` is public Humming at
+[`vllm-project/humming@f35c5ff`](https://github.com/vllm-project/humming/commit/f35c5ffdf60c34abbaa9c44508c272c2832958e8)
+(main, 2026-10-13), timed with its own `benchmarks/bench_humming.py` (BF16
+activation, `uint4` weight, BF16 group-32 scale, the `indexed` path unless a
+section says otherwise); `chord` is this repository's profile for that
+scenario. Both are timed on the same GPU (one H200 SXM, one B300 SXM6) at the
+same shape and the same routing draw, each the mean of two runs (run-to-run
+spread under 2%); the H200 rows were re-measured on 2026-10-14 after the
+H200 retune described below, alternating the two implementations on one GPU.
+Times are per-call microseconds, lower is better.
 `gate_up + down` is the speedup of the two stages summed, which is what one MoE
-layer actually pays.
+layer actually pays. Humming main's output on these cases matches a PyTorch
+BF16 matmul on the dequantized weight (cos_diff ≤ 4e-7, 96.5-100%
+bit-identical), so its times are for a correct result.
+
+The baseline moved: this repository derives from the July revision
+`4351af3` (see `chord_kernels/operator/SOURCE.md`), and upstream has since
+retuned its Hopper and Blackwell schedules. Re-measured on the same GPUs, main
+is a median 14-15% faster than `4351af3` on the H200 indexed and B300 rows
+(up to 39% on TP8 down) but slower on some grouped rows (up to 13% on
+contiguous gate/up, 23% on one EP32 masked row); the speedups below are
+against main.
 
 The timing method is the upstream `triton.testing.do_bench` call, so rows are
 comparable one-to-one with Humming's published tables; the methods, the
@@ -13,66 +30,91 @@ comparable one-to-one with Humming's published tables; the methods, the
 tables; after re-measuring, update the copies in
 `docs/assets/benchmark_chart.py` and re-run that script.
 
+On H200 this profile now leads main on every layer except two near-ties:
+EP8 prefill at 8192 tokens (0.99x per layer) and grouped masked decode at 8
+tokens per expert (0.95x).  The indexed rows are 0.97-1.25x per stage and
+0.99-1.14x per layer.  The retune (see [tuning.md](tuning.md)) adds a
+mid-size window of one-pass wide tiles, deeper cp.async rings on the large
+tiles, 3 CTAs/SM on decode, and a wider BLOCK_N rule for masked down.
+
 ## H200 EP8 prefill (`h200_prefill_ep8`)
 
 | Stage | num_tokens_total | humming µs | humming TFLOPS | chord µs | chord TFLOPS | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 1024 | 375.0 | 160.36 | 313.5 | 192 | 1.20 | 1.20 |
-| gate_up | 2048 | 466.3 | 257.92 | 383.4 | 314 | 1.22 | 1.19 |
-| gate_up | 4096 | 608.4 | 395.34 | 545.8 | 441 | 1.11 | 1.13 |
-| gate_up | 8196 | 1085.7 | 443.08 | 997.7 | 482 | 1.09 | 1.11 |
-| gate_up | 16384 | 1903.0 | 505.55 | 1743.1 | 552 | 1.09 | 1.11 |
-| down | 1024 | 195.9 | 153.43 | 162.9 | 185 | 1.20 | |
-| down | 2048 | 235.1 | 255.81 | 204.5 | 294 | 1.15 | |
-| down | 4096 | 337.4 | 356.40 | 293.2 | 410 | 1.15 | |
-| down | 8196 | 606.4 | 396.64 | 533.4 | 451 | 1.14 | |
-| down | 16384 | 1059.4 | 454.07 | 937.3 | 513 | 1.13 | |
+| gate_up | 1024 | 334.9 | 179.52 | 297.4 | 202 | 1.13 | 1.12 |
+| gate_up | 2048 | 385.4 | 312.08 | 367.4 | 327 | 1.05 | 1.05 |
+| gate_up | 4096 | 569.5 | 422.33 | 546.9 | 440 | 1.04 | 1.03 |
+| gate_up | 8192 | 999.5 | 481.29 | 1001.1 | 481 | 1.00 | 0.99 |
+| gate_up | 16384 | 1952.7 | 492.70 | 1692.5 | 568 | 1.15 | 1.11 |
+| down | 1024 | 169.1 | 177.84 | 154.1 | 195 | 1.10 |  |
+| down | 2048 | 207.1 | 290.37 | 196.1 | 307 | 1.06 |  |
+| down | 4096 | 296.8 | 405.14 | 293.9 | 409 | 1.01 |  |
+| down | 8192 | 524.1 | 458.91 | 541.0 | 445 | 0.97 |  |
+| down | 16384 | 1003.4 | 479.42 | 959.0 | 502 | 1.05 |  |
+
+At 8192 tokens (`tok_e` 171), main's TMA-loaded, warp-specialized
+`96x256x64` one-pass tile is 3% faster on down and level on gate/up.  Main
+issues the weight and activation tiles from a dedicated producer warpgroup,
+which the indexed cp.async path here does not have.  The same `96x256x64`
+tile with or without stream-K at 4-6 stages does not close the gap.  A
+`176x256x64` stream-K tile is 2-4% faster at this exact routing draw, but
+3-28% slower at neighbouring chunk sizes (`tok_e` 176-213), so the table
+does not use it.
 
 ## H200 TP8, single-instance mix (`h200_tp8`)
 
 | Stage | num_tokens_total | humming µs | humming TFLOPS | chord µs | chord TFLOPS | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 1024 | 399.0 | 150.69 | 365.5 | 165 | 1.09 | 1.17 |
-| gate_up | 2048 | 476.4 | 252.45 | 414.6 | 290 | 1.15 | 1.22 |
-| gate_up | 4096 | 655.0 | 367.21 | 567.9 | 424 | 1.15 | 1.21 |
-| gate_up | 8196 | 1206.2 | 398.81 | 1014.5 | 474 | 1.19 | 1.33 |
-| gate_up | 16384 | 2066.1 | 465.65 | 1842.7 | 522 | 1.12 | 1.19 |
-| down | 1024 | 336.2 | 89.43 | 265.3 | 113 | 1.27 | |
-| down | 2048 | 429.6 | 139.98 | 327.1 | 184 | 1.31 | |
-| down | 4096 | 604.6 | 198.90 | 469.8 | 256 | 1.29 | |
-| down | 8196 | 1277.2 | 188.32 | 847.8 | 284 | 1.51 | |
-| down | 16384 | 2187.7 | 219.89 | 1723.5 | 279 | 1.27 | |
+| gate_up | 1024 | 340.4 | 176.66 | 300.5 | 200 | 1.13 | 1.10 |
+| gate_up | 2048 | 395.2 | 304.32 | 378.5 | 318 | 1.04 | 1.04 |
+| gate_up | 4096 | 594.3 | 404.68 | 566.9 | 424 | 1.05 | 1.14 |
+| gate_up | 8192 | 1029.3 | 467.34 | 1040.3 | 462 | 0.99 | 1.05 |
+| gate_up | 16384 | 2019.6 | 476.37 | 1820.7 | 528 | 1.11 | 1.13 |
+| down | 1024 | 207.5 | 144.88 | 197.7 | 152 | 1.05 |  |
+| down | 2048 | 309.9 | 194.02 | 298.1 | 202 | 1.04 |  |
+| down | 4096 | 597.8 | 201.16 | 476.7 | 252 | 1.25 |  |
+| down | 8192 | 955.5 | 251.73 | 853.7 | 282 | 1.12 |  |
+| down | 16384 | 1840.9 | 261.30 | 1591.4 | 302 | 1.16 |  |
+
+This profile leads main by 1.04-1.14x per layer across the sweep.  Main
+retuned TP8 after the July baseline, and its TMA-loaded, warp-specialized
+one-pass tiles led the previous TP8 table below 4096 tokens (0.85-0.90x per
+layer).  The mid-size chunks (`tok_e` ~20..70, 1024-3200 tokens here) now
+run one-pass wide tiles instead of narrow stream-K ones: gate/up a single
+`32|56x512x64` tile that covers the whole `N=512` output per m-block, down
+`32|56x256x64` at 2 CTAs/SM.  With a deeper cp.async ring on the large
+tiles, the retune measures 1.30x and 1.16x per layer over the previous TP8
+tiles at 1024 and 2048 tokens and 1.02-1.04x from 4096 up, interleaved on
+the same GPU.  Gate/up at 8192 tokens is the one stage still level with
+main (0.99x).
 
 ### Stream-K reduction on H200
 
 The prefill and TP8 stream-K rows reduce their K-split partials in an FP32
-workspace and round once, like the B300 rows below.  The tables above were
-measured with the inherited BF16 reduction on another H200.  This table times
-both reductions back to back on one H200 SXM with the same cases and tiles
-(triton `do_bench`), and checks bit-identity against a PyTorch BF16 matmul on
-the BF16-dequantized INT4 weight (first 4096 routed rows):
+workspace and round once, like the B300 rows below; the chord columns above
+include it.  This table times both reductions back to back on one H200 SXM
+with the same cases and tiles (triton `do_bench`), and checks bit-identity
+against a PyTorch BF16 matmul on the BF16-dequantized INT4 weight (first 4096
+routed rows):
 
 | profile | stage | num_tokens_total | tile | BF16 µs | FP32 µs | Δ | bit-identical, BF16 / FP32 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| prefill | gate_up | 1024 | 40x256x64, 2 CTAs | 321.5 | 323.1 | +0.5% | 88.6% / 99.76% |
-| prefill | gate_up | 2048 | 64x256x64, 2 CTAs | 390.6 | 394.0 | +0.9% | 88.5% / 99.76% |
-| prefill | gate_up | 4096 | 96x256x64 | 552.3 | 554.4 | +0.4% | 97.3% / 99.86% |
-| prefill | gate_up | 8192 | 96x256x64 | 1012.9 | 1012.7 | -0.0% | 97.6% / 99.86% |
-| prefill | gate_up | 16384 | 176x256x64 | 1775.4 | 1746.9 | -1.6% | 97.3% / 99.91% |
-| prefill | down | 1024 | 40x256x64, 2 CTAs | 164.6 | 167.2 | +1.6% | 93.5% / 99.99% |
-| prefill | down | 2048 | 64x256x64, 2 CTAs | 207.7 | 208.9 | +0.6% | 93.1% / 99.99% |
-| prefill | down | 4096 | 96x256x64 | 297.1 | 293.6 | -1.2% | 96.7% / 100.00% |
-| TP8 | gate_up | 1024 | 40x128x128 | 385.0 | 388.1 | +0.8% | 97.8% / 99.84% |
-| TP8 | gate_up | 2048 | 72x256x64 | 434.5 | 446.3 | +2.7% | 94.3% / 99.71% |
-| TP8 | gate_up | 4096 | 96x256x64 | 594.2 | 594.4 | +0.0% | 96.1% / 99.71% |
-| TP8 | down | 16384 | 128x128x64, 2 CTAs | 1774.1 | 1634.8 | -7.9% | 100.0% / 100.0% |
+| prefill | gate_up | 4096 | 96x256x64, 6 stages | 544.5 | 545.9 | +0.2% | 97.3% / 99.86% |
+| prefill | gate_up | 8192 | 96x256x64, 6 stages | 994.3 | 998.7 | +0.4% | 97.6% / 99.86% |
+| prefill | gate_up | 16384 | 176x256x64, 6 stages | 1725.3 | 1698.5 | -1.6% | 97.3% / 99.91% |
+| prefill | down | 4096 | 96x256x64, 6 stages | 300.0 | 293.5 | -2.2% | 96.7% / 99.99% |
+| TP8 | gate_up | 4096 | 104x256x64, 6 stages | 568.0 | 568.3 | +0.1% | 94.2% / 99.71% |
+| TP8 | gate_up | 8192 | 96x256x64, 6 stages | 1040.0 | 1042.8 | +0.3% | 96.9% / 99.70% |
+| TP8 | gate_up | 16384 | 128x256x64, 6 stages | 1819.1 | 1828.0 | +0.5% | 98.4% / 99.70% |
+| TP8 | down | 2048 | 56x256x64, 2 CTAs | 305.1 | 298.2 | -2.3% | 99.4% / 100.00% |
 
-Rows without stream-K (prefill down from 8192, TP8 gate/up from 8192, TP8
-down below 16384) are unchanged.  Over the twelve stream-K rows the FP32
-reduction ranges from 7.9% faster to 2.7% slower (two rows repeated five
-times: TP8 gate/up 2048 +2.7%, prefill down 1024 +1.6%; the rest are within
-noise).  With BF16 reduction the prefill gate/up 4096 output also differed
-between launches.
+The other rows are one-pass: the mid-size chunks (1024 and 2048 tokens on
+prefill and TP8 gate/up, 1024 on TP8 down) run wide tiles that fill the grid
+without a K split, and prefill down from 8192 and TP8 down past 2048 are
+one-pass as before.  Over the eight stream-K rows the FP32 reduction ranges
+from 2.3% faster to 0.5% slower.  With BF16 reduction the prefill gate/up
+4096 output also differed between launches; with FP32 every row is
+deterministic.
 
 ## H200 EP8 decode (`h200_decode_ep8`)
 
@@ -80,29 +122,32 @@ Tokens per GPU is `bs * (mtp + 1)`.
 
 | Stage | tokens/GPU | humming µs | humming GB/s | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 20 | 267.6 | 2845.08 | 221.9 | 3431 | 1.21 | 1.24 |
-| gate_up | 30 | 281.3 | 2826.64 | 245.6 | 3237 | 1.15 | 1.20 |
-| gate_up | 40 | 284.0 | 2802.95 | 253.7 | 3137 | 1.12 | 1.16 |
-| gate_up | 50 | 296.4 | 2687.97 | 259.9 | 3066 | 1.14 | 1.17 |
-| down | 20 | 146.2 | 2618.17 | 111.9 | 3421 | 1.31 | |
-| down | 30 | 152.2 | 2633.29 | 116.8 | 3432 | 1.30 | |
-| down | 40 | 153.3 | 2624.30 | 123.0 | 3271 | 1.25 | |
-| down | 50 | 156.3 | 2582.34 | 126.4 | 3195 | 1.24 | |
+| gate_up | 20 | 226.3 | 3364.14 | 210.3 | 3620 | 1.08 | 1.06 |
+| gate_up | 30 | 257.8 | 3084.34 | 239.3 | 3323 | 1.08 | 1.09 |
+| gate_up | 40 | 253.4 | 3140.91 | 240.0 | 3316 | 1.06 | 1.07 |
+| gate_up | 50 | 255.2 | 3121.97 | 248.0 | 3213 | 1.03 | 1.04 |
+| down | 20 | 116.5 | 3287.25 | 112.5 | 3404 | 1.04 |  |
+| down | 30 | 131.9 | 3039.01 | 118.5 | 3381 | 1.11 |  |
+| down | 40 | 134.8 | 2984.07 | 123.2 | 3264 | 1.09 |  |
+| down | 50 | 135.1 | 2987.56 | 127.5 | 3167 | 1.06 |  |
+
+Gate/up runs 3 CTAs/SM rather than 4 (5-8% faster on the same GPU; down's
+block-M 8 rows keep 4).
 
 ## B300 EP8 decode (`blackwell_decode_ep8`)
 
 | Stage | tokens/GPU | humming µs | humming GB/s | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 20 | 319.1 | 2385.78 | 147.5 | 5160 | 2.16 | 2.14 |
-| gate_up | 30 | 320.4 | 2481.51 | 166.3 | 4780 | 1.93 | 1.94 |
-| gate_up | 40 | 320.6 | 2482.68 | 181.4 | 4388 | 1.77 | 1.84 |
-| gate_up | 50 | 320.9 | 2482.44 | 190.2 | 4190 | 1.69 | 1.76 |
-| down | 20 | 174.8 | 2190.34 | 83.8 | 4569 | 2.09 | |
-| down | 30 | 181.3 | 2211.10 | 91.9 | 4361 | 1.97 | |
-| down | 40 | 181.4 | 2217.48 | 92.0 | 4374 | 1.97 | |
-| down | 50 | 181.7 | 2221.51 | 95.2 | 4241 | 1.91 | |
+| gate_up | 20 | 179.1 | 4251.67 | 147.2 | 5172 | 1.22 | 1.25 |
+| gate_up | 30 | 191.4 | 4153.30 | 165.7 | 4800 | 1.16 | 1.19 |
+| gate_up | 40 | 192.5 | 4134.89 | 180.1 | 4422 | 1.07 | 1.13 |
+| gate_up | 50 | 192.9 | 4129.49 | 188.9 | 4218 | 1.02 | 1.08 |
+| down | 20 | 110.1 | 3476.92 | 83.7 | 4578 | 1.32 |  |
+| down | 30 | 113.9 | 3517.71 | 91.8 | 4366 | 1.24 |  |
+| down | 40 | 114.2 | 3523.22 | 91.8 | 4377 | 1.24 |  |
+| down | 50 | 114.3 | 3532.76 | 94.8 | 4260 | 1.21 |  |
 
-The gate/up rows split K with stream-K and now reduce the partials in an FP32
+The gate/up rows split K with stream-K and reduce the partials in an FP32
 workspace (one BF16 rounding, deterministic; see
 [optimizations.md](optimizations.md)).  The
 inherited reduction added BF16 partials into the output instead.  Against it,
@@ -120,13 +165,15 @@ Bit-identity is against a PyTorch BF16 matmul on the BF16-dequantized INT4
 weight; the down rows are 100% bit-identical either way.  With BF16 reduction
 the 20 and 30 tokens/GPU outputs also differ between launches.
 
-The Blackwell speedups are larger than the H200 ones mostly because of the
-baseline, not because the Blackwell schedule is better tuned than the Hopper
-one. Public Humming ships only its default config strategy on SM100/SM103, so
-its B300 numbers are an untuned reference point — note how its time barely
-moves from 20 to 50 tokens per GPU, and how it reads roughly the same GB/s on
-B300 as on H200 despite the wider memory system. Read the H200 ratios as the
-honest tuned-to-tuned comparison.
+The Blackwell gap has narrowed. The July baseline shipped only its default
+config strategy on SM100/SM103 (one-CTA `16x256x128` tiles); re-measured
+alongside main on the same B300 it is 1.26-1.48x per layer behind this
+profile.  The 1.76-2.14x previously on this page rested on July numbers this
+setup no longer reproduces (gate/up 319 us then, 215 us now for the same
+revision; the H200 July indexed rows still reproduce within -2..+5%).  Main now has SM100
+heuristics (`16x128x128` at 2 CTAs/SM, stream-K on both projections, gate/up
+read at 4.1-4.3 TB/s), which leaves this profile 1.08-1.25x ahead, mostly on
+down and on the small-token gate/up rows.
 
 ## H200 EP8 grouped prefill (`h200_grouped_prefill`, contiguous)
 
@@ -140,12 +187,12 @@ experts (EP8); `rows/E` x 48 is the total routed rows.
 
 | Stage | rows/E | humming µs | chord µs | chord TFLOPS | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 128 | 777.2 | 607.1 | 594 | 1.28 | 1.31 |
-| gate_up | 256 | 1393.2 | 1186.9 | 608 | 1.17 | 1.20 |
-| gate_up | 512 | 2265.0 | 2318.2 | 623 | 0.98 | 1.00 |
-| down | 128 | 426.8 | 310.4 | 581 | 1.38 | |
-| down | 256 | 751.3 | 604.4 | 597 | 1.24 | |
-| down | 512 | 1261.7 | 1196.1 | 603 | 1.05 | |
+| gate_up | 128 | 865.5 | 635.6 | 566 | 1.36 | 1.35 |
+| gate_up | 256 | 1432.3 | 1231.6 | 586 | 1.16 | 1.16 |
+| gate_up | 512 | 2781.2 | 2402.7 | 600 | 1.16 | 1.16 |
+| down | 128 | 427.9 | 325.2 | 552 | 1.32 |  |
+| down | 256 | 731.4 | 628.0 | 574 | 1.16 |  |
+| down | 512 | 1441.6 | 1234.0 | 584 | 1.17 |  |
 
 ## H200 EP8 grouped decode (`h200_grouped_decode`, masked)
 
@@ -154,15 +201,24 @@ row is the one that matches the decode counts in [shapes.md](shapes.md).
 
 | Stage | tokens/E | humming µs | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 8 | 308.8 | 248.8 | 3220 | 1.24 | 1.25 |
-| gate_up | 16 | 329.7 | 266.5 | 3041 | 1.24 | 1.25 |
-| gate_up | 32 | 452.3 | 329.2 | 2516 | 1.37 | 1.35 |
-| gate_up | 64 | 508.0 | 435.2 | 1986 | 1.17 | 1.16 |
-| down | 8 | 166.5 | 132.5 | 3043 | 1.26 | |
-| down | 16 | 176.2 | 138.7 | 2961 | 1.27 | |
-| down | 32 | 214.0 | 164.2 | 2592 | 1.30 | |
-| down | 64 | 269.5 | 233.0 | 1953 | 1.16 | |
+| gate_up | 8 | 253.1 | 268.1 | 2983 | 0.94 | 0.95 |
+| gate_up | 16 | 341.5 | 286.6 | 2828 | 1.19 | 1.18 |
+| gate_up | 32 | 375.3 | 356.9 | 2322 | 1.05 | 1.06 |
+| gate_up | 64 | 468.4 | 455.1 | 1896 | 1.03 | 1.03 |
+| down | 8 | 132.0 | 138.2 | 2913 | 0.95 |  |
+| down | 16 | 170.7 | 147.5 | 2787 | 1.16 |  |
+| down | 32 | 191.1 | 175.4 | 2424 | 1.09 |  |
+| down | 64 | 242.1 | 233.6 | 1948 | 1.04 |  |
 
 EP16 (24 experts) and EP32 (12 experts) run the same tables; the grouped
-profiles are EP-width agnostic and measure 1.18-1.34x and 1.13-1.30x per layer
-over the same baseline.
+profiles are EP-width agnostic and measure 1.04-1.21x and 1.04-1.31x per layer
+over the same baseline (contiguous at 24 experts: 1.16-1.40x).  Down now keeps
+BLOCK_N 256 wherever the two-wave guard allows (5.5% faster at 64 tokens per
+expert on 48 experts, 8% at 32 on 12).
+
+At 8 tokens per expert on 48 experts main's masked path is still 5% faster.
+That row runs the heuristic's `16x256x128` layout at 4 stages, and none of
+the 91 other layouts swept through `CHORD_W4A16_BM/BN/BK/CM/CN/STAGES` on
+either projection beats it by more than noise.  BM 8 is 22-91% slower,
+BM 24/32 7-120%, BN 64/128 1-70%, other stage depths -0.4% to +6.5%, and
+2-CTA clusters 1-2%.  The gap is in the kernel, not the layout choice.

@@ -258,11 +258,14 @@ def _expected_masked_config(num_sms: int = 132):
         (7168, 16, 4096, 24): (24, 256, 128, 4),
         (2048, 16, 7168, 12): (24, 256, 128, 4),
         (7168, 64, 4096, 48): (88, 256, 128, 4),
-        (2048, 64, 7168, 48): (80, 128, 128, 6),
+        # down keeps BN=256 at bm>=72 too: the two-wave guard is the only BN
+        # rule, on both projections.
+        (2048, 64, 7168, 48): (80, 256, 128, 4),
+        (2048, 64, 7168, 24): (80, 256, 128, 4),
+        (2048, 32, 7168, 12): (40, 256, 128, 4),
         # EP8 (G=48), the width docs/shapes.md derives.  Its N-tile count is
-        # past the 3-wave mark at both projections, so BN=256 survives every
-        # bracket except the bm>=72 cutoff that sends down/em=64 to BN=128
-        # above -- i.e. EP8 exercises the wave guard's saturated side, while
+        # past the 2-wave mark at both projections, so BN=256 holds in every
+        # bracket -- EP8 exercises the wave guard's saturated side, while
         # EP32 (G=12, gate_up) is the only width that falls under 2 waves.
         (7168, 8, 4096, 48): (16, 256, 128, 4),
         (7168, 32, 4096, 48): (48, 256, 128, 4),

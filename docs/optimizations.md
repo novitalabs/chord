@@ -1,12 +1,17 @@
 # Optimizations relative to the public Humming baseline
 
 This repository's indexed W4A16 operator derives from the public
-[inclusionAI/humming](https://github.com/inclusionAI/humming) revision
+[vllm-project/humming](https://github.com/vllm-project/humming) (formerly
+`inclusionAI/humming`) revision
 `4351af3a8fcdce1a8dee50104ba49566af2427fb`. On top of that baseline it carries a
 set of kernel and scheduling optimizations for the three supported scenarios.
 This page records what changed and why; the mechanics live in
 [tuning.md](tuning.md) and the resolver tables in
-`chord_kernels/operator/layer.py`.
+`chord_kernels/operator/layer.py`. "The baseline" below is that July revision,
+and the per-change measurements are against it. Upstream has moved since: the
+tables in [performance.md](performance.md) compare against Humming main
+(`f35c5ff`, 2026-10-13), which retuned the Hopper and Blackwell schedules and
+closed part of the gap.
 
 Measurements below are BF16 activation x INT4 weight, group-32 scale, indexed
 MoE routing, on the Kimi K2.5 shapes for the relevant shard axis: EP8 splits the
@@ -20,8 +25,8 @@ each supported part.
 | --- | --- | --- |
 | H200 EP8 indexed prefill | WGMMA, per-instruction commit+wait, generic block-M argmin, stream-K always on | WGMMA with batched `wait<1>` pipelining, tok/E block-M model, 2-CTAs/SM window, shape-aware stream-K gate, EP8-tuned tiles |
 | H200 TP8 indexed, single-instance mix | WGMMA, generic block-M argmin, stream-K always on | Same WGMMA improvements, plus the TP-scale block-M windows, down's block-N halving for 2 CTAs/SM, and per-projection stream-K crossovers |
-| H200 EP8 indexed decode | WGMMA (no decode-specific path) | MMA `swap-AB` decode kernel: 4 CTAs/SM, semi-static token-tile schedule, fused dequant+scale |
-| Blackwell (B200/B300) EP8 indexed decode | Default config strategy only (no SM100 heuristics) | Same MMA `swap-AB` kernel with EP8-tuned tile tables (stream-K on deep-K gate/up), `sm_100a`/`sm_103a` JIT targets |
+| H200 EP8 indexed decode | WGMMA (no decode-specific path) | MMA `swap-AB` decode kernel: 3-4 CTAs/SM, semi-static token-tile schedule, fused dequant+scale |
+| Blackwell (B200/B300) EP8 indexed decode | Default config strategy only (no SM100 heuristics; main has added them since) | Same MMA `swap-AB` kernel with EP8-tuned tile tables (stream-K on deep-K gate/up), `sm_100a`/`sm_103a` JIT targets |
 | H200 grouped prefill (`contiguous`) | Humming's own grouped kernel, generic per-`shape_m` config | DeepGEMM-derived kernel: INT4 bit-permuted weight at BLOCK_K=64, MN-major scale, BM128/BK64 tile |
 | H200 grouped decode (`masked`) | Humming's own grouped kernel, generic per-`shape_m` config | Same kernel at BLOCK_K=128, K-gated BLOCK_M covering the routed tail, wave-aware BLOCK_N, buffered-K stage depth |
 
@@ -55,14 +60,16 @@ warps, hiding the cp.async-gather + dequant latency: measured +5..14% on down
 and +3..13% on gate/up in that window. Outside the window it regresses and
 stays at 1 CTA/SM.
 
-**FP32 stream-K reduction.** The baseline (and current upstream Humming)
+**FP32 stream-K reduction.** The baseline (and current upstream Humming main)
 adds each slice's BF16-rounded partial into the output.  The prefill and TP8
 stream-K rows now reduce in an FP32 workspace and round once, the same
 reduction the Blackwell rows use; the WGMMA epilogue fences the accumulator
 registers after `wgmma.wait_group` so the reduction never reads an in-flight
-accumulator.  It raises bit-identity with a PyTorch BF16 matmul from 88-98% to
-99.7-100% and costs between -7.9% and +2.7% per row
-([performance.md](performance.md)).
+accumulator.  It raises bit-identity with a PyTorch BF16 matmul from 94-99% to
+99.7-100% and costs between -2.3% and +0.5% per row on the current tiles
+([performance.md](performance.md)).  The partials live in per-launch scratch
+from the PyTorch caching allocator, and the lock words in a buffer the layer
+owns, the ownership upstream uses for its own locks and launch scratch.
 
 **Shape-aware stream-K gate.** The baseline enables stream-K unconditionally.
 For the mid-K down projection (512 < K < 4096) at `routed_m >= 5120` the M*N
@@ -75,6 +82,20 @@ gate/up keeps the narrow-deep `128x256` tile, the wide down projection uses
 `256x128`. For gate/up block-M 40..64 the wide `256x64` tile plus the 2-CTA
 window replaces the baseline `128x128` choice, measured 12-15% faster at
 routed 863..2073.
+
+**Mid-size window and stage depth (retune against Humming main).**
+Main's TMA-loaded one-pass tiles led the 2048 and 8192-token prefill rows
+(0.98x per layer). For `tok_e` ~20..70 (routed_m 980..3370 at 48 experts),
+block-M now comes from a row-work model, the per-expert padded rows plus a
+32-row per-block cost over the same sampled routing. Those chunks run
+one-pass wide tiles: gate/up `block_m x 512 x 64` (stream-K only when the
+grid ends in a partial wave), down `block_m x 256 x 64` at 2 CTAs/SM. The
+1-CTA tiles from `tok_e` 80 run a 6-stage cp.async ring wherever they split
+K or are deep-K. Interleaved on one H200 against the previous tiles, this
+measures 1.10x and 1.07x per layer at 1024 and 2048 tokens and 1.01-1.02x
+from 4096 up ([tuning.md](tuning.md)). Against main, prefill now measures
+1.03-1.12x per layer except 8192 tokens, where main's TMA-fed
+`96x256x64` leads down by 3% (0.99x per layer).
 
 ## H200 TP8 indexed, single-instance mix (`h200_tp8`, WGMMA)
 
@@ -105,10 +126,27 @@ fill the grid on their own and then drops it, while short-K down starts one-pass
 65536, where the workload is imbalanced enough for load balancing to repay the
 locks.
 
-Against the public baseline this measures 1.09-1.19x on gate/up and 1.27-1.51x on
-down, for 1.17-1.33x per layer ([performance.md](performance.md)); the block-N
-halving is why down gains most. The table also replaces the generic fallback these
-shapes previously landed on.
+Against the July baseline this measured 1.04-1.13x on gate/up and 1.23-1.46x on
+down, for 1.14-1.28x per layer, re-measured on one H200 alongside Humming main
+(`f35c5ff`); the block-N halving is why down gains most. The table also
+replaces the generic fallback these shapes previously landed on.
+
+**Retune against Humming main.** Main then retuned TP8 itself and led
+below 4096 tokens (0.85-0.90x per layer). Three table changes, shared with
+EP8 prefill and described in [tuning.md](tuning.md), take that back:
+
+- A mid-size window (`tok_e` ~20..70) of one-pass wide tiles sized by a
+  row-work model: gate/up `block_m x 512 x 64` covers its whole `N=512`
+  output in one m-block, and down runs `256x64` at 2 CTAs/SM.
+- A 6-stage cp.async ring (5 where 6 would cost a resident CTA) on the
+  large tiles.
+- Stream-K on gate/up at every size outside that window, and on down only
+  inside it at block-M 56..72.
+
+Interleaved on one H200 against the previous tiles, this measures 1.30x
+and 1.16x per layer at 1024 and 2048 tokens and 1.02-1.04x from 4096 up.
+TP8 now leads main by 1.04-1.14x per layer across the sweep
+([performance.md](performance.md)).
 
 ## H200 EP8 indexed decode (`h200_decode_ep8`, MMA swap-AB)
 
@@ -126,7 +164,11 @@ illegal `m8n8k8` BF16 instruction. The activation tile is read straight into
 the B-fragment with non-transposing `ldmatrix.x2` over the same shared-memory
 swizzle the cp.async writer produced. The packed weight is the same one the
 WGMMA prefill kernel reads (see *P/D role selection* below). Measured vs the WGMMA
-baseline at decode token counts: down 1.10-1.34x, gate/up 1.05-1.24x.
+baseline at decode token counts: down 1.10-1.34x, gate/up 1.05-1.24x (the whole
+decode profile, re-measured against the July baseline alongside Humming main:
+down 1.24-1.31x, gate/up 1.12-1.20x). Main has since moved its own decode to
+2-CTA `8|16x256x128` WGMMA tiles; with 3 CTAs/SM this profile measures
+1.03-1.08x on gate/up and 1.04-1.11x on down against it.
 
 **Semi-static token-tile schedule.** Each m-block counts its populated 8-token
 tiles (tokens are front-packed per expert; a tile is padding iff its first
@@ -148,7 +190,9 @@ coherently over K.
 
 **Decode block-M table.** `tok_e`-calibrated: block-M 8 for `tok_e <= 6`, 16
 to 13, else 24, with tile `(block_m, 256, 64)`, warp `(block_m, 64, 64)`,
-4 CTAs/SM, one-pass (no stream-K).
+one-pass (no stream-K). The tiles run 3 CTAs/SM, except down's block-M 8
+tile, which keeps 4. On gate/up 3 CTAs/SM is 5-8% faster than 4 at
+20-50 tokens per GPU; on down it is level to 1% faster.
 
 **P/D role selection.** `CHORD_SM90_DECODE=1` selects the decode profile for
 `profile="auto"` on SM90; unset/0 selects prefill. On the indexed backend the
@@ -160,8 +204,9 @@ See [getting_started.md](getting_started.md).
 
 ## Blackwell EP8 indexed decode (`blackwell_decode_ep8`)
 
-The public baseline has no SM100 heuristics and ships only its default config
-strategy there. This repository runs the same MMA swap-AB decode kernel — `mma.sync`
+The July baseline had no SM100 heuristics and shipped only its default config
+strategy there (Humming main has since added them; see
+[performance.md](performance.md)). This repository runs the same MMA swap-AB decode kernel — `mma.sync`
 `m16n8k16` is native on SM100/SM103; no tcgen05 path is required for these
 token counts. SM100 and SM103 share one tile table, tuned on B300 (148 SMs):
 
@@ -188,13 +233,13 @@ token counts. SM100 and SM103 share one tile table, tuned on B300 (148 SMs):
   capability; cubins are not shared across the two.
 
 On B300 the decode sweep (`tests/test_w4a16_indexed.py`, triton `do_bench`) measures
-gate/up 148/166/181/190 us and down 84/92/92/95 us at 20/30/40/50 tokens per
+gate/up 147/166/180/189 us and down 84/92/92/95 us at 20/30/40/50 tokens per
 GPU.
 
 The stream-K reduction inherited from Humming adds each slice's BF16-rounded
 partial into the output (`__hadd2`, or BF16 `atomicAdd` past three slices),
 so split gate/up tiles take extra BF16 roundings and, past three slices,
-launch-dependent results.  Every stream-K row now reduces in an FP32
+launch-dependent results.  Every stream-K row reduces in an FP32
 workspace instead and rounds once (`IndexedKernelConfig.stream_k_fp32`, the
 default).  On the INT4 decode cases it costs 0.6-2.4% on gate/up and raises
 bit-identity with a PyTorch BF16 matmul from 86-90% to 99.8% (table in
@@ -230,8 +275,8 @@ weight buffer and in how the launch schedule is chosen:
 
 On top of the upstream DeepGEMM W4A16 work this repository carries the SM90
 tuning from `novitalabs/DeepGEMM-int`, which is where the grouped heuristics in
-`chord_kernels/operator/grouped/heuristics.py` come from. Ported verbatim,
-including:
+`chord_kernels/operator/grouped/heuristics.py` come from. Ported verbatim
+except the masked BLOCK_N rule noted below, including:
 
 - **Contiguous: BM128 paired with BK64.** The larger WGMMA amortizes the
   int4-to-BF16 dequant and scale promotion over more work, while BK64 keeps
@@ -248,10 +293,12 @@ including:
 - **Masked: wave-aware BLOCK_N.** BN=256 amortizes dequant over twice the
   weight-N work and gives two independent WGMMA accumulator chains per
   warpgroup, but halves the tile count. It is selected only when the N-tile
-  count still fills the machine — `G x ceil(N/256) >= 2 x num_sms` on gate/up,
-  a conservative `3 x num_sms` on down's mid-M range, and never once BLOCK_M
-  reaches 72. EP32 gate/up is the one published width that falls under the
-  two-wave line and stays at BN=128.
+  count still fills the machine, `G x ceil(N/256) >= 2 x num_sms`, on both
+  projections. EP32 gate/up is the one published width that falls under the
+  two-wave line and stays at BN=128. The ported rule also held down to a
+  conservative `3 x num_sms` in its mid-M range and to BN=128 from BLOCK_M
+  72. On H200 that measured 5.5% slower at EP8 64 tokens per expert and 8%
+  at EP32 32, level elsewhere, so this repository drops it.
 - **Masked: fixed buffered-K stage depth.** The decode kernel is latency-bound
   at one block per SM, so stages target a constant ~512 elements of buffered K
   (`512 / BLOCK_K`) rather than filling smem; deeper rings only lengthen
@@ -263,11 +310,14 @@ the profile: `block_m` on a grouped profile is metadata, and the indexed tuning
 tables and `block_m` forward override do not apply. `CHORD_W4A16_BM/BN/BK/CM/CN/STAGES`
 pin a single layout for sweeps.
 
-Measured against public Humming's grouped path on the same H200 at matched
-per-expert row counts (`tests/test_w4a16_grouped.py` and
+Measured against public Humming main's grouped path (`f35c5ff`) on the same
+H200 at matched per-expert row counts (`tests/test_w4a16_grouped.py` and
 `benchmarks/bench_humming.py --balanced`, both triton `do_bench`): per EP8
-layer 1.00-1.31x on contiguous prefill and 1.16-1.35x on masked decode. The
-prefill lead narrows with rows per expert — at 512 rows both implementations sit
-near 620 TFLOPS, so the win there is the tile/pipeline choice paying off at
-small and mid chunk sizes rather than a higher ceiling. The tables, including
-the EP16/EP32 widths, are in [performance.md](performance.md).
+layer 1.16-1.35x on contiguous prefill and 0.95-1.18x on masked decode.
+Main's masked path wins the 8-tokens-per-expert row by 5%, and no
+`CHORD_W4A16_*` layout closes it. Against the July
+baseline the same runs measure 1.05-1.36x and 1.16-1.26x. Both implementations
+sit near 600 TFLOPS at 512 rows per expert, so the contiguous win is the
+tile/pipeline choice paying off at small chunk sizes and main's slower large
+gate/up rows rather than a higher ceiling. The tables, including the EP16/EP32
+widths, are in [performance.md](performance.md).
