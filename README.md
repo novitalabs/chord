@@ -11,7 +11,7 @@ Novita Labs' production MoE CUDA kernel
 </h3>
 
 <p align="center">
-| <a href="#documentation"><b>Documentation</b></a> | <a href="https://novita.ai"><b>Novita AI</b></a> | <a href="https://blogs.novita.ai"><b>Blog</b></a> |
+| <a href="#documentation"><b>Documentation</b></a> | <a href="https://novita.ai"><b>Novita AI</b></a> | <a href="https://novita.ai/blog/"><b>Blog</b></a> |
 </p>
 
 ---
