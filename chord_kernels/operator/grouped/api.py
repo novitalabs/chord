@@ -120,9 +120,8 @@ def w4a16_masked(
     flat ``[G*max_m, N]`` out.
 
     ``masked_m`` ``[G] int32`` is each group's valid rows; ``expected_m`` only
-    sizes the tiles.  Rows past ``masked_m[g]`` are not written.  Keep
-    ``max_m >= 16`` and ``expected_m`` close to the real counts: the kernel
-    mis-writes when ``max_m`` is below BLOCK_M or ``masked_m`` exceeds it.
+    sizes the tiles.  Rows past ``masked_m[g]`` are not written.  Any
+    ``max_m`` works: a group's last M tile is clipped at ``max_m``.
     """
     _check_weight(weight, "masked", _MASKED_BLOCK_K, inputs.device)
     _check_activation(inputs, weight.k)

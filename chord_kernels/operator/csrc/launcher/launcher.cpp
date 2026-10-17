@@ -285,6 +285,61 @@ CUtensorMap make_dg_tma_2d_desc(
   return tensor_map;
 }
 
+// Masked D: (N, max_m, G) with the group as the batch dimension, so the store
+// of a group's partial last M tile is clipped at max_m instead of writing into
+// the next group's rows.
+CUtensorMap make_dg_tma_3d_desc(
+    void *ptr,
+    CUtensorMapDataType dtype,
+    int64_t elem_size,
+    int64_t gmem_inner_dim,
+    int64_t gmem_outer_dim,
+    int64_t gmem_batch_dim,
+    int64_t smem_inner_dim,
+    int64_t smem_outer_dim,
+    int64_t gmem_outer_stride_elems,
+    uint32_t swizzle_mode) {
+  CUtensorMapSwizzle swizzle;
+  switch (swizzle_mode) {
+    case 0:
+    case 16:
+      swizzle = CU_TENSOR_MAP_SWIZZLE_NONE;
+      break;
+    case 32:
+      swizzle = CU_TENSOR_MAP_SWIZZLE_32B;
+      break;
+    case 64:
+      swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
+      break;
+    case 128:
+      swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
+      break;
+    default:
+      ASSERT_CHECK(false, "unsupported TMA swizzle mode: ", swizzle_mode);
+  }
+  if (swizzle_mode != 0) smem_inner_dim = swizzle_mode / elem_size;
+
+  CUtensorMap tensor_map;
+  const cuuint64_t gmem_dims[3] = {
+      static_cast<cuuint64_t>(gmem_inner_dim),
+      static_cast<cuuint64_t>(gmem_outer_dim),
+      static_cast<cuuint64_t>(gmem_batch_dim)};
+  const cuuint32_t smem_dims[3] = {
+      static_cast<cuuint32_t>(smem_inner_dim),
+      static_cast<cuuint32_t>(smem_outer_dim), 1};
+  const cuuint64_t gmem_strides[2] = {
+      static_cast<cuuint64_t>(gmem_outer_stride_elems * elem_size),
+      static_cast<cuuint64_t>(gmem_outer_stride_elems * gmem_outer_dim * elem_size)};
+  const cuuint32_t elem_strides[3] = {1, 1, 1};
+  check_curesult(
+      cuTensorMapEncodeTiled(
+          &tensor_map, dtype, 3, ptr, gmem_dims, gmem_strides, smem_dims,
+          elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+          CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+      "cuTensorMapEncodeTiled");
+  return tensor_map;
+}
+
 void check_dg_common(
     const Tensor &a,
     const Tensor &packed_w,
@@ -346,11 +401,14 @@ void launch_grouped_w4a16(
   CUtensorMap tm_b = make_dg_tma_2d_desc(
       w_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, k / 2, n * num_groups,
       kd.block_k / 2, kd.block_n, k / 2, kd.swizzle_b);
-  // D: (N, m_total [* groups]) BF16 rows; box (swizzle CD, BLOCK_M).
-  CUtensorMap tm_d = make_dg_tma_2d_desc(
-      d_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, n,
-      m_total * (a_has_groups ? num_groups : 1), kd.block_n, kd.block_m, n,
-      kd.swizzle_cd);
+  // D: (N, m_total [, groups]) BF16 rows; box (swizzle CD, BLOCK_M).
+  CUtensorMap tm_d = a_has_groups
+      ? make_dg_tma_3d_desc(
+            d_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, n, m_total, num_groups,
+            kd.block_n, kd.block_m, n, kd.swizzle_cd)
+      : make_dg_tma_2d_desc(
+            d_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, n, m_total, kd.block_n,
+            kd.block_m, n, kd.swizzle_cd);
   // SFA: (N, (K/32) * groups), MN-major with N contiguous; box (BLOCK_N, 1).
   CUtensorMap tm_sfa = make_dg_tma_2d_desc(
       scale_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, n,

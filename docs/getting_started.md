@@ -43,9 +43,8 @@ out = contiguous(x2, weight, m_indices)
 | `masked` (decode) | `x3` BF16 `[G, max_m, K]`, `masked_m` int32 `[G]` valid rows per expert, `expected_m` their typical count. Returns `[G*max_m, N]`. |
 | `contiguous` (prefill) | `x2` BF16 `[m, K]`, each expert's rows padded to 128 (padding zeroed), `m_indices` int32 `[m]` (`-1` for padding). Returns `[m, N]`. |
 
-One packed weight serves both operators. Keep
-`max_m >= 16` and `expected_m` close to the real counts: the masked kernel
-mis-writes when `max_m` is below its BLOCK_M or a group's `masked_m` exceeds it.
+One packed weight serves both operators. For `masked`, any `max_m` works and
+`expected_m` only sizes the tiles; keep it close to the real counts for speed.
 
 ## Environment variables
 

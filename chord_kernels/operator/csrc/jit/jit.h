@@ -74,4 +74,11 @@ CUtensorMap make_tma_2d(
     int64_t gmem_outer_dim, int64_t smem_inner_dim, int64_t smem_outer_dim,
     int64_t gmem_outer_stride_elems, uint32_t swizzle_mode);
 
+// As launcher.cpp make_dg_tma_3d_desc: make_tma_2d plus a batch dimension of
+// gmem_batch_dim slices, each gmem_outer_dim rows; the box is one slice deep.
+CUtensorMap make_tma_3d(
+    void* ptr, CUtensorMapDataType dtype, int64_t elem_size, int64_t gmem_inner_dim,
+    int64_t gmem_outer_dim, int64_t gmem_batch_dim, int64_t smem_inner_dim,
+    int64_t smem_outer_dim, int64_t gmem_outer_stride_elems, uint32_t swizzle_mode);
+
 }  // namespace chord::jit
