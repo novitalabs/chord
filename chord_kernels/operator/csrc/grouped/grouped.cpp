@@ -246,9 +246,14 @@ void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
   // B: (K/2, N * groups) packed UINT8, K-major; box (swizzle B, BLOCK_N).
   CUtensorMap tm_b = tma_2d(a.weight, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, a.k / 2,
                             a.n * a.num_groups, kd.block_k / 2, kd.block_n, a.k / 2, kd.swizzle_b);
-  // D: (N, rows) BF16; box (swizzle CD, BLOCK_M).
-  CUtensorMap tm_d = tma_2d(a.d, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, a.n, rows, kd.block_n,
-                            kd.block_m, a.n, kd.swizzle_cd);
+  // D: (N, m [, groups]) BF16; box (swizzle CD, BLOCK_M).  Masked adds the
+  // group as a third dimension so a partial last M tile's store clips at max_m.
+  CUtensorMap tm_d =
+      a_has_groups
+          ? jit::make_tma_3d(a.d, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, a.n, a.m, a.num_groups,
+                             kd.block_n, kd.block_m, a.n, kd.swizzle_cd)
+          : tma_2d(a.d, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, a.n, a.m, kd.block_n, kd.block_m,
+                   a.n, kd.swizzle_cd);
   // SFA: (N, (K/32) * groups), MN-major with N contiguous; box (BLOCK_N, 1).
   CUtensorMap tm_sfa = tma_2d(a.scale, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, a.n,
                               (a.k / 32) * a.num_groups, kd.block_n, 1, a.n, 0);

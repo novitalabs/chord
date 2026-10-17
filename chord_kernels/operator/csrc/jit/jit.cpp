@@ -563,4 +563,39 @@ CUtensorMap make_tma_2d(
   return tensor_map;
 }
 
+CUtensorMap make_tma_3d(
+    void* ptr, CUtensorMapDataType dtype, int64_t elem_size, int64_t gmem_inner_dim,
+    int64_t gmem_outer_dim, int64_t gmem_batch_dim, int64_t smem_inner_dim,
+    int64_t smem_outer_dim, int64_t gmem_outer_stride_elems, uint32_t swizzle_mode) {
+  CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE;
+  switch (swizzle_mode) {
+    case 0:
+    case 16: swizzle = CU_TENSOR_MAP_SWIZZLE_NONE; break;
+    case 32: swizzle = CU_TENSOR_MAP_SWIZZLE_32B; break;
+    case 64: swizzle = CU_TENSOR_MAP_SWIZZLE_64B; break;
+    case 128: swizzle = CU_TENSOR_MAP_SWIZZLE_128B; break;
+    default: fail("unsupported TMA swizzle mode: " + std::to_string(swizzle_mode));
+  }
+  if (swizzle_mode != 0) smem_inner_dim = swizzle_mode / elem_size;
+
+  CUtensorMap tensor_map;
+  const cuuint64_t gmem_dims[3] = {
+      static_cast<cuuint64_t>(gmem_inner_dim),
+      static_cast<cuuint64_t>(gmem_outer_dim),
+      static_cast<cuuint64_t>(gmem_batch_dim)};
+  const cuuint32_t smem_dims[3] = {
+      static_cast<cuuint32_t>(smem_inner_dim),
+      static_cast<cuuint32_t>(smem_outer_dim), 1};
+  const cuuint64_t gmem_strides[2] = {
+      static_cast<cuuint64_t>(gmem_outer_stride_elems * elem_size),
+      static_cast<cuuint64_t>(gmem_outer_stride_elems * gmem_outer_dim * elem_size)};
+  const cuuint32_t elem_strides[3] = {1, 1, 1};
+  check(cuTensorMapEncodeTiled(
+            &tensor_map, dtype, 3, ptr, gmem_dims, gmem_strides, smem_dims, elem_strides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+        "cuTensorMapEncodeTiled");
+  return tensor_map;
+}
+
 }  // namespace chord::jit

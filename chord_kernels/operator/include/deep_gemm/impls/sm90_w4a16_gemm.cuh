@@ -204,7 +204,9 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                     // Wait consumer release
                     empty_barriers[stage_idx]->wait(phase ^ 1);
 
-                    // Issue TMA A
+                    // Issue TMA A.  A masked group's partial last M tile may read the
+                    // next group's first rows; they only feed output rows past max_m,
+                    // which the 3D D store below clips.
                     constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                     const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
 
@@ -677,16 +679,18 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
             cute::tma_store_fence();
             cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1);
 
-            // Use TMA store to write back to global memory
+            // Use TMA store to write back to global memory.  Masked D is a 3D
+            // (N, max_m, G) map, so the store of a partial last M tile is clipped
+            // at max_m and never reaches the next group's rows.
             // TODO: compatible with FP32 output
-            constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
+            constexpr bool kWithGroupOffsetD = false;
             DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
                 auto n_idx = epilogue_type_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset);
                 auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
-                if constexpr (kGemmType == GemmType::Batched) {
+                if constexpr (kGemmType == GemmType::Batched or kGemmType == GemmType::MGroupedMasked) {
                     cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
                                                   n_idx, m_idx, scheduler.current_group_idx);
                 } else {

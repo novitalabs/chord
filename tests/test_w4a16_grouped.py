@@ -458,6 +458,47 @@ def test_masked_w4a16_correctness(case: MaskedCase, hopper: torch.device) -> Non
         assert diff < _COSINE_LIMIT, (case.label, j, mm, diff)
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "max_m,masked_counts",
+    [(8, [8]), (24, [20]), (24, [20, 4]), (40, [36]), (40, [(i * 7) % 41 for i in range(48)])],
+    ids=["max_m_8", "max_m_24", "max_m_24_mixed", "max_m_40", "max_m_40_ragged"],
+)
+@pytest.mark.parametrize("n,k", [(4096, 7168), (7168, 2048)], ids=["gate_up", "down"])
+def test_masked_partial_last_tile_stays_in_its_group(
+    hopper: torch.device, n: int, k: int, max_m: int, masked_counts: list[int],
+) -> None:
+    """A ``max_m`` that is not a multiple of BLOCK_M (16 at ``expected_m`` 8)
+    leaves each group a partial last M tile.  Its loads and stores are clipped
+    at ``max_m``: every group matches the reference and repeated launches agree.
+    The flat 2D maps used to let that tile read and write the next group's rows.
+    """
+    from chord_kernels.operator.grouped.api import w4a16_masked
+
+    _reset_seed()
+    g = 48
+    counts = (masked_counts * g)[:g]
+    a3 = torch.randn((g, max_m, k), device=hopper, dtype=torch.bfloat16)
+    codes = torch.randint(0, 16, (g, n, k), device=hopper, dtype=torch.int8).to(torch.int32)
+    scale = (torch.randn((g, n, k // _W4A16_GROUP), device=hopper) * 0.02).to(torch.bfloat16)
+    weight = _pack_unpacked(codes, scale)
+    masked_m = torch.tensor(counts, dtype=torch.int32, device=hopper)
+
+    outs = []
+    for _ in range(3):
+        out = torch.full((g * max_m, n), float("nan"), dtype=torch.bfloat16, device=hopper)
+        w4a16_masked(a3, weight, masked_m, 8, outputs=out)
+        outs.append(out.view(g, max_m, n))
+    torch.cuda.synchronize(hopper)
+    for j, mm in enumerate(counts):
+        if mm == 0:
+            continue
+        ref = (a3[j, :mm].float() @ _dequant_reference(codes[j], scale[j]).reshape(n, k).t().float())
+        diff = _cos_diff(outs[0][j, :mm], ref.to(torch.bfloat16))
+        assert diff < _COSINE_LIMIT, (j, mm, diff)
+        assert all(torch.equal(o[j, :mm], outs[0][j, :mm]) for o in outs[1:]), (j, mm)
+
+
 # One case per decode bucket at a single shape: the flat/3D equivalence is a
 # calling-convention property, so it needs the bucket spread rather than the
 # full shape matrix.  Selected by value so extending MASKED_CASES cannot
