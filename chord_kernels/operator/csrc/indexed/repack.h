@@ -13,8 +13,7 @@ struct RepackArgs {
   const void* input;  // int32 [E, N, K] codes, or [E, N, K/8] packed words
   void* output;       // int32 [E, K/16, 2N]
   int64_t num_experts, shape_n, shape_k;  // shape_k: logical K
-  bool packed_input;
-  bool wgmma_layout;
+  bool packed_input;  // MMA and WGMMA read the same layout: the input form is the only choice
 };
 
 // Compile (or read the cache), load and launch on `stream`.

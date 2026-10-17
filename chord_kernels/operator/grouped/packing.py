@@ -1,23 +1,11 @@
 # Derived from deepseek-ai/DeepGEMM; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
-"""Weight packing for the grouped W4A16 backend.
+"""Grouped W4A16 weight packing, a bit-exact port of DeepGEMM's ``reorder_w4a16``.
 
-The packing itself was bit-exactly ported from DeepGEMM's
-``tests/generators.py::reorder_w4a16``: within each ``N_ATOM(64) x BLOCK_K``
-tile the
-INT4 weight is reordered by a pure bit-permutation of the 13-bit ``(nl, kl)``
-atom index so that after TMA + ldmatrix + the kernel's int4->bf16 dequant the
-fragments line up with the BF16 RS-WGMMA A-operand; nibbles are pre-flipped
-to excess-8 (``^0x08``) because the kernel's LOP3 dequant expects that.
-
-The reorder perm width MUST equal the kernel's ``BLOCK_K``, and the vendored
-heuristic fixes ``BLOCK_K`` per mode (128 for masked decode, 64 for contiguous
-prefill), so the two modes pack DIFFERENT weight buffers.  The mode recorded
-on :class:`GroupedPreparedWeight` is the guard that keeps a masked-packed
-weight from ever being fed to the contiguous kernel (a silent wrong answer).
-The BF16 scale layout ``[G, K/32, N]`` (N contiguous) is shared by both modes —
-it is exactly what the kernel's SFA TMA descriptor reads, so no per-forward
-transpose happens on the hot path.
+Codes are bit-permuted within each ``64 x BLOCK_K`` atom for the RS-WGMMA
+A-operand and pre-flipped to excess-8.  The BLOCK_K 128 order is two 64-wide
+orders side by side, so one buffer serves masked (BLOCK_K 128) and contiguous
+(64).  Scales become
+``[G, K/32, N]``, the layout the SFA TMA descriptor reads.
 """
 
 from __future__ import annotations
@@ -25,57 +13,28 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Iterator
-from typing import Literal
 
 import torch
 
 from chord_kernels.operator.grouped.heuristics import W4A16_N_ATOM, W4A16_SCALE_GROUP
 
-GroupedMode = Literal["masked", "contiguous"]
-
-# Perm widths baked into the packed buffer; they must match the vendored
-# heuristic's per-mode BLOCK_K selection (masked decode BK128, contiguous
-# prefill BK64).
-MASKED_BLOCK_K = 128
-CONTIGUOUS_BLOCK_K = 64
-
-_MODE_BLOCK_K: dict[str, int] = {
-    "masked": MASKED_BLOCK_K,
-    "contiguous": CONTIGUOUS_BLOCK_K,
-}
+# The reorder works in 64-wide K slabs; a BLOCK_K 128 kernel reads two side by side.
+PACK_BLOCK_K = 64
 
 # The vendored kernel is an SM90 (Hopper) WGMMA kernel; Blackwell deployments
 # keep using the phase-1 indexed kernel.
 SUPPORTED_GROUPED_COMPUTE_CAPABILITIES = frozenset({(9, 0)})
 
 
-def block_k_for_mode(mode: GroupedMode) -> int:
-    try:
-        return _MODE_BLOCK_K[mode]
-    except KeyError:
-        raise ValueError(f"mode must be 'masked' or 'contiguous', got {mode!r}") from None
-
-
 @dataclasses.dataclass(frozen=True, eq=False)
 class GroupedPreparedWeight:
-    """Packed tensors plus the mode the grouped weight layout was built for."""
+    """Packed tensors for ``masked`` and ``contiguous``."""
 
     packed: torch.Tensor  # [G, N, K/2] viewed as float8_e4m3fn
     scale: torch.Tensor   # [G, K/32, N] BF16, N contiguous (MN-major)
-    mode: GroupedMode
     n: int
     k: int
     num_experts: int
-
-    @property
-    def block_k(self) -> int:
-        return block_k_for_mode(self.mode)
-
-    @property
-    def layout(self) -> str:
-        # Present a WeightLayout-compatible spelling so framework code can key
-        # off ``weight.layout`` uniformly across the two operator families.
-        return f"grouped_{self.mode}"
 
     @property
     def tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -112,12 +71,9 @@ def _w4a16_perm(block_k: int, device_str: str) -> tuple[torch.Tensor, torch.Tens
     return rows, nibs
 
 
-def reorder_w4a16(b_int8: torch.Tensor, block_k: int = MASKED_BLOCK_K) -> torch.Tensor:
-    """Reorder a [n, k] signed-int4 weight (values in [-8, 7], stored int8) into
-    the grouped packed layout.  Returns ``[n, k//2]`` viewed as
-    ``float8_e4m3fn`` (2 nibbles/byte), excess-8 pre-flipped.  Bit-exact port of
-    DeepGEMM ``tests/generators.py::reorder_w4a16``.
-    """
+def reorder_w4a16(b_int8: torch.Tensor, block_k: int = PACK_BLOCK_K) -> torch.Tensor:
+    """Reorder signed int4 ``[n, k]`` (int8 in [-8, 7]) to ``[n, k//2]``
+    ``float8_e4m3fn``, excess-8 pre-flipped."""
     if b_int8.dim() != 2:
         raise ValueError(f"b_int8 must be 2D [n, k], got {tuple(b_int8.shape)}")
     n, k = b_int8.shape
@@ -155,9 +111,7 @@ def _unpack_checkpoint_codes(weight: torch.Tensor) -> torch.Tensor:
     """Unpack [G, N, K/8] INT32 checkpoint words into [G, N, K] uint4 codes.
 
     Each INT32 word holds eight little-endian nibbles; the returned int8 tensor
-    holds the unsigned codes in [0, 15].  Mirrors
-    ``chord_kernels.operator.layer.unpack_packed_uint4`` for the DeepGEMM
-    packing path without importing the layer module.
+    holds the unsigned codes in [0, 15].
     """
     words = weight.to(torch.int64) & 0xFFFFFFFF
     shifts = torch.arange(8, dtype=torch.int64, device=weight.device) * 4
@@ -165,12 +119,8 @@ def _unpack_checkpoint_codes(weight: torch.Tensor) -> torch.Tensor:
     return codes.reshape(*weight.shape[:-1], weight.shape[-1] * 8).to(torch.int8)
 
 
-def pack_weight_grouped(codes_uint4: torch.Tensor, block_k: int) -> torch.Tensor:
-    """Pack unpacked [G, N, K] uint4 codes ([0, 15]) into the DeepGEMM layout
-    [G, N, K/2] float8_e4m3fn.  The DeepGEMM reorder works on signed [-8, 7],
-    so map back (v - 8) first; the reorder re-applies the +8 excess-8 flip
-    internally.
-    """
+def pack_weight_grouped(codes_uint4: torch.Tensor, block_k: int = PACK_BLOCK_K) -> torch.Tensor:
+    """Pack ``[G, N, K]`` uint4 codes into ``[G, N, K/2]`` ``float8_e4m3fn``."""
     signed = (codes_uint4.to(torch.int16) - 8).to(torch.int8)
     out = torch.empty(
         (*codes_uint4.shape[:-1], codes_uint4.shape[-1] // 2),
@@ -185,18 +135,14 @@ def pack_weight_grouped(codes_uint4: torch.Tensor, block_k: int) -> torch.Tensor
 def pack_w4a16_grouped(
     weight_uint4: torch.Tensor,
     weight_scale: torch.Tensor,
-    mode: GroupedMode,
     *,
     packed: bool = False,
 ) -> GroupedPreparedWeight:
-    """Pack quantized W4A16 weights for the grouped W4A16 kernels.
+    """Pack for ``masked``/``contiguous``; same inputs as ``pack_w4a16_indexed``.
 
-    ``weight_uint4`` follows the chord checkpoint contract: unpacked INT32
-    ``[G, N, K]`` unsigned codes in ``[0, 15]``, or with ``packed=True`` the
-    compact ``[G, N, K/8]`` INT32 form (eight little-endian nibbles per word).
-    ``weight_scale`` is BF16 ``[G, N, K/32]``.
+    int32 codes ``[G, N, K]`` in ``[0, 15]`` (``packed=True``: ``[G, N, K/8]``),
+    BF16 scale ``[G, N, K/32]``.
     """
-    block_k = block_k_for_mode(mode)
     if not isinstance(weight_uint4, torch.Tensor):
         raise TypeError(
             f"weight_uint4 must be a torch.Tensor, got {type(weight_uint4).__name__}"
@@ -236,11 +182,8 @@ def pack_w4a16_grouped(
             f"shape_n must be divisible by the {W4A16_N_ATOM}-row weight atom, "
             f"got {shape_n}"
         )
-    if shape_k % block_k:
-        raise ValueError(
-            f"shape_k must be divisible by the {mode} BLOCK_K={block_k}, "
-            f"got {shape_k}"
-        )
+    if shape_k % PACK_BLOCK_K:
+        raise ValueError(f"shape_k must be divisible by {PACK_BLOCK_K}, got {shape_k}")
     if shape_k % W4A16_SCALE_GROUP:
         raise ValueError(f"shape_k must be divisible by {W4A16_SCALE_GROUP}")
     if shape_n % 16:
@@ -266,7 +209,7 @@ def pack_w4a16_grouped(
                 f"[{minimum.item()}, {maximum.item()}]"
             )
         codes = weight_uint4.to(torch.int8)
-    packed_weight = pack_weight_grouped(codes, block_k)
+    packed_weight = pack_weight_grouped(codes)
 
     # Humming checkpoints store scales N-major [G, N, K/32]; the kernel's SFA
     # TMA descriptor reads MN-major [G, K/32, N] (N contiguous).  Transposing
@@ -275,7 +218,6 @@ def pack_w4a16_grouped(
     return GroupedPreparedWeight(
         packed=packed_weight,
         scale=packed_scale,
-        mode=mode,
         n=shape_n,
         k=shape_k,
         num_experts=num_experts,
@@ -283,12 +225,9 @@ def pack_w4a16_grouped(
 
 
 __all__ = [
-    "CONTIGUOUS_BLOCK_K",
-    "GroupedMode",
     "GroupedPreparedWeight",
-    "MASKED_BLOCK_K",
+    "PACK_BLOCK_K",
     "SUPPORTED_GROUPED_COMPUTE_CAPABILITIES",
-    "block_k_for_mode",
     "pack_w4a16_grouped",
     "reorder_w4a16",
 ]

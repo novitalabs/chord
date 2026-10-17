@@ -12,12 +12,7 @@ description = "Indexed W4A16 CUDA MoE operator"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-# chord_kernels/operator/LICENSE additionally ships as package data (see
-# setup.py) so the JIT source tree carries its provenance record at runtime.
-license-files = [
-    "LICENSE",
-    "NOTICE",
-]
+license-files = ["LICENSE"]
 dependencies = [
     "torch>=2.1",
     "jinja2",

@@ -1,5 +1,4 @@
 // Derived from inclusionAI/humming; modified for chord_kernels.
-// Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
 
 #pragma once
 
@@ -82,7 +81,14 @@ public:
     for (uint32_t i = 0; i < WarpShape::N / (MmaShape::N / 4); i++) {
       uint32_t *regs_b_ptr =
           reinterpret_cast<uint32_t *>(regs_b[buffer_id][i * 64 / MmaShape::N]);
-      dequant_uint4_to_bf16(regs_qb[buffer_id], regs_b_ptr, i);
+      // The weight is in the MMA layout, whose nibble pairs come in mma.sync
+      // B-fragment order (row r k-lo, r k-hi, r+8 k-lo, r+8 k-hi).  WGMMA's
+      // register operand A wants (r k-lo, r+8 k-lo, r k-hi, r+8 k-hi), so the
+      // dequant reads the pairs in that order: only shift immediates change,
+      // and the math stays the single-rounding RN((w - 8) * bs).  Upstream
+      // Humming swaps the middle registers after dequant instead; folding the
+      // permutation into the extraction keeps ptxas' schedule unchanged.
+      dequant_uint4_to_bf16</*kWgmmaOrder=*/true>(regs_qb[buffer_id], regs_b_ptr, i);
       arith.apply_group_scale_on_b(regs_b_ptr, i, buffer_id);
     };
   };

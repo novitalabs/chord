@@ -112,20 +112,7 @@ if editable_wheel is not None:
     cmdclass["editable_wheel"] = EditableWheel
 
 setup(
-    # ``chord`` is the humming-compatible facade over ``chord_kernels``, and
-    # ``humming`` is the import root frameworks that hardcode the upstream
-    # package name resolve (notably vLLM's lazy facade); both are
-    # import-root-only (no kernel sources), so they need no package_data.
-    packages=find_packages(
-        include=(
-            "chord_kernels",
-            "chord_kernels.*",
-            "chord",
-            "chord.*",
-            "humming",
-            "humming.*",
-        )
-    ),
+    packages=find_packages(include=("chord_kernels", "chord_kernels.*")),
     # The implementation is packaged under the ``operator`` subpackage.
     package_data={"chord_kernels.operator": package_data("operator")},
     include_package_data=False,

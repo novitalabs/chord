@@ -104,10 +104,7 @@ struct Scheduler {
         auto in_group_idx = block_idx % num_blocks_per_group;
         num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
 
-        // Fix unaligned TMA multicast
-        // NOTES: for SM90 only, as SM90 can dynamically disable TMA multicast
-        // while SM100 uses 2-CTA, which can not be dynamically disabled
-#if __CUDA_ARCH__ < 1000
+        // Fix unaligned TMA multicast (SM90 can dynamically disable TMA multicast)
         if (kNumMulticast > 1 and num_blocks_in_group % 2 != 0) {
             if (in_group_idx < (num_blocks_in_group ^ 1) * secondary_num_blocks) {
                 num_blocks_in_group = num_blocks_in_group ^ 1;
@@ -117,7 +114,6 @@ struct Scheduler {
                 num_blocks_in_group = 1;
             }
         }
-#endif
 
         // Convert to final M/N block indices
         // `kIsMulticastOnA == true` leads to groups on N
@@ -159,14 +155,6 @@ struct Scheduler {
         }
     }
 
-    // For swap A/B and psum layout only
-    CUTLASS_DEVICE uint32_t get_aligned_effective_m_in_block(const uint32_t& m_block_idx) const {
-        constexpr uint32_t UMMA_STEP_N = 16;
-        DG_STATIC_ASSERT(BLOCK_M % UMMA_STEP_N == 0, "Invalid alignment");
-        if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout)
-            return math::align(m_block_idx == last_psum_m / BLOCK_M + num_m_blocks - 1 ? current_psum_m - m_block_idx * BLOCK_M : BLOCK_M, UMMA_STEP_N);
-        return BLOCK_M;
-    }
 
     CUTLASS_DEVICE bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
         const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;

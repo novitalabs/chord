@@ -1,5 +1,4 @@
 # Derived from inclusionAI/humming; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
 
 import os
 import sys
@@ -89,13 +88,9 @@ def launch_kernel(
     num_tokens_padded: torch.Tensor,
     top_k: int,
     outputs: torch.Tensor | None = None,
-    valid_shape_m: int = 0,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     init_launcher()
-    # Kernel selection is already performed by the indexed Python API.  Keep
-    # valid_shape_m in this wrapper's signature for layer compatibility; the
-    # narrowed launcher receives one concrete kernel id.
-    del valid_shape_m
     return torch.ops.chord.launch_kernel(
         kernel_id,
         inputs,
@@ -106,6 +101,7 @@ def launch_kernel(
         expert_ids,
         num_tokens_padded,
         top_k,
+        locks,
     )
 
 

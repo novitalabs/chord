@@ -38,7 +38,7 @@ class IndexedCase:
         metadata is still generated with the real ``top_k``.
     """
 
-    profile: str
+    scenario: str  # benchmark scenario label; the schedule comes from select_indexed_config
     m: int
     n: int
     k: int
@@ -68,19 +68,19 @@ class IndexedCase:
 
     @property
     def is_tensor_parallel(self) -> bool:
-        """True when the profile shards ``moe_intermediate`` instead of experts."""
+        """True when the scenario shards ``moe_intermediate`` instead of experts."""
 
-        return "_tp8" in self.profile
+        return "_tp8" in self.scenario
 
     @property
     def is_decode(self) -> bool:
-        return "decode" in self.profile
+        return "decode" in self.scenario
 
     @property
     def is_prefill(self) -> bool:
         """True when the sweep is a whole-system chunk rather than a decode step.
 
-        TP8 counts as prefill-shaped here even though its profile is ``mix``.
+        TP8 counts as prefill-shaped here even though it serves a mixed instance.
         """
 
         return not self.is_decode
@@ -110,14 +110,13 @@ class IndexedCase:
     @property
     def label(self) -> str:
         return (
-            f"{self.profile} {self.projection} m={self.m} n={self.n} k={self.k} "
+            f"{self.scenario} {self.projection} m={self.m} n={self.n} k={self.k} "
             f"E={self.num_experts} top_k={self.top_k} {self.distribution}"
         )
 
 
 @dataclass(frozen=True)
 class IndexedTensors:
-    profile: object
     kernel_config: object
     activation: torch.Tensor
     logical_weight: torch.Tensor
@@ -128,6 +127,8 @@ class IndexedTensors:
     expert_ids: torch.Tensor
     num_tokens_padded: torch.Tensor
     output: torch.Tensor
+    # The caller-owned stream-K lock buffer: zeroed once, reused by every launch.
+    locks: torch.Tensor
 
     @property
     def num_active_experts(self) -> int:
@@ -329,22 +330,14 @@ def pack_checkpoint_uint4(weight: torch.Tensor) -> torch.Tensor:
 def generate_indexed_case(case: IndexedCase, device: torch.device) -> IndexedTensors:
     """Generate and pack all tensors required by one indexed W4A16 case."""
 
-    from chord_kernels.operator import (
-        IndexedLayerMeta,
-        pack_w4a16,
-        select_indexed_profile,
-    )
+    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels.operator.tuning import select_indexed_config
 
-    profile = select_indexed_profile(case.profile, device=device)
-    meta = IndexedLayerMeta(
-        shape_n=case.n,
-        shape_k=case.k,
-        num_experts=case.num_experts,
-        profile=profile,
-    )
     # Block-M is selected from the routed row count for both projections: the
     # kernel schedules over routed rows regardless of the input row count.
-    kernel_config = meta.kernel_config(case.routed_m)
+    kernel_config = select_indexed_config(
+        case.n, case.k, case.num_experts, case.routed_m, device=device
+    )
     generator = torch.Generator(device=device).manual_seed(case.seed)
     activation = torch.randn(
         (case.input_rows, case.k),
@@ -370,7 +363,7 @@ def generate_indexed_case(case: IndexedCase, device: torch.device) -> IndexedTen
         * 0.04
         + 0.005
     ).to(torch.bfloat16)
-    prepared_weight = pack_w4a16(logical_weight, scale, layout=profile.layout)
+    prepared_weight = pack_w4a16_indexed(logical_weight, scale)
     # Routing reproduces the upstream bench_humming.py draw exactly: that
     # benchmark seeds the global CUDA RNG with the token count immediately
     # before scoring experts, and a fresh Generator with the same seed yields
@@ -390,7 +383,6 @@ def generate_indexed_case(case: IndexedCase, device: torch.device) -> IndexedTen
     )
     output = torch.empty((case.routed_m, case.n), dtype=torch.bfloat16, device=device)
     return IndexedTensors(
-        profile=profile,
         kernel_config=kernel_config,
         activation=activation,
         logical_weight=logical_weight,
@@ -401,6 +393,7 @@ def generate_indexed_case(case: IndexedCase, device: torch.device) -> IndexedTen
         expert_ids=expert_ids,
         num_tokens_padded=num_tokens_padded,
         output=output,
+        locks=torch.zeros(1024, dtype=torch.int32, device=device),
     )
 
 
@@ -462,8 +455,8 @@ PREFILL_SYSTEM_TOKENS = (1024, 2048, 4096, 8192, 16384)
 DECODE_TOKENS_PER_GPU = (20, 30, 40, 50)
 
 
-def _profile_cases(
-    profile: str,
+def _scenario_cases(
+    scenario: str,
     routed_rows: tuple[int, ...],
     *,
     seed_base: int,
@@ -471,7 +464,7 @@ def _profile_cases(
     gate_up_shape: dict | None = None,
     down_shape: dict | None = None,
 ) -> tuple[IndexedCase, ...]:
-    """Sweep local routed row counts for one profile, gate/up first then down.
+    """Sweep local routed row counts for one scenario, gate/up first then down.
 
     ``routed_rows`` is the number of rows the kernel writes on this GPU.  Each
     case therefore uses ``m = routed / top_k`` so that ``routed_m == routed``,
@@ -482,7 +475,7 @@ def _profile_cases(
     across the sweep can be read down a single column.
 
     ``shard``/``gate_up_shape``/``down_shape`` default to the EP8 expert count and
-    shapes; the TP8 profile passes its own, which keeps this sweep the single
+    shapes; the TP8 scenario passes its own, which keeps this sweep the single
     place a token count turns into cases regardless of the shard axis.
     """
 
@@ -492,13 +485,13 @@ def _profile_cases(
     top_k = shard["top_k"]
     gate_up = [
         IndexedCase(
-            profile, m=routed // top_k, seed=seed_base + index, **shard, **gate_up_shape
+            scenario, m=routed // top_k, seed=seed_base + index, **shard, **gate_up_shape
         )
         for index, routed in enumerate(routed_rows)
     ]
     down = [
         IndexedCase(
-            profile,
+            scenario,
             m=routed // top_k,
             seed=seed_base + len(routed_rows) + index,
             projection="down",
@@ -530,8 +523,8 @@ _TP8_ROUTED_ROWS = tuple(
 
 
 PERFORMANCE_CASES: tuple[IndexedCase, ...] = (
-    *_profile_cases("h200_prefill_ep8", _PREFILL_ROUTED_ROWS, seed_base=20260900),
-    *_profile_cases(
+    *_scenario_cases("h200_prefill_ep8", _PREFILL_ROUTED_ROWS, seed_base=20260900),
+    *_scenario_cases(
         "h200_tp8",
         _TP8_ROUTED_ROWS,
         seed_base=20260920,
@@ -539,12 +532,12 @@ PERFORMANCE_CASES: tuple[IndexedCase, ...] = (
         gate_up_shape=_TP8_GATE_UP,
         down_shape=_TP8_DOWN,
     ),
-    *_profile_cases("h200_decode_ep8", _DECODE_ROUTED_ROWS, seed_base=20260940),
-    *_profile_cases("blackwell_decode_ep8", _DECODE_ROUTED_ROWS, seed_base=20260980),
+    *_scenario_cases("h200_decode_ep8", _DECODE_ROUTED_ROWS, seed_base=20260940),
+    *_scenario_cases("blackwell_decode_ep8", _DECODE_ROUTED_ROWS, seed_base=20260980),
 )
 
 
-_PROFILE_CAPABILITY = {
+_SCENARIO_CAPABILITY = {
     "h200_prefill_ep8": {(9, 0)},
     "h200_tp8": {(9, 0)},
     "h200_decode_ep8": {(9, 0)},
@@ -558,7 +551,7 @@ def select_cases(capability: tuple[int, int]) -> list[IndexedCase]:
     return [
         case
         for case in PERFORMANCE_CASES
-        if capability in _PROFILE_CAPABILITY.get(case.profile, set())
+        if capability in _SCENARIO_CAPABILITY.get(case.scenario, set())
     ]
 
 

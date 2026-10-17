@@ -7,7 +7,7 @@
 </p>
 
 <h3 align="center">
-Novita Labs' production MoE CUDA kernel
+Novita Labs' production MoE CUDA kernels
 </h3>
 
 <p align="center">
@@ -16,35 +16,28 @@ Novita Labs' production MoE CUDA kernel
 
 ---
 
-Chord (Python package `chord_kernels`) is Novita Labs' in-house W4A16 MoE CUDA
-operator — BF16 activation, INT4 weight, group-32 scale — built for serving the
-Kimi K2.5 family (K2.5/K2.6/K2.7), the main open-weight LLM family shipping
-INT4 weights.
+Chord (Python package `chord_kernels`) is a set of W4A16 MoE CUDA operators
+(BF16 activation, INT4 weight, group-32 scale) tuned for serving the Kimi K2.5
+family (K2.5/K2.6/K2.7).
 
 ## Supported configurations
 
-| Interface | GPU | Compute capability | Scenario | Profile |
-| --- | --- | --- | --- | --- |
-| `indexed` | Hopper (H200) | SM90 (9.0) | Prefill, EP8 | `h200_prefill_ep8` |
-| `indexed` | Hopper (H200) | SM90 (9.0) | Single-instance (mix), TP8 | `h200_tp8` |
-| `indexed` | Hopper (H200) | SM90 (9.0) | Decode, EP8 | `h200_decode_ep8` |
-| `indexed` | Blackwell (B200/B300) | B200: SM100 (10.0); B300: SM103 (10.3) | Decode, EP8 | `blackwell_decode_ep8` |
-| `masked` | Hopper (H200) | SM90 (9.0) | Decode, EP8/EP16/EP32 | `h200_grouped_decode` |
-| `contiguous` | Hopper (H200) | SM90 (9.0) | Prefill, EP8/EP16/EP32 | `h200_grouped_prefill` |
+| Interface | GPU | Tuned scenarios |
+| --- | --- | --- |
+| `indexed` | H200 | EP8 prefill and decode, TP8 (mixed) |
+| `contiguous` | H200 | Prefill, EP8/EP16/EP32 |
+| `masked` | H200 | Decode, EP8/EP16/EP32 |
+| `indexed` | B200/B300 | EP8 decode |
 
 ## Performance
 
-Per-call latency against public Humming main
-([`vllm-project/humming@c00b2e6`](https://github.com/vllm-project/humming/commit/c00b2e645a4b5ef57174f40254968a2996944217),
-2026-10-16), each backend measured against the matching Humming path
-(`indexed` against `indexed`, the grouped modes against Humming's own
-`grouped_contiguous`/`grouped_masked`) on the same GPU. Full tables, and how
-this baseline differs from the July revision this repository derives from, are
-in [docs/performance.md](docs/performance.md).
+speedup(gate_up + down) over
+[`vllm-project/humming@c00b2e6`](https://github.com/vllm-project/humming/commit/c00b2e645a4b5ef57174f40254968a2996944217)
+(2026-10-16) on the same GPU, detailed in [docs/performance.md](docs/performance.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
-  <img src="docs/assets/benchmark_chart.svg" alt="Per-call latency versus token count for the public Humming baseline and this repository across the six measured scenarios, lower is better">
+  <img src="docs/assets/benchmark_chart.svg" alt="speedup(gate_up + down) of chord over Humming for each measured scenario and size">
 </picture>
 
 ## Installation
@@ -53,104 +46,44 @@ in [docs/performance.md](docs/performance.md).
 pip install git+https://github.com/novitalabs/chord.git
 ```
 
-NVIDIA CUTLASS ships as a git submodule and supplies the arch headers the JIT
-compiles against; `pip` fetches it as part of the command above. A source
-checkout needs it initialized explicitly:
-
-```bash
-git clone --recurse-submodules https://github.com/novitalabs/chord.git
-cd chord
-pip install -e .
-```
-
-For a checkout that already exists, run `git submodule update --init --recursive`
-first.
-
 ## Quick start
+
+### indexed
 
 ```python
 import torch
+from chord_kernels import indexed, indexed_block_m, pack_w4a16_indexed
 
-from chord_kernels import indexed
-from chord_kernels.operator import pack_w4a16
+weight = pack_w4a16_indexed(weight_uint4, scale)
+locks = torch.zeros(1024, dtype=torch.int32, device="cuda")
 
-weight = torch.randint(
-    0, 16, (num_experts, n, k), dtype=torch.int32, device="cuda"
-).contiguous()
-scale = torch.ones(
-    (num_experts, n, k // 32), dtype=torch.bfloat16, device="cuda"
-).contiguous()
-packed = pack_w4a16(weight, scale, layout="mma")
-
-output = indexed(
-    inputs, packed, sorted_ids, expert_ids, num_tokens_padded, top_k
-)
-# down projection: inputs are the already-routed (top_k-expanded) activations,
-# so call with top_k=1
+# sorted_ids / expert_ids / num_tokens_padded: routing aligned to block_m
+block_m = indexed_block_m(weight, num_tokens, top_k)
+out = indexed(x, weight, sorted_ids, expert_ids, num_tokens_padded, top_k, locks=locks)
 ```
 
-The full API surface — packing layouts, the routing contract, the layer adapter
-for framework integration and per-instance P/D role selection — is in
-[docs/getting_started.md](docs/getting_started.md).
+Details in [docs/getting_started.md](docs/getting_started.md).
 
-### DeepGEMM-layout grouped paths (SM90)
-
-**Grouped integration with vLLM's Humming backend is WIP.**
-
-The `masked` (decode) and `contiguous` (prefill) interfaces consume the
-DeepGEMM-native group layouts and pack a different weight buffer via
-`pack_w4a16_grouped`. The two modes are not interchangeable: masked packs
-with BLOCK_K=128, contiguous with BLOCK_K=64, and the packed buffer records
-the mode so a mismatch fails loudly at dispatch.
+### grouped (SM90)
 
 ```python
-from chord_kernels import contiguous, masked
-from chord_kernels.operator import pack_w4a16_grouped
+from chord_kernels import contiguous, masked, pack_w4a16_grouped
 
-# decode: activations laid out per expert with a fixed row budget per expert
-packed_masked = pack_w4a16_grouped(weight, scale, "masked")
-out = masked(a3, packed_masked, masked_m, expected_m)    # [G, max_m, N]
-
-# prefill: activations concatenated per expert, padded to 128-row boundaries
-packed_contig = pack_w4a16_grouped(weight, scale, "contiguous")
-out = contiguous(a2, packed_contig, m_indices)           # [m, N]
+weight = pack_w4a16_grouped(weight_uint4, scale)            # serves both operators
+out = masked(x3, weight, masked_m, expected_m)              # x3 [G, max_m, K] -> [G*max_m, N]
+out = contiguous(x2, weight, m_indices)                     # x2 [m, K], 128-row padded per expert
 ```
-
-Layer-level, `select_indexed_profile("auto")` keeps the indexed phase-1
-profiles by default; setting `CHORD_USE_GROUPED=1` before model
-load reroutes both SM90 roles to `h200_grouped_{prefill,decode}`.
 
 ## Documentation
 
-- [docs/getting_started.md](docs/getting_started.md) — JIT cache, low-level
-  API, routing contract, layer adapter, tests.
-- [docs/performance.md](docs/performance.md) — the measured tables behind the
-  chart above.
-- [docs/optimizations.md](docs/optimizations.md) — what the three published
-  scenarios changed relative to the public Humming baseline, with measurements.
-- [docs/tuning.md](docs/tuning.md) — instruction paths, block-M model, the
-  2-CTAs/SM window, and the stream-K reduction.
-- [docs/benchmarking.md](docs/benchmarking.md) — timing methods, `cos_diff`, and
-  reading TFLOPS/GB-s.
-- [docs/shapes.md](docs/shapes.md) — Kimi K2.5 EP8 and TP8 shape derivation,
-  token-count scoping, routing distribution, and the gate/up vs down contract.
+- [docs/getting_started.md](docs/getting_started.md): API, routing contract, environment variables, tests.
+- [docs/performance.md](docs/performance.md): measured tables, shapes and method.
+- [docs/design.md](docs/design.md): kernels, schedule selection, stream-K.
 
-## Provenance and license
+## Acknowledgement
 
-This repository derives from the public `inclusionAI/humming` (now
-`vllm-project/humming`) commit
-[`4351af3a8fcdce1a8dee50104ba49566af2427fb`](https://github.com/vllm-project/humming/commit/4351af3a8fcdce1a8dee50104ba49566af2427fb);
-"based on Humming" describes source lineage, not a runtime dependency. The
-SM90 `masked`/`contiguous` backend additionally vendors the W4A16 kernel and
-its launch heuristics from `deepseek-ai/DeepGEMM`
-([public release commit `7f2a703`](https://github.com/deepseek-ai/DeepGEMM/tree/7f2a703ed51ac1f7af07f5e1453b2d3267d37d50),
-secondarily developed; MIT), together with the arch-level CUTLASS/CuTe headers
-it includes (BSD-3-Clause, NVIDIA). The extraction scope, W4A16 modifications and
-retained files of both upstreams are listed in
-[chord_kernels/operator/SOURCE.md](chord_kernels/operator/SOURCE.md). The
-upstream license texts are in
-[chord_kernels/operator/LICENSE](chord_kernels/operator/LICENSE),
-[chord_kernels/operator/include/deep_gemm/LICENSE](chord_kernels/operator/include/deep_gemm/LICENSE)
-and
-[chord_kernels/operator/include/cutlass/LICENSE.txt](chord_kernels/operator/include/cutlass/LICENSE.txt);
-the repository as a whole is Apache-2.0.
+This project builds on
+
+* [Humming](https://github.com/vllm-project/humming), whose indexed W4A16 MoE kernel the `indexed` operator derives from
+* [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM/), whose SM90 W4A16 GEMM and launch heuristics the `masked`/`contiguous` operators vendor
+* [CUTLASS](https://github.com/nvidia/cutlass), for the CuTe/CUTLASS arch headers the kernels include

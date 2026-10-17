@@ -124,13 +124,13 @@ def run_indexed_case(
     check: bool = True,
     check_rows: int | None = None,
 ) -> BenchmarkResult:
-    """Run one case, check a route prefix, and return measured throughput."""
+    """Run one case through the public ``indexed``, check a route prefix, and
+    return measured throughput."""
 
     from chord_kernels import indexed
 
     tensors = generate_indexed_case(case, device)
-    layout = tensors.profile.layout
-    swap_ab = tensors.kernel_config.swap_ab
+    layout = "wgmma" if tensors.kernel_config.warp_shape[1] == 32 else "mma"
 
     def invoke() -> torch.Tensor:
         return indexed(
@@ -143,11 +143,7 @@ def run_indexed_case(
             # division becomes an identity map over already routed rows.
             case.kernel_top_k,
             outputs=tensors.output,
-            config=tensors.kernel_config,
-            layout=layout,
-            swap_ab=swap_ab,
-            valid_shape_m=case.routed_m,
-            validate_routing=False,
+            locks=tensors.locks,
         )
 
     output, seconds = benchmark(
@@ -229,7 +225,7 @@ def _print_row(result: BenchmarkResult, shape_columns: tuple[str, ...] = ()) -> 
     case = result.case
     cosine = "-" if result.cosine_diff is None else f"{result.cosine_diff:.2e}"
     available = {
-        "profile": case.profile,
+        "profile": case.scenario,
         "proj": case.projection,
         "n": str(case.n),
         "k": str(case.k),
@@ -279,7 +275,7 @@ def _group_title(case: IndexedCase) -> str:
         shard = "TP8 mix (384 experts on each of 8 GPUs, moe_intermediate/8)"
     else:
         shard = "EP8 (384 experts / 8 GPUs)"
-    return f"{case.profile} -- Kimi K2.5 {shard}, {tokens}"
+    return f"{case.scenario} -- Kimi K2.5 {shard}, {tokens}"
 
 
 def _run_case_table(
@@ -307,7 +303,7 @@ def _run_case_table(
         varying[group] = tuple(
             name
             for name, getter in (
-                ("profile", lambda case: case.profile),
+                ("profile", lambda case: case.scenario),
                 ("proj", lambda case: case.projection),
                 ("n", lambda case: case.n),
                 ("k", lambda case: case.k),
@@ -357,10 +353,12 @@ def supported_gpu() -> torch.device:
 
 
 @pytest.mark.gpu
-def test_indexed_layer_correctness(supported_gpu: torch.device) -> None:
-    """Drive the vLLM-facing layer adapter end to end on a checkpoint tensor."""
+def test_indexed_checkpoint_weight_correctness(supported_gpu: torch.device) -> None:
+    """Pack a checkpoint-form (eight nibbles per int32) weight and run the tuned
+    decode config end to end against the BF16 dequant reference."""
 
-    from chord_kernels.operator import IndexedW4A16Layer
+    from chord_kernels.operator import w4a16_indexed as indexed
+    from chord_kernels import pack_w4a16_indexed
 
     capability = torch.cuda.get_device_capability(supported_gpu)
     profile = "h200_decode_ep8" if capability == (9, 0) else "blackwell_decode_ep8"
@@ -368,25 +366,19 @@ def test_indexed_layer_correctness(supported_gpu: torch.device) -> None:
         profile, m=8, n=128, k=128, num_experts=4, top_k=2, seed=20260810
     )
     tensors = generate_indexed_case(case, supported_gpu)
-    layer = IndexedW4A16Layer(
-        shape_n=case.n,
-        shape_k=case.k,
-        num_experts=case.num_experts,
-        profile=profile,
+    weight = pack_w4a16_indexed(
+        pack_checkpoint_uint4(tensors.logical_weight), tensors.scale, packed=True
     )
-    layer.load_weight(
-        pack_checkpoint_uint4(tensors.logical_weight).cpu(),
-        tensors.scale.cpu(),
-        packed=True,
-    )
-    layer.to(supported_gpu)
-    layer.process_weights_after_loading()
-    actual = layer(
+    assert torch.equal(weight.packed, tensors.prepared_weight.packed)
+    actual = indexed(
         tensors.activation,
+        weight,
         tensors.sorted_ids,
         tensors.expert_ids,
         tensors.num_tokens_padded,
         case.kernel_top_k,
+        config=tensors.kernel_config,
+        locks=tensors.locks,
     )
     reference, rows = reference_indexed(
         tensors.activation,
@@ -546,7 +538,7 @@ def test_prefill_routed_rows_match_system_tokens() -> None:
     prefill = [
         case
         for case in PERFORMANCE_CASES
-        if case.profile == "h200_prefill_ep8" and case.projection == "gate_up"
+        if case.scenario == "h200_prefill_ep8" and case.projection == "gate_up"
     ]
     assert [case.routed_m for case in prefill] == list(PREFILL_SYSTEM_TOKENS)
 
@@ -561,7 +553,7 @@ def test_tp8_routed_rows_are_eight_times_ep8() -> None:
     tp8 = [
         case
         for case in PERFORMANCE_CASES
-        if case.profile == "h200_tp8" and case.projection == "gate_up"
+        if case.scenario == "h200_tp8" and case.projection == "gate_up"
     ]
     assert [case.token_count for case in tp8] == list(PREFILL_SYSTEM_TOKENS)
     assert [case.routed_m for case in tp8] == [
@@ -574,7 +566,7 @@ def test_tp8_routed_rows_are_eight_times_ep8() -> None:
 def test_tp8_shapes_slice_the_intermediate_dimension() -> None:
     """TP8 narrows gate/up's N and down's K by 8, keeping all 384 experts."""
 
-    tp8 = [case for case in PERFORMANCE_CASES if case.profile == "h200_tp8"]
+    tp8 = [case for case in PERFORMANCE_CASES if case.scenario == "h200_tp8"]
     assert tp8, "the TP8 profile declares no cases"
     gate_up = {(case.n, case.k) for case in tp8 if case.projection == "gate_up"}
     down = {(case.n, case.k) for case in tp8 if case.projection == "down"}
@@ -594,7 +586,7 @@ def test_tp8_and_ep8_sweep_the_same_token_counts() -> None:
         return [
             case.token_count
             for case in PERFORMANCE_CASES
-            if case.profile == profile and case.projection == "gate_up"
+            if case.scenario == profile and case.projection == "gate_up"
         ]
 
     assert tokens("h200_tp8") == tokens("h200_prefill_ep8")
@@ -606,7 +598,7 @@ def test_decode_tokens_are_already_per_gpu() -> None:
     decode = [
         case
         for case in PERFORMANCE_CASES
-        if case.profile == "h200_decode_ep8" and case.projection == "gate_up"
+        if case.scenario == "h200_decode_ep8" and case.projection == "gate_up"
     ]
     assert [case.m for case in decode] == list(DECODE_TOKENS_PER_GPU)
     assert [case.routed_m for case in decode] == [
@@ -640,7 +632,7 @@ def test_prefill_block_m_follows_tokens_per_expert(
 ) -> None:
     """Prefill block-M must track tok_e."""
 
-    from chord_kernels.operator.layer import _h200_prefill_block_m
+    from chord_kernels.operator.tuning import _h200_prefill_block_m
 
     assert _h200_prefill_block_m(routed_m, 48, shape_k) == expected
 
@@ -717,7 +709,7 @@ def test_tp8_block_m_follows_tokens_per_expert(
     96..144 band beats the taller tiles EP8 grows into.
     """
 
-    from chord_kernels.operator.layer import _h200_tp8_block_m
+    from chord_kernels.operator.tuning import _h200_tp8_block_m
 
     assert _h200_tp8_block_m(routed_m, 384, shape_k) == expected
 
@@ -750,7 +742,7 @@ def test_tp8_stream_k_gate(
 ) -> None:
     """down is one-pass outside the mid-size window; gate/up splits outside it."""
 
-    from chord_kernels.operator.layer import _h200_tp8_use_stream_k
+    from chord_kernels.operator.tuning import _h200_tp8_use_stream_k
 
     assert _h200_tp8_use_stream_k(routed_m, 384, shape_k) is expected
 
@@ -790,16 +782,9 @@ def test_tp8_configs_at_benchmark_points(
     so a change here is a change to published numbers.
     """
 
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.tuning import _select_indexed_kernel_config
 
-    meta = IndexedLayerMeta(
-        shape_n=shape_n,
-        shape_k=shape_k,
-        num_experts=384,
-        profile=_PROFILES["h200_tp8"],
-    )
-    config = meta.kernel_config(routed_m)
+    config = _select_indexed_kernel_config("h200_tp8", shape_n, shape_k, 384, routed_m)
     assert config.block_shape == block_shape
     assert config.warp_shape == (block_shape[0], 32, 64)
     assert config.num_stages == num_stages
@@ -818,20 +803,15 @@ def test_tp8_down_never_drops_to_one_cta() -> None:
     points.
     """
 
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.tuning import _select_indexed_kernel_config
     from chord_kernels.operator.tuning import (
         _H200_SMEM_PER_SM,
         _H200_SMEM_RESERVED_PER_CTA,
         _indexed_smem_bytes,
     )
 
-    meta = IndexedLayerMeta(
-        shape_n=7168, shape_k=256, num_experts=384,
-        profile=_PROFILES["h200_tp8"],
-    )
     for routed_m in (1, 512, 8192, 16384, 26148, 32768, 65536, 131072, 262144):
-        config = meta.kernel_config(routed_m)
+        config = _select_indexed_kernel_config("h200_tp8", 7168, 256, 384, routed_m)
         assert config.num_ctas_per_sm == 2, routed_m
         if config.block_n == 256:
             assert config.block_m <= 72, routed_m
@@ -844,12 +824,11 @@ def test_tp8_down_never_drops_to_one_cta() -> None:
 def test_stage_depth_never_costs_a_resident_cta() -> None:
     """Every published H200 row fits its CTAs/SM in shared memory."""
 
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES, _indexed_tuning_rows
     from chord_kernels.operator.tuning import (
         _H200_SMEM_PER_SM,
         _H200_SMEM_RESERVED_PER_CTA,
         _indexed_smem_bytes,
+        _select_indexed_kernel_config,
     )
 
     for name, shapes, experts in (
@@ -857,22 +836,22 @@ def test_stage_depth_never_costs_a_resident_cta() -> None:
         ("h200_tp8", ((512, 7168), (7168, 256)), 384),
     ):
         for shape_n, shape_k in shapes:
-            meta = IndexedLayerMeta(
-                shape_n=shape_n, shape_k=shape_k, num_experts=experts,
-                profile=_PROFILES[name],
-            )
-            for _, _, row in _indexed_tuning_rows(meta):
-                per_cta = _indexed_smem_bytes(*row["block_shape"], row["num_stages"])
-                resident = row["num_ctas_per_sm"] * (
+            configs = {
+                _select_indexed_kernel_config(name, shape_n, shape_k, experts, m)
+                for m in range(1, 368 * experts + 1, 7)
+            }
+            for config in configs:
+                per_cta = _indexed_smem_bytes(*config.block_shape, config.num_stages)
+                resident = config.num_ctas_per_sm * (
                     per_cta + _H200_SMEM_RESERVED_PER_CTA
                 )
-                assert resident <= _H200_SMEM_PER_SM, (name, shape_n, row)
+                assert resident <= _H200_SMEM_PER_SM, (name, shape_n, config)
 
 
 def test_prefill_block_m_is_deterministic() -> None:
     """The block-count argmin samples a routing, so it must use a fixed seed."""
 
-    from chord_kernels.operator.layer import _h200_prefill_block_m
+    from chord_kernels.operator.tuning import _h200_prefill_block_m
 
     first = [_h200_prefill_block_m(m, 48, 7168) for m in (512, 1024, 2048)]
     second = [_h200_prefill_block_m(m, 48, 7168) for m in (512, 1024, 2048)]
@@ -906,7 +885,7 @@ def test_prefill_stream_k_gate(
 ) -> None:
     """Prefill enables stream-K except the mid-size window and large mid-K down."""
 
-    from chord_kernels.operator.layer import _h200_prefill_use_stream_k
+    from chord_kernels.operator.tuning import _h200_prefill_use_stream_k
 
     assert _h200_prefill_use_stream_k(routed_m, 48, shape_n, shape_k) == expected
 
@@ -930,14 +909,9 @@ def test_h200_decode_ctas_per_sm(
 ) -> None:
     """H200 decode runs 3 CTAs/SM except down's block-M 8 swap-AB tile."""
 
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.tuning import _select_indexed_kernel_config
 
-    meta = IndexedLayerMeta(
-        shape_n=shape_n, shape_k=shape_k, num_experts=48,
-        profile=_PROFILES["h200_decode_ep8"],
-    )
-    config = meta.kernel_config(routed_m)
+    config = _select_indexed_kernel_config("h200_decode_ep8", shape_n, shape_k, 48, routed_m)
     assert config.block_shape == (block_m, 256, 64)
     assert config.swap_ab is True
     assert config.num_ctas_per_sm == num_ctas_per_sm
@@ -952,30 +926,22 @@ def test_decode_stream_k_policy() -> None:
     the split on the large non-swap tiles.
     """
 
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.tuning import _select_indexed_kernel_config
 
     for shape_n, shape_k in ((4096, 7168), (7168, 2048)):
-        meta = IndexedLayerMeta(
-            shape_n=shape_n, shape_k=shape_k, num_experts=48,
-            profile=_PROFILES["h200_decode_ep8"],
-        )
         for routed_m in (160, 400, 8192):
-            assert not meta.kernel_config(routed_m).use_stream_k
+            config = _select_indexed_kernel_config("h200_decode_ep8", shape_n, shape_k, 48, routed_m)
+            assert not config.use_stream_k
 
-    blackwell = _PROFILES["blackwell_decode_ep8"]
-    gate_up = IndexedLayerMeta(
-        shape_n=4096, shape_k=7168, num_experts=48, profile=blackwell
-    )
-    down = IndexedLayerMeta(
-        shape_n=7168, shape_k=2048, num_experts=48, profile=blackwell
-    )
+    def blackwell(shape_n, shape_k, routed_m):
+        return _select_indexed_kernel_config("blackwell_decode_ep8", shape_n, shape_k, 48, routed_m)
+
     for routed_m in (160, 400, 1200, 8192):
-        assert gate_up.kernel_config(routed_m).use_stream_k
+        assert blackwell(4096, 7168, routed_m).use_stream_k
     for routed_m in (160, 400, 848):
-        assert not down.kernel_config(routed_m).use_stream_k
+        assert not blackwell(7168, 2048, routed_m).use_stream_k
     for routed_m in (1200, 8192):
-        assert down.kernel_config(routed_m).use_stream_k
+        assert blackwell(7168, 2048, routed_m).use_stream_k
 
 
 def test_prefill_forces_two_ctas_in_block_m_window() -> None:
@@ -988,17 +954,14 @@ def test_prefill_forces_two_ctas_in_block_m_window() -> None:
     block_m > 80) stays at 1 CTA/SM.
     """
 
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator.tuning import _select_indexed_kernel_config
     from chord_kernels.operator.tuning import _uses_mid_tiles
 
-    profile = _PROFILES["h200_prefill_ep8"]
     for shape_n, shape_k in ((4096, 7168), (7168, 2048)):
-        meta = IndexedLayerMeta(
-            shape_n=shape_n, shape_k=shape_k, num_experts=48, profile=profile
-        )
         for routed_m in (512, 900, 1024, 2048, 3500, 4096, 8192, 16384, 65536):
-            config = meta.kernel_config(routed_m)
+            config = _select_indexed_kernel_config(
+                "h200_prefill_ep8", shape_n, shape_k, 48, routed_m
+            )
             in_window = config.block_n == 256 and 40 <= config.block_m <= 80
             if _uses_mid_tiles(routed_m, 48):
                 in_window = config.block_n == 256
@@ -1015,169 +978,122 @@ def test_traffic_bytes_counts_only_active_experts() -> None:
     assert _case_traffic_bytes(case, 48) > _case_traffic_bytes(case, 8)
 
 
-def test_tuning_rows_cover_all_routed_m() -> None:
-    """`get_default_tuning_configs` rows form contiguous brackets over routed-M.
+def test_select_indexed_config_contract() -> None:
+    """The public selector picks the table from the GPU, the shape and routed-M,
+    keeps N/K under a shared routing block-M, and checks its inputs."""
 
-    Frameworks index the table with `min_m < routed_m <= max_m`, so the rows
-    must tile [0, 2^30] without gaps and carry the resolver's schedule.
-    """
-
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES, _indexed_tuning_rows
-
-    # Each profile is swept at one of its own tuned shapes: TP8 narrows gate/up's
-    # N to 512 and holds all 384 experts, so the EP8 shape would only exercise
-    # the generic fallback and never reach the TP8 rows.
-    sweeps = (
-        ("h200_prefill_ep8", 4096, 7168, 48),
-        ("h200_tp8", 512, 7168, 384),
-        ("h200_decode_ep8", 4096, 7168, 48),
-        ("blackwell_decode_ep8", 4096, 7168, 48),
-    )
-    for profile_name, shape_n, shape_k, num_experts in sweeps:
-        meta = IndexedLayerMeta(
-            shape_n=shape_n, shape_k=shape_k, num_experts=num_experts,
-            profile=_PROFILES[profile_name],
-        )
-        rows = _indexed_tuning_rows(meta)
-        assert rows[0][0] == 0
-        assert rows[-1][1] == 1 << 30
-        for previous, current in zip(rows, rows[1:]):
-            assert previous[1] == current[0]
-        for _, _, config in rows:
-            assert config["block_m"] == config["block_shape"][0]
-            assert config["layout"] == meta.layout
-
-
-def test_shard_axis_shapes_match_tuning() -> None:
-    """The axis-inference table must list exactly the tuned shapes.
-
-    Shard-axis recovery keys on the published projection shapes, so if a tuned
-    shape is added to the resolver without being registered here, that shape
-    would infer the wrong axis (or none).  This reads the resolver's own guards
-    back out by asking which shapes actually get a non-fallback schedule.
-    """
-
-    from chord_kernels.operator import IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES
-    from chord_kernels.operator.profiles import (
-        _EP8_SHAPES,
-        _TP8_SHAPES,
-        shard_axis_from_shapes,
+    from chord_kernels.operator import IndexedKernelConfig
+    from chord_kernels.operator.tuning import select_indexed_config
+    from chord_kernels.operator.tuning import (
+        _H200_DECODE_MAX_TOKENS_PER_EXPERT,
+        _select_indexed_kernel_config,
     )
 
-    assert not set(_EP8_SHAPES) & set(_TP8_SHAPES), "axes must be distinguishable"
+    h200, b300 = (9, 0), (10, 3)
 
-    for axis, shapes, profile_name, num_experts in (
-        ("ep", _EP8_SHAPES, "h200_prefill_ep8", 48),
-        ("tp", _TP8_SHAPES, "h200_tp8", 384),
+    def pick(n, k, e, m, cap, **kw):
+        return select_indexed_config(n, k, e, m, capability=cap, **kw)
+
+    # Every published benchmark point resolves to the table it was tuned in.
+    for scenario, cap, (n, k), e, routed in (
+        ("h200_prefill_ep8", h200, (4096, 7168), 48, (1024, 2048, 4096, 8192, 16384)),
+        ("h200_prefill_ep8", h200, (7168, 2048), 48, (1024, 2048, 4096, 8192, 16384)),
+        ("h200_tp8", h200, (512, 7168), 384, (8192, 16384, 32768, 65536, 131072)),
+        ("h200_tp8", h200, (7168, 256), 384, (8192, 16384, 32768, 65536, 131072)),
+        ("h200_decode_ep8", h200, (4096, 7168), 48, (160, 240, 320, 400)),
+        ("h200_decode_ep8", h200, (7168, 2048), 48, (160, 240, 320, 400)),
+        ("blackwell_decode_ep8", b300, (4096, 7168), 48, (160, 240, 320, 400, 8192)),
+        ("blackwell_decode_ep8", (10, 0), (7168, 2048), 48, (160, 1200)),
     ):
-        for shape_n, shape_k in shapes:
-            assert shard_axis_from_shapes(shape_n, shape_k) == axis
-            # A tuned shape resolves to a schedule the profile fallback would
-            # not produce, which is what makes it "published" for this axis.
-            meta = IndexedLayerMeta(
-                shape_n=shape_n, shape_k=shape_k, num_experts=num_experts,
-                profile=_PROFILES[profile_name],
-            )
-            tuned = meta.kernel_config(num_experts * 256)
-            assert tuned.block_m != meta.profile.block_m, (
-                f"{profile_name} {shape_n}x{shape_k} hit the profile fallback; "
-                "it is listed as a tuned shape but the resolver has no row"
-            )
+        for m in routed:
+            assert pick(n, k, e, m, cap) == _select_indexed_kernel_config(scenario, n, k, e, m)
 
-    # An unlisted shape must infer nothing rather than be forced onto an axis.
-    assert shard_axis_from_shapes(2048, 2048) is None
+    # H200 EP8 switches from the swap-AB decode table to the WGMMA prefill
+    # table at the measured crossover.
+    edge = int(_H200_DECODE_MAX_TOKENS_PER_EXPERT * 48)
+    assert pick(4096, 7168, 48, edge - 8, h200).swap_ab
+    assert pick(4096, 7168, 48, edge + 8, h200).warp_shape[1] == 32
 
-
-def test_sm90_decode_env_selects_profile(monkeypatch: pytest.MonkeyPatch) -> None:
-    """CHORD_SM90_DECODE off means prefill.
-
-    The SM90 role bit only fills in when ``profile="auto"`` carries no explicit
-    mode; explicit arguments always win, and any value other than 0/1 is
-    rejected rather than silently mapped to a role.
-    """
-
-    from chord_kernels.operator import layer as layer_module
-
-    monkeypatch.delenv("CHORD_SM90_DECODE", raising=False)
-    assert layer_module.indexed_mode_from_env() is None
-    layer = layer_module.IndexedW4A16Layer(shape_n=128, shape_k=64, num_experts=1)
-    assert layer.indexed_profile.name == "h200_prefill_ep8"
-
-    monkeypatch.setenv("CHORD_SM90_DECODE", "1")
-    layer = layer_module.IndexedW4A16Layer(shape_n=128, shape_k=64, num_experts=1)
-    assert layer.indexed_profile.name == "h200_decode_ep8"
-
-    # Explicit arguments beat the environment.
-    layer = layer_module.IndexedW4A16Layer(
-        shape_n=128, shape_k=64, num_experts=1, mode="prefill"
+    # Unpublished shapes run the untuned fallback of the chosen family.
+    assert pick(2048, 2048, 48, 4096, h200) == IndexedKernelConfig.default(
+        layout="wgmma", block_m=16, block_n=256, swap_ab=False
     )
-    assert layer.indexed_profile.name == "h200_prefill_ep8"
-
-    monkeypatch.setenv("CHORD_SM90_DECODE", "yes")
-    with pytest.raises(ValueError, match="CHORD_SM90_DECODE"):
-        layer_module.indexed_mode_from_env()
-
-
-def test_layer_adapter_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    import chord_kernels.operator.layer as layer_module
-
-    layer = layer_module.IndexedW4A16Layer(
-        shape_n=128,
-        shape_k=64,
-        num_experts=1,
-        profile="h200_decode_ep8",
+    assert pick(2048, 2048, 48, 160, b300) == IndexedKernelConfig.default(
+        layout="mma", block_m=8, block_n=256, swap_ab=True
     )
-    checkpoint_weight = torch.zeros((1, 128, 8), dtype=torch.int32)
-    checkpoint_scale = torch.ones((1, 128, 2), dtype=torch.bfloat16)
-    layer.load_weight(checkpoint_weight, checkpoint_scale, packed=True)
-    assert tuple(layer.weight.shape) == (1, 128, 8)
-    assert layer._prepared_weight is None
 
-    meta = layer_module.IndexedW4A16Method.prepare_layer_meta(
-        layer,
-        shape_n=128,
-        shape_k=64,
-        num_experts=1,
-        sublayer_name="w13",
-    )
-    assert (meta.weight_name, meta.weight_scale_name) == (
-        "w13_weight",
-        "w13_weight_scale",
-    )
-    rows = layer_module.IndexedW4A16Method.get_default_tuning_configs(layer)
-    assert rows[0][2]["block_shape"] == (8, 128, 64)
+    # A shared routing block-M replaces the M tile and keeps N/K.
+    base = pick(4096, 7168, 48, 3072, h200)
+    for block_m in (8, 16, 24, 48):
+        shared = pick(4096, 7168, 48, 3072, h200, block_m=block_m)
+        assert shared.block_m == shared.warp_shape[0] == block_m
+        assert shared.block_shape[1:] == base.block_shape[1:]
+    assert pick(4096, 7168, 48, 160, b300, block_m=24).swap_ab
 
-    expected = object()
-    calls = {}
+    with pytest.raises(RuntimeError, match="supports SM90"):
+        pick(4096, 7168, 48, 128, (8, 0))
+    with pytest.raises(ValueError, match="routing block_m"):
+        pick(4096, 7168, 48, 128, h200, block_m=12)
+    with pytest.raises(ValueError, match="routed_m"):
+        pick(4096, 7168, 48, -1, h200)
+    with pytest.raises(ValueError, match="shape_n"):
+        pick(0, 7168, 48, 128, h200)
 
-    def fake_indexed(*args, **kwargs):
-        calls.update(args=args, kwargs=kwargs)
-        return expected
 
-    # The kernel call is dispatched flatly; the dispatch module owns the single
-    # ``w4a16_indexed`` call site.
-    from chord_kernels.operator import dispatch as dispatch_mod
+def test_public_api_surface() -> None:
+    """The package exports the operators and packers, and nothing tuning-specific."""
 
-    monkeypatch.setattr(dispatch_mod, "w4a16_indexed", fake_indexed)
-    layer._prepared_weight = object()
-    inputs = torch.zeros((1, 64), dtype=torch.bfloat16)
-    sorted_ids = torch.arange(8, dtype=torch.int32)
-    expert_ids = torch.zeros(1, dtype=torch.int32)
-    count = torch.tensor(8, dtype=torch.int32)
-    assert layer(inputs, sorted_ids, expert_ids, count, 1) is expected
-    assert calls["args"][1] is layer._prepared_weight
-    assert calls["kwargs"]["validate_routing"] is False
+    import chord_kernels
+
+    assert sorted(chord_kernels.__all__) == [
+        "contiguous", "indexed", "indexed_block_m", "masked", "pack_w4a16_grouped",
+        "pack_w4a16_indexed",
+    ]
+    for name in chord_kernels.__all__:
+        assert callable(getattr(chord_kernels, name))
+    import inspect
+
+    params = inspect.signature(chord_kernels.indexed).parameters
+    assert not {"config", "layout", "swap_ab"} & set(params)
+
+
+def test_indexed_block_m_matches_the_tuned_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``indexed_block_m`` is the tuned config's block-M for routed_m = tokens * top_k."""
+
+    from chord_kernels import indexed_block_m
+    from chord_kernels.operator import PreparedWeight
+    from chord_kernels.operator import tuning
+
+    monkeypatch.setattr(tuning, "_device_capability", lambda index: (9, 0))
+    for (n, k, e), tokens in (
+        ((4096, 7168, 48), 20), ((7168, 2048, 48), 2048), ((512, 7168, 384), 1024),
+    ):
+        w = PreparedWeight(packed=torch.empty(0), scale=torch.empty(0), n=n, k=k,
+                           num_experts=e)
+        expected = tuning.select_indexed_config(n, k, e, tokens * 8, capability=(9, 0)).block_m
+        assert indexed_block_m(w, tokens, 8, device=0) == expected
+
+
+def test_indexed_kernels_covers_every_selected_config() -> None:
+    """``indexed_kernels`` (the precompile list) holds every config the selector
+    can return for a projection, each once."""
+
+    from chord_kernels.operator.tuning import select_indexed_config
+    from chord_kernels.operator.cpp_jit import indexed_kernels
+
+    for cap, (n, k), e in (((10, 3), (4096, 7168), 48), ((9, 0), (7168, 2048), 48)):
+        configs = [c for _, _, _, c in indexed_kernels(n, k, e, capability=cap)]
+        assert len(configs) == len(set(configs))
+        for routed_m in list(range(0, 3000, 7)) + [1 << 20]:
+            assert select_indexed_config(n, k, e, routed_m, capability=cap) in configs
 
 
 def test_checkpoint_uint4_layout() -> None:
-    from chord_kernels.operator import unpack_packed_uint4
+    from chord_kernels.operator.grouped.packing import _unpack_checkpoint_codes
 
     logical = torch.arange(16, dtype=torch.int32).repeat(1, 128, 4)
     packed = pack_checkpoint_uint4(logical)
-    unpacked = unpack_packed_uint4(packed, shape_k=64)
-    assert torch.equal(unpacked, logical)
+    assert torch.equal(_unpack_checkpoint_codes(packed).to(torch.int32), logical)
 
 
 def test_sm103_jit_target(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1262,7 +1178,8 @@ def _stream_k_swap_ab_case(device: torch.device, seed: int):
     K = 7168 (112 K-blocks) at 4 CTAs/SM leaves the tail tiles split more than
     three ways, so the stream-K reduction is exercised on every launch.
     """
-    from chord_kernels.operator import IndexedKernelConfig, pack_w4a16
+    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels.operator import IndexedKernelConfig
 
     num_experts, top_k, m, n, k = 8, 4, 24, 512, 7168
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -1270,7 +1187,7 @@ def _stream_k_swap_ab_case(device: torch.device, seed: int):
                           generator=gen)
     scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
              + 0.005).to(torch.bfloat16)
-    weight = pack_w4a16(codes, scale, layout="mma")
+    weight = pack_w4a16_indexed(codes, scale)
     config = IndexedKernelConfig(
         block_shape=(8, 256, 64), warp_shape=(8, 64, 64), num_stages=4,
         num_ctas_per_sm=4, swap_ab=True, use_stream_k=True,
@@ -1294,24 +1211,25 @@ def test_stream_k_first_launch_inside_cuda_graph_capture(
 ) -> None:
     """A stream's first stream-K launch may be inside a CUDA-graph capture.
 
-    vLLM captures decode graphs on a stream that never ran the kernel eagerly,
-    so the per-stream lock buffer is first requested during capture.  The
-    capture must succeed, and both graph replays and an eager launch on the
-    capture stream (whose locks were allocated mid-capture) must match the
-    reference.  FP32 stream-K also allocates its workspace there, and its
-    replays must be bit-identical.
+    vLLM captures decode graphs on a stream that never ran the kernel eagerly.
+    The caller's lock buffer is allocated beforehand and the FP32 workspace
+    comes from the caching allocator, so nothing in the launch allocates
+    outside PyTorch: the capture must succeed, and graph replays and an eager
+    launch on the capture stream must match the reference (FP32 replays bit for
+    bit).
     """
     import dataclasses
 
-    from chord_kernels import indexed
+    from chord_kernels.operator import w4a16_indexed as indexed
 
     case = _stream_k_swap_ab_case(supported_gpu, seed=20261009)
     config = dataclasses.replace(case.config, stream_k_fp32=stream_k_fp32)
+    locks = torch.zeros(1024, dtype=torch.int32, device=supported_gpu)
 
     def run(out):
         return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
                        case.ntp, case.top_k, outputs=out, config=config,
-                       validate_routing=False)
+                       validate_routing=False, locks=locks)
 
     # Compile + load the kernel eagerly on the default stream only.
     run(torch.empty((case.rows, case.n), dtype=torch.bfloat16, device=supported_gpu))
@@ -1347,15 +1265,17 @@ def test_mma_stream_k_fp32_matches_one_pass(supported_gpu: torch.device) -> None
     flipped 10-55% of outputs."""
     import dataclasses
 
-    from chord_kernels import indexed
+    from chord_kernels.operator import w4a16_indexed as indexed
 
     case = _stream_k_swap_ab_case(supported_gpu, seed=20261013)
     assert case.config.stream_k_fp32
     one_pass = dataclasses.replace(case.config, use_stream_k=False, stream_k_fp32=False)
+    locks = torch.zeros(1024, dtype=torch.int32, device=supported_gpu)
 
     def run(config):
         return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
-                       case.ntp, case.top_k, config=config, validate_routing=False)
+                       case.ntp, case.top_k, config=config, validate_routing=False,
+                       locks=locks)
 
     reference = run(one_pass)
     outputs = [run(case.config) for _ in range(5)]
@@ -1366,8 +1286,8 @@ def test_mma_stream_k_fp32_matches_one_pass(supported_gpu: torch.device) -> None
 
 def test_stream_k_fp32_is_the_default_for_stream_k() -> None:
     """Stream-K configs (MMA and WGMMA) reduce in FP32 unless asked not to."""
-    from chord_kernels.operator import IndexedKernelConfig, IndexedLayerMeta
-    from chord_kernels.operator.layer import _PROFILES
+    from chord_kernels.operator import IndexedKernelConfig
+    from chord_kernels.operator.tuning import _select_indexed_kernel_config
 
     mma = dict(block_shape=(8, 256, 64), warp_shape=(8, 64, 64), num_ctas_per_sm=4,
                swap_ab=True)
@@ -1400,10 +1320,8 @@ def test_stream_k_fp32_is_the_default_for_stream_k() -> None:
     }
     for name, profile_shapes in shapes.items():
         for n, k, e in profile_shapes:
-            meta = IndexedLayerMeta(shape_n=n, shape_k=k, num_experts=e,
-                                    profile=_PROFILES[name])
             for routed_m in list(range(1, 4097, 31)) + [16384, 131072]:
-                config = meta.kernel_config(routed_m)
+                config = _select_indexed_kernel_config(name, n, k, e, routed_m)
                 assert config.stream_k_fp32 == config.use_stream_k
 
 
@@ -1422,8 +1340,9 @@ def test_wgmma_stream_k_fp32_matches_one_pass(
     in-flight accumulators and two launches disagreed)."""
     import dataclasses
 
-    from chord_kernels import indexed
-    from chord_kernels.operator import IndexedKernelConfig, pack_w4a16
+    from chord_kernels.operator import w4a16_indexed as indexed
+    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels.operator import IndexedKernelConfig
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("the WGMMA indexed layout needs SM90")
@@ -1434,7 +1353,7 @@ def test_wgmma_stream_k_fp32_matches_one_pass(
                           generator=gen)
     scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
              + 0.005).to(torch.bfloat16)
-    weight = pack_w4a16(codes, scale, layout="wgmma")
+    weight = pack_w4a16_indexed(codes, scale)
     del codes, scale
     stream_k = IndexedKernelConfig(
         block_shape=block_shape, warp_shape=(block_shape[0], 32, 64),
@@ -1448,13 +1367,108 @@ def test_wgmma_stream_k_fp32_matches_one_pass(
         topk_ids, block_m=stream_k.block_m, num_experts=num_experts)
     activation = torch.randn((num_tokens, k), dtype=torch.bfloat16, device=device,
                              generator=gen)
+    locks = torch.zeros(1024, dtype=torch.int32, device=device)
 
     def run(config):
         return indexed(activation, weight, sorted_ids, expert_ids, ntp, top_k,
-                       config=config, validate_routing=False)
+                       config=config, validate_routing=False, locks=locks)
 
     reference = run(one_pass)
     outputs = [run(stream_k) for _ in range(5)]
     torch.cuda.synchronize(device)
     assert all(torch.equal(out, outputs[0]) for out in outputs[1:])
     assert (outputs[0] == reference).double().mean().item() >= 0.995
+
+
+@pytest.mark.gpu
+def test_stream_k_caller_owned_locks_and_scratch_workspace(
+    supported_gpu: torch.device,
+) -> None:
+    """Stream-K buffers: the caller's lock tensor, and FP32 partials in
+    per-launch scratch from the PyTorch allocator.
+
+    A stream-K launch without locks, or with a buffer smaller than the launch's
+    tile bound, is rejected; a one-pass config ignores locks.  Eager launches and
+    a captured graph on the caller's locks are bit-identical and leave every lock
+    word at 0, and repeated launches do not grow allocated memory.
+    """
+    import dataclasses
+
+    from chord_kernels.operator import w4a16_indexed as indexed
+
+    case = _stream_k_swap_ab_case(supported_gpu, seed=20261014)
+    assert case.config.stream_k_fp32
+    locks = torch.zeros(1024, dtype=torch.int32, device=supported_gpu)
+
+    def run(out=None, owned_locks=None, config=case.config):
+        return indexed(case.activation, case.weight, case.sorted_ids, case.expert_ids,
+                       case.ntp, case.top_k, outputs=out, config=config,
+                       validate_routing=False, locks=owned_locks)
+
+    with pytest.raises(ValueError, match="locks"):
+        run()
+    with pytest.raises(RuntimeError, match="lock words"):
+        run(owned_locks=torch.zeros(8, dtype=torch.int32, device=supported_gpu))
+    one_pass = dataclasses.replace(case.config, use_stream_k=False, stream_k_fp32=False)
+    run(config=one_pass)
+
+    eager = run(owned_locks=locks)
+    torch.cuda.synchronize(supported_gpu)
+    assert not locks.any()
+    _check_output(eager[: case.rows], case.reference)
+
+    before = torch.cuda.memory_allocated(supported_gpu)
+    for _ in range(4):
+        run(eager, locks)
+    torch.cuda.synchronize(supported_gpu)
+    assert torch.cuda.memory_allocated(supported_gpu) == before
+
+    capture_stream = torch.cuda.Stream(device=supported_gpu)
+    graph_out = torch.zeros_like(eager)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        run(graph_out, locks)
+    for _ in range(3):
+        graph_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize(supported_gpu)
+        assert torch.equal(graph_out, eager)
+        assert not locks.any()
+
+
+@pytest.mark.gpu
+def test_one_packed_weight_serves_mma_and_wgmma() -> None:
+    """One packed weight feeds the WGMMA prefill/TP8 tile, the MMA non-swap tile
+    and the swap-AB decode tile, each matching the BF16 dequant reference."""
+    from chord_kernels.operator import w4a16_indexed as indexed
+    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels.operator import IndexedKernelConfig
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the WGMMA indexed kernel needs SM90")
+    device = torch.device("cuda")
+    num_experts, top_k, num_tokens, n, k = 8, 4, 64, 256, 1024
+    gen = torch.Generator(device=device).manual_seed(20261014)
+    codes = torch.randint(0, 16, (num_experts, n, k), dtype=torch.int32, device=device,
+                          generator=gen)
+    scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
+             + 0.005).to(torch.bfloat16)
+    weight = pack_w4a16_indexed(codes, scale)
+
+    activation = torch.randn((num_tokens, k), dtype=torch.bfloat16, device=device,
+                             generator=gen)
+    topk_ids = generate_topk_ids(num_tokens=num_tokens, top_k=top_k,
+                                 num_experts=num_experts, device=device, generator=gen)
+    reference, rows = reference_indexed(activation, codes, scale, topk_ids, top_k)
+    configs = (
+        IndexedKernelConfig(block_shape=(16, 128, 64), warp_shape=(16, 32, 64)),
+        IndexedKernelConfig(block_shape=(16, 256, 64), warp_shape=(16, 64, 64)),
+        IndexedKernelConfig(block_shape=(8, 256, 64), warp_shape=(8, 64, 64),
+                            num_ctas_per_sm=4, swap_ab=True),
+    )
+    for config in configs:
+        sorted_ids, expert_ids, ntp = align_routing_blocks(
+            topk_ids, block_m=config.block_m, num_experts=num_experts)
+        actual = indexed(activation, weight, sorted_ids, expert_ids, ntp, top_k,
+                         config=config, validate_routing=False)
+        _check_output(actual[:rows], reference)
