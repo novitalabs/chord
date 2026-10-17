@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import json
-import os
 import random
 import sys
 from collections.abc import Sequence
@@ -128,7 +126,7 @@ class ContiguousCase:
 
 # The upstream tuning matrix restricted to a fast, representative subset:
 # EP8/EP16/EP32 groups, both projections, small/mid/large decode buckets.
-# EP8 (G=48) is the shape docs/shapes.md derives, and it is also the width
+# EP8 (G=48) is the shape docs/performance.md (Shapes) derives, and it is also the width
 # where the masked BN rule flips: BN=256 needs enough N-tiles to fill the
 # machine, and the tile count scales with G.
 MASKED_CASES = [
@@ -148,7 +146,7 @@ CONTIGUOUS_CASES = [
 ]
 
 # Kimi K2.5 routing, the configuration these shapes are derived for; see
-# docs/shapes.md.  Used only to restate ``m/grp`` as the serving-side token
+# docs/performance.md (Shapes).  Used only to restate ``m/grp`` as the serving-side token
 # count each row models, so a tuning row can be matched to a deployment.
 _ROUTED_EXPERTS = 384
 _TOP_K = 8
@@ -247,7 +245,7 @@ def _pack_checkpoint_int32(codes: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Non-GPU unit tests: the heuristic port and the profile registry invariants.
+# Non-GPU unit tests: the heuristic port.
 # ---------------------------------------------------------------------------
 
 
@@ -263,7 +261,7 @@ def _expected_masked_config(num_sms: int = 132):
         (2048, 64, 7168, 48): (80, 256, 128, 4),
         (2048, 64, 7168, 24): (80, 256, 128, 4),
         (2048, 32, 7168, 12): (40, 256, 128, 4),
-        # EP8 (G=48), the width docs/shapes.md derives.  Its N-tile count is
+        # EP8 (G=48), the width docs/performance.md (Shapes) derives.  Its N-tile count is
         # past the 2-wave mark at both projections, so BN=256 holds in every
         # bracket -- EP8 exercises the wave guard's saturated side, while
         # EP32 (G=12, gate_up) is the only width that falls under 2 waves.
@@ -313,68 +311,8 @@ def test_sm90_w4a16_contiguous_heuristic_table() -> None:
     assert (small.layout.block_m, small.layout.block_n) == (64, 64)
 
 
-def test_grouped_profiles_are_load_time_consistent() -> None:
-    from chord_kernels.operator.layer import (
-        H200_GROUPED_DECODE,
-        H200_GROUPED_PREFILL,
-        IndexedLayerProfile,
-    )
-
-    assert H200_GROUPED_DECODE.backend == "grouped_masked"
-    assert H200_GROUPED_DECODE.mode == "decode"
-    assert H200_GROUPED_PREFILL.backend == "grouped_contiguous"
-    assert H200_GROUPED_PREFILL.mode == "prefill"
-    for profile in (H200_GROUPED_DECODE, H200_GROUPED_PREFILL):
-        assert profile.is_grouped
-        assert profile.layout == "wgmma" and not profile.swap_ab
-    with pytest.raises(ValueError):
-        IndexedLayerProfile(
-            name="bad_mode",
-            device_major=9,
-            mode="prefill",
-            expert_parallel_size=8,
-            layout="wgmma",
-            swap_ab=False,
-            block_m=8,
-            compute_capabilities=((9, 0),),
-            backend="grouped_masked",
-        )
-
-
-def test_select_indexed_profile_honors_grouped_switch(monkeypatch) -> None:
-    from chord_kernels.operator.layer import select_indexed_profile
-
-    monkeypatch.setenv("CHORD_USE_GROUPED", "1")
-    masked = select_indexed_profile("h200_grouped_decode")
-    contiguous = select_indexed_profile("h200_grouped_prefill")
-    assert masked.backend == "grouped_masked"
-    assert contiguous.backend == "grouped_contiguous"
-    for ep in (8, 16, 32):
-        select_indexed_profile("h200_grouped_decode", expert_parallel_size=ep)
-    monkeypatch.delenv("CHORD_USE_GROUPED")
-    with pytest.raises(ValueError):
-        select_indexed_profile("h200_grouped_decode", mode="prefill")
-    with pytest.raises(ValueError):
-        # The indexed profiles remain EP8-only.
-        select_indexed_profile("h200_decode_ep8", expert_parallel_size=16)
-
-
-def test_grouped_env_validation(monkeypatch) -> None:
-    from chord_kernels.operator.layer import use_grouped_from_env
-
-    monkeypatch.delenv("CHORD_USE_GROUPED", raising=False)
-    assert not use_grouped_from_env()
-    monkeypatch.setenv("CHORD_USE_GROUPED", "1")
-    assert use_grouped_from_env()
-    monkeypatch.setenv("CHORD_USE_GROUPED", "0")
-    assert not use_grouped_from_env()
-    monkeypatch.setenv("CHORD_USE_GROUPED", "yes")
-    with pytest.raises(ValueError):
-        use_grouped_from_env()
-
-
 # ---------------------------------------------------------------------------
-# GPU tests: packing, direct-API correctness, layer dispatch.
+# GPU tests: packing and direct-API correctness.
 # ---------------------------------------------------------------------------
 
 
@@ -388,10 +326,10 @@ def hopper() -> torch.device:
     return device
 
 
-def _pack_unpacked(codes: torch.Tensor, scale: torch.Tensor, mode: str):
+def _pack_unpacked(codes: torch.Tensor, scale: torch.Tensor):
     from chord_kernels.operator.grouped.packing import pack_w4a16_grouped
 
-    return pack_w4a16_grouped(codes, scale, mode, packed=False)
+    return pack_w4a16_grouped(codes, scale, packed=False)
 
 
 @pytest.mark.gpu
@@ -450,24 +388,21 @@ def test_pack_parity_packed_vs_unpacked(hopper: torch.device) -> None:
         torch.int32
     )
     scale = (torch.randn((g, n, k // 32), device=hopper) * 0.02).to(torch.bfloat16)
-    for mode in ("masked", "contiguous"):
-        unpacked = pack_w4a16_grouped(codes, scale, mode, packed=False)
-        packed = pack_w4a16_grouped(
-            _pack_checkpoint_int32(codes), scale, mode, packed=True
-        )
-        assert torch.equal(
-            unpacked.packed.view(torch.uint8), packed.packed.view(torch.uint8)
-        )
-        assert torch.equal(unpacked.scale, packed.scale)
+    unpacked = pack_w4a16_grouped(codes, scale, packed=False)
+    packed = pack_w4a16_grouped(_pack_checkpoint_int32(codes), scale, packed=True)
+    assert torch.equal(
+        unpacked.packed.view(torch.uint8), packed.packed.view(torch.uint8)
+    )
+    assert torch.equal(unpacked.scale, packed.scale)
 
 
 @pytest.mark.gpu
-def test_pack_layout_shape_and_mode_guard(hopper: torch.device) -> None:
-    from chord_kernels.operator.grouped.api import (
-        w4a16_contiguous,
-        w4a16_masked,
+def test_pack_layout_shape_and_block_k_guard(hopper: torch.device) -> None:
+    from chord_kernels.operator.grouped.api import w4a16_masked
+    from chord_kernels.operator.grouped.packing import (
+        pack_w4a16_grouped,
+        reorder_w4a16,
     )
-    from chord_kernels.operator.grouped.packing import pack_w4a16_grouped
 
     _reset_seed()
     g, n, k = 2, 128, 256
@@ -475,25 +410,30 @@ def test_pack_layout_shape_and_mode_guard(hopper: torch.device) -> None:
         torch.int32
     )
     scale = (torch.randn((g, n, k // 32), device=hopper) * 0.02).to(torch.bfloat16)
-    masked_weight = pack_w4a16_grouped(codes, scale, "masked", packed=False)
-    assert masked_weight.packed.shape == (g, n, k // 2)
-    assert masked_weight.packed.dtype == torch.float8_e4m3fn
-    assert masked_weight.scale.shape == (g, k // 32, n)
-    assert masked_weight.scale.is_contiguous()
-    assert masked_weight.scale.dtype == torch.bfloat16
+    weight = pack_w4a16_grouped(codes, scale, packed=False)
+    assert weight.packed.shape == (g, n, k // 2)
+    assert weight.packed.dtype == torch.float8_e4m3fn
+    assert weight.scale.shape == (g, k // 32, n)
+    assert weight.scale.is_contiguous()
+    assert weight.scale.dtype == torch.bfloat16
 
-    # A contiguous-packed weight must never reach the masked kernel: that is
-    # the classic silent-wrong-answer the mode guard exists for.
-    contiguous_weight = pack_w4a16_grouped(codes, scale, "contiguous", packed=False)
-    a3 = torch.randn((g, 8, k), device=hopper, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="repack"):
-        w4a16_masked(a3, contiguous_weight, torch.full((g,), 4, dtype=torch.int32, device=hopper), 4)
-    with pytest.raises(ValueError, match="repack"):
-        w4a16_contiguous(
-            torch.randn((128, k), device=hopper, dtype=torch.bfloat16),
-            masked_weight,
-            torch.zeros((128,), dtype=torch.int32, device=hopper),
+    # The BLOCK_K=128 reorder the masked kernel was written against is two
+    # BLOCK_K=64 reorders side by side, so the one buffer serves both kernels.
+    signed = (codes[0].to(torch.int16) - 8).to(torch.int8)
+    for block_k in (64, 128):
+        assert torch.equal(
+            weight.packed[0].view(torch.uint8),
+            reorder_w4a16(signed, block_k=block_k).view(torch.uint8),
         )
+
+    # The masked kernel's BLOCK_K=128 must still tile K whole.
+    short_k = pack_w4a16_grouped(
+        codes[..., :192].contiguous(), scale[..., :6].contiguous()
+    )
+    a3 = torch.randn((g, 16, 192), device=hopper, dtype=torch.bfloat16)
+    masked_m = torch.full((g,), 4, dtype=torch.int32, device=hopper)
+    with pytest.raises(ValueError, match="BLOCK_K=128"):
+        w4a16_masked(a3, short_k, masked_m, 4)
 
 
 @pytest.mark.gpu
@@ -502,7 +442,7 @@ def test_masked_w4a16_correctness(case: MaskedCase, hopper: torch.device) -> Non
     from chord_kernels.operator.grouped.api import w4a16_masked
 
     a3, codes, scale, masked_m, ref = make_masked_case(case, hopper)
-    weight = _pack_unpacked(codes, scale, "masked")
+    weight = _pack_unpacked(codes, scale)
     g, max_m, n = case.num_groups, case.max_m, case.n
 
     out = w4a16_masked(
@@ -537,7 +477,7 @@ def test_masked_w4a16_flat_input_and_output_buffer(
     from chord_kernels.operator.grouped.api import w4a16_masked
 
     a3, codes, scale, masked_m, ref = make_masked_case(case, hopper)
-    weight = _pack_unpacked(codes, scale, "masked")
+    weight = _pack_unpacked(codes, scale)
     g, max_m, n = case.num_groups, case.max_m, case.n
 
     flat_out = torch.zeros((g * max_m, n), device=hopper, dtype=torch.bfloat16)
@@ -565,100 +505,9 @@ def test_contiguous_w4a16_correctness(
     from chord_kernels.operator.grouped.api import w4a16_contiguous
 
     a2, codes, scale, m_indices, ref, bounds = make_contiguous_case(case, hopper)
-    weight = _pack_unpacked(codes, scale, "contiguous")
+    weight = _pack_unpacked(codes, scale)
     out = w4a16_contiguous(a2, weight, m_indices)
     assert out.shape == (a2.size(0), case.n)
-    for j, start, actual_end in bounds:
-        if actual_end <= start:
-            continue
-        diff = _cos_diff(out[start:actual_end], ref[start:actual_end])
-        assert diff < _COSINE_LIMIT, (case.label, j, diff)
-
-
-@pytest.mark.gpu
-def test_layer_masked_decode_end_to_end(hopper: torch.device) -> None:
-    """IndexedW4A16Layer with the grouped decode profile: load packed
-    checkpoint weights, transform to the BK128 masked layout, forward with
-    the masked routing convention."""
-    from chord_kernels.operator.layer import IndexedW4A16Layer
-
-    g, n, k, max_m, em = 12, 3072, 2048, 64, 16
-    _reset_seed()
-    layer = IndexedW4A16Layer(
-        n, k, num_experts=g, profile="h200_grouped_decode", device=hopper
-    )
-    codes = torch.randint(0, 16, (g, n, k), device=hopper, dtype=torch.int8).to(
-        torch.int32
-    )
-    scale = (torch.randn((g, n, k // 32), device=hopper) * 0.02).to(torch.bfloat16)
-    layer.load_weight(_pack_checkpoint_int32(codes), scale)
-    assert layer.weight.dtype == torch.float8_e4m3fn
-    assert tuple(layer.weight.shape) == (g, n, k // 2)
-    assert tuple(layer.weight_scale.shape) == (g, k // 32, n)
-
-    a3 = torch.randn((g, max_m, k), device=hopper, dtype=torch.bfloat16)
-    masked_m = torch.empty((g,), device=hopper, dtype=torch.int32)
-    for j in range(g):
-        masked_m[j] = int(em * random.uniform(0.7, 1.3))
-    masked_m.clamp_(1, max_m)
-
-    out = layer.forward(
-        a3.view(g * max_m, k),
-        expert_layout=masked_m,
-        valid_shape_m=int(masked_m.sum().item()),
-        compute_config=json.dumps({"gemm_type": "grouped_masked"}),
-    )
-    assert out.shape == (g * max_m, n)
-    out3 = out.view(g, max_m, n)
-    for j in range(g):
-        mm = int(masked_m[j].item())
-        ref = (
-            a3[j, :mm].float()
-            @ _dequant_reference(codes[j], scale[j]).reshape(n, k).t()
-        ).to(torch.bfloat16)
-        diff = _cos_diff(out3[j, :mm], ref)
-        assert diff < _COSINE_LIMIT, (j, mm, diff)
-
-    # The mode guard: asking the masked-packed layer for a contiguous forward
-    # must fail loudly instead of mis-computing.
-    with pytest.raises(ValueError, match="gemm_type"):
-        layer.forward(
-            a3.view(g * max_m, k),
-            expert_layout=masked_m,
-            valid_shape_m=int(masked_m.sum().item()),
-            compute_config=json.dumps({"gemm_type": "grouped_contiguous"}),
-        )
-    # Index-routed calls are rejected on the grouped backend.
-    with pytest.raises(ValueError, match="expert_layout"):
-        layer.forward(
-            a3.view(g * max_m, k),
-            torch.zeros((max_m,), dtype=torch.int32, device=hopper),
-            torch.zeros((1,), dtype=torch.int32, device=hopper),
-            torch.zeros((1,), dtype=torch.int32, device=hopper),
-            1,
-            valid_shape_m=int(masked_m.sum().item()),
-        )
-
-
-@pytest.mark.gpu
-def test_layer_contiguous_prefill_end_to_end(hopper: torch.device) -> None:
-    from chord_kernels.operator.layer import IndexedW4A16Layer
-
-    g, n, k, mpg = 8, 2048, 1408, 100
-    _reset_seed()
-    case = ContiguousCase(g, mpg, n, k)
-    a2, codes, scale, m_indices, ref, bounds = make_contiguous_case(case, hopper)
-
-    layer = IndexedW4A16Layer(
-        n, k, num_experts=g, profile="h200_grouped_prefill", device=hopper
-    )
-    layer.load_weight(codes, scale, packed=False)
-    out = layer.forward(
-        a2,
-        m_indices=m_indices,
-        compute_config={"gemm_type": "grouped_contiguous"},
-    )
-    assert out.shape == (a2.size(0), n)
     for j, start, actual_end in bounds:
         if actual_end <= start:
             continue
@@ -699,7 +548,7 @@ def _base_columns(token_column: str | None) -> tuple[tuple[str, int], ...]:
 
 
 def _projection(n: int, k: int) -> str:
-    """Name the projection the way the indexed table and docs/shapes.md do.
+    """Name the projection the way the indexed table and docs/performance.md (Shapes) do.
 
     The Kimi K2.5 shapes are gate/up ``N=4096 K=7168`` (fused w13, reads the
     model dim) and down ``N=7168 K=2048`` (reads the expert dim), so the wider
@@ -750,7 +599,7 @@ def run_perf_table(
     )
     for case in CONTIGUOUS_CASES:
         a2, codes, scale, m_indices, ref, _ = make_contiguous_case(case, device)
-        weight = _pack_unpacked(codes, scale, "contiguous")
+        weight = _pack_unpacked(codes, scale)
         out = w4a16_contiguous(a2, weight, m_indices)
         # m_indices == -1 marks the padding rows the kernel does not write.
         valid = m_indices != -1
@@ -792,7 +641,7 @@ def run_perf_table(
     )
     for case in MASKED_CASES:
         a3, codes, scale, masked_m, ref = make_masked_case(case, device)
-        weight = _pack_unpacked(codes, scale, "masked")
+        weight = _pack_unpacked(codes, scale)
         out = w4a16_masked(a3, weight, masked_m, case.expected_m_per_group)
         # Only the per-expert valid prefixes carry results; the padding rows up
         # to max_m are untouched, so compare the same slices the correctness

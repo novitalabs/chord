@@ -34,7 +34,7 @@ CUTLASS_DEVICE void dispatch_num_former_iters(uint32_t num_former_iters, const f
         dispatch_num_former_iters<kNumFormerIters + kGap, kGap, kEnd>(num_former_iters, func);
 }
 
-template <cute::UMMA::Major kMajorSFB,
+template <cute::SM90::GMMA::Major kMajorSFB,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -317,8 +317,8 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                 // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
                 if (threadIdx.x >= 32) {
                     auto previous_group_offset = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_n_sfb * shape_k_scales, 0, 0, m_block_idx);
-                    const uint32_t stride_n_sfb = kMajorSFB == cute::UMMA::Major::MN ? 1 : shape_k_scales;
-                    const uint32_t stride_k_sfb = kMajorSFB == cute::UMMA::Major::MN ? shape_n_sfb : 1;
+                    const uint32_t stride_n_sfb = kMajorSFB == cute::SM90::GMMA::Major::MN ? 1 : shape_k_scales;
+                    const uint32_t stride_k_sfb = kMajorSFB == cute::SM90::GMMA::Major::MN ? shape_n_sfb : 1;
                     auto local_sfb = sfb + previous_group_offset + ((n_block_idx * BLOCK_N) / BLOCK_K) * stride_n_sfb;
 
                     #pragma unroll
@@ -462,7 +462,7 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                                     const uint32_t k_elem = rr * WGMMA::K;
                                     const uint32_t atom_k_idx = k_elem / BLOCK_ATOM_K;
                                     return mma::sm90::advance_gmma_desc_lo<
-                                        cute::UMMA::Major::K, BLOCK_M, BLOCK_ATOM_K, kSwizzleAMode, TA>(
+                                        cute::SM90::GMMA::Major::K, BLOCK_M, BLOCK_ATOM_K, kSwizzleAMode, TA>(
                                         a_desc_base_lo, 0, k_elem % BLOCK_ATOM_K, atom_k_idx * BLOCK_M * BLOCK_ATOM_K);
                                 };
                                 auto cvt_scaled = [&](uint32_t* out, uint32_t frag, uint32_t rr) {

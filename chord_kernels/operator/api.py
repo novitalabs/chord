@@ -1,5 +1,4 @@
 # Derived from inclusionAI/humming; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
 
 import dataclasses
 import functools
@@ -10,33 +9,20 @@ from chord_kernels.operator import cpp_jit
 from chord_kernels.operator.kernel.humming import HummingKernel
 from chord_kernels.operator.ops import launch_kernel
 from chord_kernels.operator.packing import (
-    WeightLayout,
     PreparedWeight,
-    _validate_layout,
     _validate_supported_architecture,
-    pack_w4a16,
 )
 
 
 def _default_stream_k_fp32(use_stream_k: bool, warp_shape: tuple[int, int, int]) -> bool:
-    """Default stream-K reduction: FP32 for every stream-K config.
-
-    The FP32 workspace reduction exchanges each thread's accumulator registers
-    as-is, so it serves the MMA and WGMMA layouts alike.  One-pass configs have
-    no reduction, so they keep ``False`` and their cubins.
-    """
+    """FP32 stream-K reduction for every stream-K config, MMA and WGMMA."""
     del warp_shape
     return use_stream_k
 
 
 @dataclasses.dataclass(frozen=True)
 class IndexedKernelConfig:
-    """Small immutable launch description for the indexed W4A16 kernel.
-
-    The public profiles only use the fields below.  Keeping the description
-    separate from :class:`HummingKernel` lets a layer select a narrow tuning
-    row without exposing unrelated dense/grouped configuration surfaces.
-    """
+    """Launch description for the indexed W4A16 kernel (``tuning.py`` picks it)."""
 
     block_shape: tuple[int, int, int]
     warp_shape: tuple[int, int, int]
@@ -89,10 +75,10 @@ class IndexedKernelConfig:
             )
         if not isinstance(self.stream_k_fp32, bool):
             raise TypeError("stream_k_fp32 must be a bool or None")
-        # The launcher's device-resident lock buffer holds 1024 words and the
-        # scheduler peels at most ~2x the grid in stream-K tiles, so 4 CTAs/SM
-        # on a 128-SM part is already the ceiling.  The launcher re-checks the
-        # exact grid at launch; rejecting the config here fails earlier.
+        # A 1024-word lock buffer covers ~1.1x the grid in stream-K tiles, so
+        # 4 CTAs/SM on a 148-SM part is already the ceiling.  The launcher
+        # re-checks the exact grid against the caller's buffer at launch;
+        # rejecting the config here fails earlier.
         if self.use_stream_k and self.num_ctas_per_sm > 4:
             raise ValueError(
                 "use_stream_k supports at most 4 CTAs/SM (stream-K lock "
@@ -115,7 +101,7 @@ class IndexedKernelConfig:
     def default(
         cls,
         *,
-        layout: WeightLayout,
+        layout: str,
         block_m: int,
         block_n: int,
         swap_ab: bool,
@@ -161,7 +147,6 @@ class IndexedKernelConfig:
 
 
 def _compatible_block_n(shape_n: int) -> int:
-    # Ported, with IndexedKernelConfig.default, to csrc/indexed/select.cpp: change both.
     candidate = 1 << min(shape_n, 256).bit_length() - 1
     while candidate > 1 and shape_n % candidate:
         candidate //= 2
@@ -172,20 +157,26 @@ def _compatible_block_n(shape_n: int) -> int:
     return candidate
 
 
+def _config_layout(config: IndexedKernelConfig) -> str:
+    """The MMA family a config launches: warp-N 32 is WGMMA, 64 is mma.sync."""
+    return "wgmma" if config.warp_shape[1] == 32 else "mma"
+
+
 @functools.lru_cache(maxsize=128)
 def _get_indexed_kernel(
     device_index: int,
     shape_n: int,
     shape_k: int,
     num_experts: int,
-    layout: WeightLayout,
     config: IndexedKernelConfig,
 ) -> HummingKernel:
     block_m, block_n, block_k = config.block_shape
-    warp_shape = config.warp_shape
     swap_ab = config.swap_ab
+    # The packed bytes are the same for both MMA families; the config's warp-N
+    # picks the instruction (32 = WGMMA, 64 = mma.sync).
+    layout = _config_layout(config)
     if swap_ab and layout != "mma":
-        raise ValueError("swap_ab requires an MMA-packed weight")
+        raise ValueError("swap_ab requires the MMA kernel (warp-N 64)")
     if layout == "mma" and not swap_ab and config.block_m % 16 == 8:
         raise ValueError(
             "MMA indexed configs with block_m=8 (or another 16q+8 tile) "
@@ -197,9 +188,9 @@ def _get_indexed_kernel(
             f"indexed block-K must be a positive multiple of 64, got {block_k}"
         )
 
-    mma_type = "wgmma" if layout == "wgmma" else "mma"
+    mma_type = layout
     if mma_type == "wgmma" and block_n < 128:
-        raise ValueError("the WGMMA layout requires shape_n/block_n >= 128")
+        raise ValueError("the WGMMA kernel requires shape_n/block_n >= 128")
 
     # WGMMA instructions execute across a full four-warp group. With the
     # minimum block-N of 128, warp-N 32 produces exactly those 128 threads.
@@ -229,66 +220,88 @@ def _check_cuda_int32(name: str, tensor: torch.Tensor, device: torch.device) -> 
 
 
 def _validate_prepared_weight(
-    weight: PreparedWeight,
-    device: torch.device,
-    requested_layout: WeightLayout | None,
-) -> tuple[torch.Tensor, torch.Tensor, WeightLayout, int, int, int]:
+    weight: PreparedWeight, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
     if not isinstance(weight, PreparedWeight):
-        raise TypeError(
-            "weight must be a PreparedWeight from pack_w4a16(); "
-            "this preserves the MMA/WGMMA layout contract"
-        )
-
-    layout = _validate_layout(weight.layout)
-    if requested_layout is not None:
-        requested_layout = _validate_layout(requested_layout)
-        if layout != requested_layout:
-            raise ValueError(
-                f"weight uses layout={layout!r}, but layout={requested_layout!r} "
-                "was requested; repack or select the matching layout"
-            )
-
-    metadata = {
-        "n": weight.n,
-        "k": weight.k,
-        "num_experts": weight.num_experts,
-    }
-    for name, value in metadata.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(
-                f"weight metadata {name} must be a positive int, got {value!r}"
-            )
-    if weight.n % 128 or weight.k % 64:
-        raise ValueError(
-            f"weight metadata is not W4A16-aligned: N={weight.n}, K={weight.k}"
-        )
-
-    packed = weight.packed
-    scale = weight.scale
-    if not isinstance(packed, torch.Tensor) or not isinstance(scale, torch.Tensor):
-        raise TypeError(
-            "PreparedWeight packed and scale fields must be tensors"
-        )
-    expected_packed_shape = (weight.num_experts, weight.k // 16, weight.n * 2)
-    expected_scale_shape = (weight.num_experts, weight.k // 32, weight.n)
-    if packed.dtype != torch.int32 or tuple(packed.shape) != expected_packed_shape:
-        raise ValueError(
-            f"packed weight must be int32 {expected_packed_shape}, got "
-            f"{tuple(packed.shape)}/{packed.dtype}"
-        )
-    if scale.dtype != torch.bfloat16 or tuple(scale.shape) != expected_scale_shape:
-        raise ValueError(
-            f"packed scale must be BF16 {expected_scale_shape}, got "
-            f"{tuple(scale.shape)}/{scale.dtype}"
-        )
+        raise TypeError("weight must be a PreparedWeight from pack_w4a16_indexed()")
+    n, k, e = weight.n, weight.k, weight.num_experts
+    packed, scale = weight.packed, weight.scale
+    if packed.dtype != torch.int32 or tuple(packed.shape) != (e, k // 16, n * 2):
+        raise ValueError(f"packed weight must be int32 {(e, k // 16, n * 2)}, got {tuple(packed.shape)}")
+    if scale.dtype != torch.bfloat16 or tuple(scale.shape) != (e, k // 32, n):
+        raise ValueError(f"packed scale must be BF16 {(e, k // 32, n)}, got {tuple(scale.shape)}")
     if packed.device != device or scale.device != device:
-        raise ValueError(
-            f"inputs, packed weight, and scale must be on the same device; got "
-            f"{device}, {packed.device}, and {scale.device}"
-        )
+        raise ValueError(f"weight must be on {device}, got {packed.device}")
     if not packed.is_contiguous() or not scale.is_contiguous():
         raise ValueError("packed weight and scale must be contiguous")
-    return packed, scale, layout, weight.num_experts, weight.n, weight.k
+    return packed, scale, e, n, k
+
+
+def _validate_routing(
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_padded: torch.Tensor,
+    block_m: int,
+    routed_limit: int,
+    num_experts: int,
+) -> None:
+    """Synchronizing check of the routing contract (``validate_routing=True``)."""
+    padded_count = int(num_tokens_padded.reshape(-1)[0].item())
+    if padded_count < 0 or padded_count > sorted_ids.numel():
+        raise ValueError(
+            f"num_tokens_padded must be in [0, {sorted_ids.numel()}], got {padded_count}"
+        )
+    if padded_count % block_m:
+        raise ValueError(
+            f"num_tokens_padded must be a multiple of block_m={block_m}, got {padded_count}"
+        )
+    active_blocks = padded_count // block_m
+    if expert_ids.numel() < active_blocks:
+        raise ValueError(
+            f"expert_ids must cover {active_blocks} active blocks, got {expert_ids.numel()}"
+        )
+    if not padded_count:
+        return
+    ids = sorted_ids[:padded_count]
+    experts = expert_ids[:active_blocks]
+    valid = ids.view(-1, block_m) < routed_limit
+    route_ids = torch.sort(ids[(ids >= 0) & (ids < routed_limit)]).values
+    unique = (route_ids[1:] != route_ids[:-1]).all() if route_ids.numel() > 1 else ids.new_ones((), dtype=torch.bool)
+    nonneg, prefix, unique, in_range = torch.stack((
+        (ids >= 0).all(),
+        ~(valid & ((~valid).cumsum(dim=1) > 0)).any(),
+        unique,
+        ((experts >= 0) & (experts < num_experts)).all(),
+    )).cpu().tolist()
+    if not nonneg:
+        raise ValueError("sorted_ids values must be non-negative")
+    if not prefix:
+        raise ValueError(
+            "each active sorted_ids block must hold its routed ids as a prefix "
+            "followed only by sentinels"
+        )
+    if not in_range:
+        raise ValueError(f"expert_ids values must be in [0, {num_experts - 1}]")
+    if not unique:
+        raise ValueError("active sorted_ids contains duplicate routed ids")
+
+
+def indexed_block_m(
+    weight: PreparedWeight, num_tokens: int, top_k: int, *, device=None
+) -> int:
+    """Routing block size ``indexed`` uses; align ``moe_align_block_size`` to it.
+
+    For down pass gate/up's ``top_k`` here (the kernel call takes ``top_k=1``).
+    """
+    from chord_kernels.operator.tuning import select_indexed_config
+
+    if not isinstance(weight, PreparedWeight):
+        raise TypeError("weight must be a PreparedWeight from pack_w4a16_indexed()")
+    if device is None:
+        device = weight.packed.device
+    return select_indexed_config(
+        weight.n, weight.k, weight.num_experts, num_tokens * top_k, device=device
+    ).block_m
 
 
 def w4a16_indexed(
@@ -299,270 +312,77 @@ def w4a16_indexed(
     num_tokens_padded: torch.Tensor,
     top_k: int,
     *,
+    locks: torch.Tensor | None = None,
     outputs: torch.Tensor | None = None,
     block_m: int | None = None,
-    layout: WeightLayout | None = None,
-    swap_ab: bool | None = None,
-    config: IndexedKernelConfig | dict | None = None,
-    valid_shape_m: int = 0,
-    validate_routing: bool = True,
+    validate_routing: bool = False,
+    config: IndexedKernelConfig | None = None,
 ) -> torch.Tensor:
-    """Run BF16 x INT4 group-32 indexed MoE GEMM.
+    """BF16 x INT4 group-32 indexed MoE GEMM; see :func:`chord_kernels.indexed`.
 
-    Each published profile selects a narrow shape-aware tile table: the H200
-    prefill and TP8 profiles use WGMMA, while the decode profiles use MMA
-    (swap-AB for small token blocks). All rows load
-    through cp.async rather than TMA; stream-K is enabled per row by the layer's
-    tuning table and can be requested here through ``config``. If no explicit
-    config is supplied, block-N defaults to the largest compatible power of two
-    between 128 and 256 and MMA defaults to swap-AB. ``valid_shape_m`` is
-    accepted for layer-path compatibility (where it selects the tuning bracket)
-    and has no kernel-level effect here.
-    ``sorted_ids`` and ``expert_ids`` may be overallocated routing buffers as
-    returned by vLLM's ``moe_align_block_size``.  ``num_tokens_padded`` gives the
-    active prefix length; only that prefix is consumed by the kernel.  Each active
-    block contains valid row ids followed by sentinels greater than or equal to
-    ``inputs.size(0) * top_k``.  Expert-parallel routing may legitimately contain
-    only a subset of the flattened route ids.  Routing value validation
-    synchronizes the CUDA device; disable it only for buffers from a trusted
-    producer. The trusted fast path performs only shape/dtype/device checks and
-    never reads ``num_tokens_padded`` back to the host, so it is CUDA-Graph safe.
+    ``config`` overrides the tuned schedule (tests and tuning sweeps only).
     """
-    if not isinstance(inputs, torch.Tensor):
-        raise TypeError(f"inputs must be a torch.Tensor, got {type(inputs).__name__}")
-    if inputs.ndim != 2 or inputs.dtype != torch.bfloat16:
-        raise TypeError(
-            f"inputs must be a 2D torch.bfloat16 tensor, got {inputs.shape}/{inputs.dtype}"
-        )
-    if not inputs.is_cuda or not inputs.is_contiguous():
-        raise ValueError("inputs must be a contiguous CUDA tensor")
-    if inputs.size(0) == 0 or inputs.size(1) == 0:
-        raise ValueError(
-            f"inputs dimensions must be non-zero, got {tuple(inputs.shape)}"
-        )
-    _validate_supported_architecture(inputs.device)
-    packed_weight, packed_scale, layout, num_experts, shape_n, shape_k = (
-        _validate_prepared_weight(weight, inputs.device, layout)
+    if not isinstance(inputs, torch.Tensor) or inputs.ndim != 2 or inputs.dtype != torch.bfloat16:
+        raise TypeError("inputs must be a 2D torch.bfloat16 tensor")
+    if not inputs.is_cuda or not inputs.is_contiguous() or 0 in inputs.shape:
+        raise ValueError("inputs must be a non-empty contiguous CUDA tensor")
+    device = inputs.device
+    _validate_supported_architecture(device)
+    packed_weight, packed_scale, num_experts, shape_n, shape_k = _validate_prepared_weight(
+        weight, device
     )
     if inputs.size(1) != shape_k:
-        raise ValueError(
-            f"inputs K={inputs.size(1)} does not match packed weight K={shape_k}"
-        )
-    if shape_k % 64:
-        raise ValueError(
-            f"indexed production kernel requires K divisible by 64, got {shape_k}"
-        )
+        raise ValueError(f"inputs K={inputs.size(1)} does not match the weight's K={shape_k}")
+    for name, tensor in (("sorted_ids", sorted_ids), ("expert_ids", expert_ids),
+                         ("num_tokens_padded", num_tokens_padded)):
+        _check_cuda_int32(name, tensor, device)
+    if sorted_ids.ndim != 1 or expert_ids.ndim != 1:
+        raise ValueError("sorted_ids and expert_ids must be 1D")
+    if num_tokens_padded.numel() != 1 or num_tokens_padded.ndim > 1:
+        raise ValueError("num_tokens_padded must be a scalar or a one-element tensor")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError(f"top_k must be a positive int, got {top_k!r}")
 
-    _check_cuda_int32("sorted_ids", sorted_ids, inputs.device)
-    _check_cuda_int32("expert_ids", expert_ids, inputs.device)
-    _check_cuda_int32("num_tokens_padded", num_tokens_padded, inputs.device)
-    if sorted_ids.ndim != 1:
-        raise ValueError(f"sorted_ids must be 1D, got shape {tuple(sorted_ids.shape)}")
-    if expert_ids.ndim != 1:
-        raise ValueError(f"expert_ids must be 1D, got shape {tuple(expert_ids.shape)}")
-    if not (
-        num_tokens_padded.ndim == 0
-        or (num_tokens_padded.ndim == 1 and num_tokens_padded.numel() == 1)
-    ):
-        raise ValueError(
-            "num_tokens_padded must be a scalar or a one-element tensor, "
-            f"got shape {tuple(num_tokens_padded.shape)}"
-        )
-    if isinstance(top_k, bool) or not isinstance(top_k, int):
-        raise TypeError(f"top_k must be an int, got {type(top_k).__name__}")
-    if top_k <= 0:
-        raise ValueError(f"top_k must be positive, got {top_k}")
-    if not isinstance(validate_routing, bool):
-        raise TypeError(
-            f"validate_routing must be a bool, got {type(validate_routing).__name__}"
-        )
-
-    requested_swap_ab = swap_ab
-    if swap_ab is not None and not isinstance(swap_ab, bool):
-        raise TypeError(f"swap_ab must be a bool or None, got {type(swap_ab).__name__}")
     if config is None:
-        swap_ab = layout == "mma" if swap_ab is None else swap_ab
-        if layout == "wgmma" and swap_ab:
-            raise ValueError("WGMMA-packed weights cannot be used by swap_ab")
-        if block_m is None:
-            block_m = 8 if swap_ab else 16
-        elif isinstance(block_m, bool) or not isinstance(block_m, int):
-            raise TypeError(
-                f"block_m must be an int or None, got {type(block_m).__name__}"
-            )
-        if block_m <= 0 or block_m % 8:
-            raise ValueError(f"block_m must be a positive multiple of 8, got {block_m}")
-        if layout == "mma" and cpp_jit.enabled(inputs.device):
-            # CHORD_CPP_JIT=1 on SM100 / SM103: the same default chosen in C++.
-            kernel_config = cpp_jit.default_config(
-                shape_n, shape_k, num_experts, block_m=block_m, swap_ab=swap_ab
-            )
-        else:
-            kernel_config = IndexedKernelConfig.default(
-                layout=layout,
-                block_m=block_m,
-                block_n=_compatible_block_n(shape_n),
-                swap_ab=swap_ab,
-            )
-    else:
-        if not isinstance(config, (IndexedKernelConfig, dict)):
-            raise TypeError(
-                "config must be an IndexedKernelConfig, dict, or None; "
-                f"got {type(config).__name__}"
-            )
-        if isinstance(config, IndexedKernelConfig):
-            kernel_config = config
-        else:
-            config_dict = dict(config)
-            config_layout = config_dict.get("layout")
-            if config_layout is not None and _validate_layout(config_layout) != layout:
-                raise ValueError(
-                    "config layout does not match the packed weight: "
-                    f"config={config_layout!r}, weight={layout!r}"
-                )
-            # The legacy short form omitted swap_ab; preserve its historical
-            # MMA decode default while keeping WGMMA non-swap.
-            config_dict.setdefault("swap_ab", layout == "mma")
-            kernel_config = IndexedKernelConfig.from_dict(config_dict)
-        # Explicit config is authoritative; accepting a second, conflicting
-        # schedule makes routing alignment ambiguous.
-        if block_m is not None and block_m != kernel_config.block_m:
-            raise ValueError("block_m conflicts with config.block_shape[0]")
-        if requested_swap_ab is not None and requested_swap_ab != kernel_config.swap_ab:
-            raise ValueError("swap_ab conflicts with config")
-        block_m = kernel_config.block_m
-        swap_ab = kernel_config.swap_ab
-        if layout == "wgmma" and swap_ab:
-            raise ValueError("WGMMA-packed weights cannot be used by swap_ab")
-        if block_m <= 0 or block_m % 8:
-            raise ValueError(
-                f"config block_m must be a positive multiple of 8, got {block_m}"
-            )
-    if isinstance(valid_shape_m, bool) or not isinstance(valid_shape_m, int):
-        raise TypeError(
-            f"valid_shape_m must be an int, got {type(valid_shape_m).__name__}"
+        from chord_kernels.operator.tuning import select_indexed_config
+
+        config = select_indexed_config(
+            shape_n, shape_k, num_experts, inputs.size(0) * top_k,
+            block_m=block_m, device=device,
         )
-    if valid_shape_m < 0:
-        raise ValueError(f"valid_shape_m must be non-negative, got {valid_shape_m}")
+    elif not isinstance(config, IndexedKernelConfig):
+        raise TypeError(f"config must be an IndexedKernelConfig, got {type(config).__name__}")
+    elif block_m is not None and block_m != config.block_m:
+        raise ValueError("block_m conflicts with config")
+    if shape_n % config.block_n:
+        raise ValueError(f"config block-N={config.block_n} must divide N={shape_n}")
+
+    if config.use_stream_k:
+        if locks is None:
+            raise ValueError(
+                "this call uses stream-K and needs locks: "
+                "torch.zeros(1024, dtype=torch.int32, device=...), allocated once"
+            )
+        _check_cuda_int32("locks", locks, device)
+        if locks.ndim != 1:
+            raise ValueError("locks must be 1D")
+    else:
+        locks = None
     if validate_routing:
-        # Debug validation intentionally synchronizes once. The production
-        # fast path above never reads a device scalar back to Python, which is
-        # required for CUDA Graph capture and steady-state vLLM execution.
-        padded_count = int(num_tokens_padded.reshape(-1)[0].item())
-        if padded_count < 0:
-            raise ValueError(
-                f"num_tokens_padded must be non-negative, got {padded_count}"
-            )
-        if padded_count > sorted_ids.numel():
-            raise ValueError(
-                f"num_tokens_padded must not exceed sorted_ids capacity "
-                f"{sorted_ids.numel()}, got {padded_count}"
-            )
-        if padded_count % block_m:
-            raise ValueError(
-                f"num_tokens_padded must be a multiple of block_m={block_m}, "
-                f"got {padded_count}"
-            )
-        active_blocks = padded_count // block_m
-        if expert_ids.numel() < active_blocks:
-            raise ValueError(
-                "expert_ids capacity must cover the active routed blocks "
-                f"({active_blocks}), got {expert_ids.numel()}"
-            )
-        routed_limit = inputs.size(0) * top_k
-        active_ids = sorted_ids[:padded_count]
-        active_experts = expert_ids[:active_blocks]
-        if padded_count:
-            routed_rows = active_ids.view(-1, block_m)
-            valid_rows = routed_rows < routed_limit
-            valid_after_sentinel = valid_rows & ((~valid_rows).cumsum(dim=1) > 0)
-            valid_route_ids = active_ids[
-                (active_ids >= 0) & (active_ids < routed_limit)
-            ]
-            if valid_route_ids.numel() > 1:
-                sorted_route_ids = torch.sort(valid_route_ids).values
-                route_ids_are_unique = (
-                    sorted_route_ids[1:] != sorted_route_ids[:-1]
-                ).all()
-            else:
-                route_ids_are_unique = torch.ones(
-                    (), dtype=torch.bool, device=active_ids.device
-                )
-            (
-                ids_are_nonnegative,
-                block_prefixes_are_valid,
-                route_ids_are_unique,
-                experts_are_nonnegative,
-                experts_are_in_range,
-            ) = (
-                torch.stack(
-                    (
-                        (active_ids >= 0).all(),
-                        ~valid_after_sentinel.any(),
-                        route_ids_are_unique,
-                        (active_experts >= 0).all(),
-                        (active_experts < num_experts).all(),
-                    )
-                )
-                .cpu()
-                .tolist()
-            )
-        else:
-            ids_are_nonnegative = True
-            block_prefixes_are_valid = True
-            route_ids_are_unique = True
-            experts_are_nonnegative = True
-            experts_are_in_range = True
+        _validate_routing(sorted_ids, expert_ids, num_tokens_padded, config.block_m,
+                          inputs.size(0) * top_k, num_experts)
 
-        if not ids_are_nonnegative:
-            raise ValueError("sorted_ids values must be non-negative")
-        if not block_prefixes_are_valid:
-            raise ValueError(
-                "each active sorted_ids block must contain valid routed ids as a "
-                "contiguous prefix followed only by sentinel values"
-            )
-        if not experts_are_nonnegative or not experts_are_in_range:
-            if active_experts.numel() == 0:
-                minimum_expert = maximum_expert = 0
-            else:
-                minimum_expert, maximum_expert = torch.aminmax(active_experts)
-            minimum_expert, maximum_expert = (
-                torch.stack((minimum_expert, maximum_expert)).cpu().tolist()
-            )
-            raise ValueError(
-                f"expert_ids values must be in [0, {num_experts - 1}], got "
-                f"[{minimum_expert}, {maximum_expert}]"
-            )
-        if not route_ids_are_unique:
-            raise ValueError("active sorted_ids contains duplicate routed ids")
-    block_n = kernel_config.block_n
-    if block_n <= 0 or shape_n % block_n:
-        raise ValueError(f"config block-N={block_n} must divide shape_n={shape_n}")
-
-    with torch.cuda.device(inputs.device):
-        if layout == "mma" and cpp_jit.enabled(inputs.device):
-            # CHORD_CPP_JIT=1 on SM100 / SM103: the C++ JIT (cpp_jit.py).
+    with torch.cuda.device(device):
+        if cpp_jit.enabled(device):
             kernel_id = cpp_jit.get_indexed_kernel(
-                inputs.get_device(), shape_n, shape_k, num_experts, kernel_config
+                inputs.get_device(), shape_n, shape_k, num_experts, config
             )
             return cpp_jit.indexed_gemm(
-                kernel_id,
-                inputs,
-                packed_weight,
-                packed_scale,
-                sorted_ids,
-                expert_ids,
-                num_tokens_padded,
-                top_k,
-                outputs,
+                kernel_id, inputs, packed_weight, packed_scale, sorted_ids,
+                expert_ids, num_tokens_padded, top_k, outputs, locks,
             )
         kernel = _get_indexed_kernel(
-            inputs.get_device(),
-            shape_n,
-            shape_k,
-            num_experts,
-            layout,
-            kernel_config,
+            inputs.get_device(), shape_n, shape_k, num_experts, config
         )
         return launch_kernel(
             kernel_id=kernel.kernel_id,
@@ -574,12 +394,8 @@ def w4a16_indexed(
             num_tokens_padded=num_tokens_padded,
             top_k=top_k,
             outputs=outputs,
-            valid_shape_m=valid_shape_m,
+            locks=locks,
         )
 
 
-__all__ = [
-    "IndexedKernelConfig",
-    "pack_w4a16",
-    "w4a16_indexed",
-]
+__all__ = ["IndexedKernelConfig", "indexed_block_m", "w4a16_indexed"]

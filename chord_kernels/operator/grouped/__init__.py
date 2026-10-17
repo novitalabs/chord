@@ -1,5 +1,4 @@
 # Derived from deepseek-ai/DeepGEMM; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
 """grouped W4A16 integration for chord.
 
 This subpackage vendors DeepGEMM's SM90 W4A16 (BF16 activation x INT4 group-32

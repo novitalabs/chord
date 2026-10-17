@@ -1,5 +1,4 @@
 // Derived from inclusionAI/humming; modified for chord_kernels.
-// Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
 
 // BF16 group-32 weight-scale loader for indexed W4A16.
 

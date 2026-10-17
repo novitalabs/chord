@@ -1,15 +1,9 @@
-"""C++ JIT for the indexed W4A16 GEMM and repack_w4a16 (``CHORD_CPP_JIT=1``).
+"""C++ JIT for every chord kernel (``CHORD_CPP_JIT=1``, SM90/SM100/SM103).
 
-On SM100 / SM103 with ``CHORD_CPP_JIT=1``, code generation, the cubin cache,
-NVRTC, loading and launch of both kernels run in C++ (``csrc/jit`` +
-``csrc/indexed``, no torch, no Python); ``csrc/indexed/torch_ops.cpp`` is a
-thin torch op over it.  The configuration is still chosen in Python
-(``tuning.py``) and passed in.  This module only builds that extension once
-per process, like ``ops.init_launcher``, and forwards the calls.  Elsewhere
-(SM90, or the switch off) the Python JIT path is used unchanged.
-
-Call :func:`precompile_indexed` at startup so that no forward pass compiles: a
-cache miss prints a progress bar on stderr, a cache hit prints nothing.
+Codegen, cubin cache, NVRTC, load and launch run in ``csrc/``; configs are
+still picked in Python.  This module builds the extension once per process and
+forwards calls.  See docs/cpp_jit.md.  :func:`precompile_indexed` at startup
+keeps forward passes from compiling.
 """
 
 from __future__ import annotations
@@ -36,12 +30,12 @@ if TYPE_CHECKING:
     from chord_kernels.operator.api import IndexedKernelConfig
 
 _CSRC = Path(__file__).resolve().parent / "csrc"
-_CPP_JIT_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_CPP_JIT_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
 _module = None
 
 
 def enabled(device: torch.device | int) -> bool:
-    """Whether ``CHORD_CPP_JIT=1`` and ``device`` is SM100 / SM103."""
+    """Whether ``CHORD_CPP_JIT=1`` and ``device`` is SM90 / SM100 / SM103."""
     if os.environ.get("CHORD_CPP_JIT", "0") != "1":
         return False
     if isinstance(device, torch.device) and device.type != "cuda":
@@ -92,6 +86,7 @@ def _load():
             [
                 jit_utils.hash_path_content((_CSRC / "jit").as_posix(), relative=True),
                 jit_utils.hash_path_content((_CSRC / "indexed").as_posix(), relative=True),
+                jit_utils.hash_path_content((_CSRC / "grouped").as_posix(), relative=True),
                 *(
                     jit_utils.hash_path_content(
                         (_CSRC / "launcher" / name).as_posix(), relative=True
@@ -134,7 +129,7 @@ def _load():
                 (_CSRC / "jit" / "jit.cpp").as_posix(),
                 (_CSRC / "indexed" / "humming.cpp").as_posix(),
                 (_CSRC / "indexed" / "repack.cpp").as_posix(),
-                (_CSRC / "indexed" / "select.cpp").as_posix(),
+                (_CSRC / "grouped" / "grouped.cpp").as_posix(),
                 (_CSRC / "indexed" / "torch_ops.cpp").as_posix(),
             ],
             extra_include_paths=[build_dir.as_posix(), *include_paths],
@@ -195,9 +190,11 @@ def indexed_gemm(
     num_tokens_padded: torch.Tensor,
     top_k: int,
     outputs: torch.Tensor | None = None,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch kernel ``kernel_id`` (from :func:`get_indexed_kernel`), as
-    ``ops.launch_kernel`` does for the Python JIT path."""
+    ``ops.launch_kernel`` does for the Python JIT path; ``locks`` is the
+    caller-owned stream-K lock buffer (``w4a16_indexed``)."""
     _load()
     return torch.ops.chord_cpp.indexed_gemm(
         kernel_id,
@@ -209,16 +206,15 @@ def indexed_gemm(
         expert_ids,
         num_tokens_padded,
         top_k,
+        locks,
     )
 
 
-def repack_w4a16(
-    inputs: torch.Tensor, outputs: torch.Tensor, *, packed: bool, wgmma_layout: bool
-) -> torch.Tensor:
-    """``RepackWeightKernel(is_weight_packed=packed, use_wgmma=wgmma_layout)``
-    applied to ``inputs`` into ``outputs``."""
+def repack_w4a16(inputs: torch.Tensor, outputs: torch.Tensor, *, packed: bool) -> torch.Tensor:
+    """``RepackWeightKernel(is_weight_packed=packed)`` applied to ``inputs``
+    into ``outputs``."""
     _load()
-    return torch.ops.chord_cpp.repack_w4a16(inputs, outputs, packed, wgmma_layout)
+    return torch.ops.chord_cpp.repack_w4a16(inputs, outputs, packed)
 
 
 def precompile_indexed(
@@ -226,10 +222,8 @@ def precompile_indexed(
     *,
     device: torch.device | int | str | None = None,
 ) -> None:
-    """Compile (or read from the cache), load and register every
-    ``(shape_n, shape_k, num_experts, config)`` on ``device`` (default: the
-    current device), so that later calls never compile.  One progress bar on
-    stderr over the cache misses; nothing when all are cached."""
+    """Compile or load every ``(shape_n, shape_k, num_experts, config)`` on
+    ``device`` so later calls never compile; a progress bar over cache misses."""
     index = torch.device(device if device is not None else "cuda").index
     if index is None:
         index = torch.cuda.current_device()
@@ -242,143 +236,84 @@ def precompile_indexed(
         get_indexed_kernel(index, n, k, e, c)  # registered above: no compile, no load
 
 
-def _to_config(fields: Sequence[int]) -> IndexedKernelConfig:
-    from chord_kernels.operator.api import IndexedKernelConfig
-
-    return IndexedKernelConfig(
-        block_shape=tuple(fields[0:3]),
-        warp_shape=tuple(fields[3:6]),
-        num_stages=fields[6],
-        num_ctas_per_sm=fields[7],
-        swap_ab=bool(fields[8]),
-        use_stream_k=bool(fields[9]),
-        stream_k_fp32=bool(fields[10]),
-    )
-
-
-def default_config(
-    shape_n: int, shape_k: int, num_experts: int, *, block_m: int, swap_ab: bool
-) -> IndexedKernelConfig:
-    """``IndexedKernelConfig.default`` (MMA layout, ``_compatible_block_n``),
-    chosen in C++."""
-    return _to_config(
-        _load().default_config(shape_n, shape_k, num_experts, block_m, swap_ab)
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _python_only_profiles() -> frozenset[str]:
-    # Published non-Blackwell profiles: their tuning rows are not ported to C++
-    # (validate_device keeps them off SM100 / SM103 anyway).
-    from chord_kernels.operator.profiles import INDEXED_PROFILES
-
-    return frozenset(INDEXED_PROFILES) - {"blackwell_decode_ep8"}
-
-
-@functools.lru_cache(maxsize=256)
-def _table_id(tuning_config: str, swap_ab: bool, layout: str) -> int | None:
-    """Register a tuning_config JSON string with C++ once; ``None`` when it is
-    not a list of rows (a single config, or an invalid type), which the Python
-    path keeps."""
-    from chord_kernels.operator.api import IndexedKernelConfig
-
-    try:
-        value = json.loads(tuning_config)
-    except json.JSONDecodeError as exc:
-        raise ValueError("tuning_config must be valid JSON") from exc
-    if not isinstance(value, list):
-        return None
-    rows = []
-    # As tuning._resolve_tuning_config parses a matched row, for every row.
-    for lower, upper, row in value:
-        row = dict(row)
-        row.setdefault("swap_ab", swap_ab)
-        if row.get("layout", layout) != layout:
-            raise ValueError("tuning_config layout does not match the packed weight")
-        c = IndexedKernelConfig.from_dict(row)
-        rows.append(
-            [
-                int(lower),
-                int(upper),
-                *c.block_shape,
-                *c.warp_shape,
-                c.num_stages,
-                c.num_ctas_per_sm,
-                int(c.swap_ab),
-                int(c.use_stream_k),
-                int(c.stream_k_fp32),
-            ]
-        )
-    return _load().register_table(rows)
-
-
-def select_layer_config(
-    meta,
-    device: torch.device,
-    selected_shape_m: object,
-    tuning_config: object | None,
-    block_m: object | None,
-) -> IndexedKernelConfig | None:
-    """The config ``dispatch.forward_w4a16`` picks for one indexed call
-    (profile table / fallback, or the tuning_config rows, then the routing
-    block-M), chosen in C++.  ``None`` when the call is not on the C++ path
-    (switch off, not SM100 / SM103, WGMMA layout, a non-Blackwell published
-    profile, or an argument form the Python path keeps); the caller then runs
-    the Python resolution unchanged."""
-    if not enabled(device) or meta.layout != "mma":
-        return None
-    if meta.profile.name in _python_only_profiles():
-        return None
-    if isinstance(selected_shape_m, bool) or not isinstance(selected_shape_m, int):
-        return None
-    if block_m is not None and (isinstance(block_m, bool) or not isinstance(block_m, int)):
-        return None
-    table = -1
-    if tuning_config is not None:
-        if not isinstance(tuning_config, str):
-            return None
-        table_id = _table_id(tuning_config, meta.swap_ab, meta.layout)
-        if table_id is None:
-            return None
-        table = table_id
-    layer = [
-        meta.shape_n,
-        meta.shape_k,
-        meta.num_experts,
-        int(meta.profile.name == "blackwell_decode_ep8"),
-        meta.profile.block_m,
-        int(meta.swap_ab),
+@functools.lru_cache(maxsize=128)
+def get_grouped_kernel(device_index: int, desc, config) -> int:
+    """Compile (or read from the cache), load and register one grouped kernel
+    (``W4A16GemmDesc`` + ``W4A16GemmConfig``) on ``device_index``; returns its id."""
+    fields = [
+        2 if desc.gemm_type == "masked" else 1,
+        desc.n,
+        desc.k,
+        desc.num_groups,
+        desc.num_sms,
+        config.layout.block_m,
+        config.layout.block_n,
+        config.layout.block_k,
+        config.storage.swizzle_a_mode,
+        config.storage.swizzle_b_mode,
+        config.storage.swizzle_cd_mode,
+        config.pipeline.num_stages,
+        config.pipeline.smem_size,
+        config.launch.num_tma_threads,
+        config.launch.num_math_threads,
+        config.launch.num_threads,
+        config.layout.cluster_size,
+        int(config.layout.cluster_n > 1),
     ]
-    return _to_config(
-        _load().select_config(
-            layer, selected_shape_m, table, block_m is not None, block_m or 0
-        )
+    module = _load()
+    with torch.cuda.device(device_index):
+        return module.register_grouped(device_index, fields)
+
+
+def grouped_masked(kernel_id, inputs, weight, scale, masked_m, outputs, enable_pdl):
+    """``ops.launch_grouped_w4a16_masked`` on the C++ JIT path."""
+    _load()
+    return torch.ops.chord_cpp.grouped_masked(
+        kernel_id, inputs, weight, scale, masked_m, outputs, enable_pdl
     )
 
 
-def layer_kernels(meta) -> list[tuple[int, int, int, IndexedKernelConfig]]:
-    """Every ``(shape_n, shape_k, num_experts, config)`` the published tuning
-    table of an indexed layer (``IndexedLayerMeta``) can pick, for
-    :func:`precompile_indexed`."""
-    from chord_kernels.operator.api import IndexedKernelConfig
-    from chord_kernels.operator.tuning import _indexed_tuning_rows
+def grouped_contiguous(kernel_id, inputs, weight, scale, m_indices, outputs, enable_pdl):
+    """``ops.launch_grouped_w4a16_contiguous`` on the C++ JIT path."""
+    _load()
+    return torch.ops.chord_cpp.grouped_contiguous(
+        kernel_id, inputs, weight, scale, m_indices, outputs, enable_pdl
+    )
 
-    configs = []
-    for _, _, row in _indexed_tuning_rows(meta):
-        row = {k: v for k, v in row.items() if k not in ("block_m", "layout")}
-        config = IndexedKernelConfig.from_dict(row)
+
+def indexed_kernels(
+    shape_n: int,
+    shape_k: int,
+    num_experts: int,
+    *,
+    device: torch.device | int | str | None = None,
+    capability: tuple[int, int] | None = None,
+) -> list[tuple[int, int, int, IndexedKernelConfig]]:
+    """Every distinct ``(shape_n, shape_k, num_experts, config)`` that
+    ``select_indexed_config`` picks for one projection on this GPU, for
+    :func:`precompile_indexed`."""
+    from chord_kernels.operator.tuning import select_indexed_config
+
+    configs: list[IndexedKernelConfig] = []
+    # The tuned schedules settle by routed_m = 368 * experts (prefill's last
+    # block-M step); the sentinel covers anything past it.
+    for routed_m in [*range(1, max(4096, 368 * num_experts) + 1), 1 << 29]:
+        config = select_indexed_config(
+            shape_n, shape_k, num_experts, routed_m, device=device, capability=capability
+        )
         if config not in configs:
             configs.append(config)
-    return [(meta.shape_n, meta.shape_k, meta.num_experts, c) for c in configs]
+    return [(shape_n, shape_k, num_experts, c) for c in configs]
 
 
 __all__ = [
-    "default_config",
     "enabled",
+    "get_grouped_kernel",
     "get_indexed_kernel",
+    "grouped_contiguous",
+    "grouped_masked",
     "indexed_gemm",
-    "layer_kernels",
+    "indexed_kernels",
     "precompile_indexed",
     "repack_w4a16",
-    "select_layer_config",
 ]

@@ -1,20 +1,10 @@
 # Derived from deepseek-ai/DeepGEMM; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
-"""NVRTC codegen + cubin registration for the vendored DeepGEMM W4A16 kernel.
+"""NVRTC codegen and cubin registration for the grouped W4A16 kernel.
 
-Mirrors ``SM90FP8Gemm1D2DRuntime::generate_impl``: a fixed
-instantiation of ``deep_gemm::sm90_w4a16_gemm_impl`` (upstream's
-``sm90_fp8_gemm_1d2d_impl``, renamed here for the one instantiation this
-distribution ships -- see SOURCE.md) compiled with
-``SHAPE_M == 0`` (dynamic M at launch) and ``compiled_dims == "nk"`` (N/K
-baked), the identity epilogue, and the weight scales on the SFA slot
-(``kMajorSFB = MN``).  ``--use_fast_math`` and friends are NOT applied: the
-upstream flags are reproduced via :class:`GroupedNVRTCCompiler`.
-
-Launch metadata the C++ launcher cannot derive from the tensors (tile sizes,
-swizzle modes, stage count folded into the smem size, grid extent, cluster)
-is exported as ``extern "C" __constant__ uint32_t`` symbols and read out of
-the cubin by the ELF symbol reader, exactly like the phase-1 humming kernel.
+One instantiation of ``deep_gemm::sm90_w4a16_gemm_impl``: dynamic M, N/K baked,
+weight scales on the SFA slot, upstream's NVRTC flags
+(:class:`GroupedNVRTCCompiler`).  Launch metadata the launcher cannot derive
+from tensors is exported as ``__constant__`` symbols read from the cubin.
 """
 
 from __future__ import annotations
@@ -96,7 +86,7 @@ CODE_TEMPLATE = jinja2.Template("""
 
 static void __instantiate_kernel() {
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_w4a16_gemm_impl<
-        cute::UMMA::Major::K,                           // kMajorSFB (upstream spelling; dead slot under W4A16)
+        cute::SM90::GMMA::Major::K,                     // kMajorSFB (dead slot under W4A16)
         {{shape_m}}, {{shape_n}}, {{shape_k}},        // SHAPE_M is 0: runtime m
         {{num_groups}},
         {{config.layout.block_m}}, {{config.layout.block_n}}, {{config.layout.block_k}},
@@ -173,7 +163,7 @@ class GroupedW4A16Kernel(KernelRuntime):
         )
         expr = (
             "deep_gemm::sm90_w4a16_gemm_impl<\n"
-            "cute::UMMA::Major::K,\n"
+            "cute::SM90::GMMA::Major::K,\n"
             f"0, {self.desc.n}, {self.desc.k},\n"
             f"{self.desc.num_groups},\n"
             f"{self.config.layout.block_m}, {self.config.layout.block_n}, {self.config.layout.block_k},\n"

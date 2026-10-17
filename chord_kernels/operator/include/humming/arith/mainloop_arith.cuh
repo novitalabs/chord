@@ -1,5 +1,4 @@
 // Derived from inclusionAI/humming; modified for chord_kernels.
-// Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
 
 #pragma once
 
@@ -11,7 +10,6 @@
 template <class WarpShape>
 class MainloopArithmetic {
 private:
-  using scalar_t = nv_bfloat16;
   using scalar_t2 = nv_bfloat162;
 
   static constexpr uint32_t kNumScaleWords = MAX(WarpShape::N / 8, 8) / 2;
@@ -62,7 +60,7 @@ public:
 private:
   // Scale extraction must go through __low2bfloat162/__high2bfloat162: their
   // inline asm splits the 32-bit scale word with a single `mov.b32 {lo,hi}`.
-  // Reading the two halves through a scalar_t* (or the array base) makes NVVM
+  // Reading the two halves through an nv_bfloat16* (or the array base) makes NVVM
   // materialize a 64-bit value and extract with SHF.R.U64 funnel shifts inside
   // the hot dequant loop, costing 1-2% on decode.
   template <bool kWriteMmaA>

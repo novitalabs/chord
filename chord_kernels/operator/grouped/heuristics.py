@@ -1,19 +1,9 @@
 # Derived from deepseek-ai/DeepGEMM; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
-"""SM90 launch-config selection for the vendored DeepGEMM W4A16 kernel.
+"""SM90 tile selection for the grouped W4A16 kernel.
 
-This is a Python port of the ``is_w4a16`` branches of
-``csrc/jit_kernels/heuristics/sm90.hpp`` (``SM90ArchSpec``), restricted to the
-grouped-GEMM modes the chord layer dispatches: ``MGroupedMasked`` (decode)
-and ``MGroupedContiguous`` (prefill).  The dense ``Normal`` mode and the
-FP8/1D1D families are intentionally not ported.
-
-Only BF16 activations, packed-INT4 weights (``weight_ratio == 2``), BF16
-outputs without accumulation, and scale group 32 are representable here,
-matching the vendored kernel instantiation.  The ``get_expected_*`` fallback
-semantics are kept: the masked path compiles the per-group ``expected_m`` into
-the heuristic while the contiguous one sees the concatenated total ``m`` with
-``expected_num_groups == 1``.
+A port of the ``is_w4a16`` masked/contiguous branches of DeepGEMM's
+``heuristics/sm90.hpp``, retuned (docs/design.md).  Masked sizes from the
+per-group ``expected_m``; contiguous sees the total ``m`` as one group.
 """
 
 from __future__ import annotations

@@ -13,11 +13,10 @@ namespace chord::indexed {
 
 namespace {
 
-jit::Program make_program(bool packed_input, bool wgmma_layout) {
+jit::Program make_program(bool packed_input) {
   jit::Program program;
   // kernel_expr, whitespace collapsed as NVRTCCompiler._compile does.
-  program.name_expression = std::string("repack_w4a16< ") + (packed_input ? "1" : "0") + ", " +
-                            (wgmma_layout ? "1" : "0") + ">";
+  program.name_expression = std::string("repack_w4a16<") + (packed_input ? "1" : "0") + ">";
   // CODE_TEMPLATE rendered (jinja2 drops the final newline).
   program.source = "\n#include <humming/kernel/repack.cuh>\n";
   program.flags = jit::default_flags();
@@ -33,7 +32,7 @@ void repack_w4a16(const RepackArgs& a, CUstream stream) {
   if (a.num_experts <= 0 || a.shape_n <= 0 || a.shape_k <= 0) {
     jit::fail("repack_w4a16: dimensions must be positive");
   }
-  const jit::Kernel& kernel = jit::get_kernel(make_program(a.packed_input, a.wgmma_layout));
+  const jit::Kernel& kernel = jit::get_kernel(make_program(a.packed_input));
 
   const void* input = a.input;
   void* output = a.output;

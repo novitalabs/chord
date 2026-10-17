@@ -1,13 +1,5 @@
 # Derived from deepseek-ai/DeepGEMM; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
-"""Operator entry points for the grouped W4A16 backend.
-
-These mirror the two DeepGEMM dispatch paths the chord layer uses
-(``sm90_m_grouped_w4a16_gemm_nt_masked`` / ``..._contiguous``), routed through
-chord's own NVRTC JIT and cubin launcher instead of the upstream
-``deep_gemm`` package.  ``expected_m`` (masked) feeds the launch heuristics
-only; ``masked_m`` carries the authoritative per-group row counts.
-"""
+"""Grouped W4A16 entry points: DeepGEMM's masked/contiguous paths on chord's JIT."""
 
 from __future__ import annotations
 
@@ -15,7 +7,7 @@ import functools
 
 import torch
 
-from chord_kernels.operator import ops
+from chord_kernels.operator import cpp_jit, ops
 from chord_kernels.operator.grouped.heuristics import (
     W4A16GemmDesc,
     _env_int,
@@ -24,21 +16,22 @@ from chord_kernels.operator.grouped.heuristics import (
 from chord_kernels.operator.grouped.kernel import GroupedW4A16Kernel
 from chord_kernels.operator.grouped.packing import GroupedPreparedWeight
 
+# BLOCK_K the heuristic picks per kernel; K must cover whole tiles.
+_MASKED_BLOCK_K = 128
+_CONTIGUOUS_BLOCK_K = 64
+
 
 def _check_weight(
-    weight: GroupedPreparedWeight, mode: str, device: torch.device
+    weight: GroupedPreparedWeight, mode: str, block_k: int, device: torch.device
 ) -> None:
     if not isinstance(weight, GroupedPreparedWeight):
         raise TypeError(
             "weight must be a GroupedPreparedWeight from pack_w4a16_grouped()"
         )
-    if weight.mode != mode:
-        # The reorder perm width (= BLOCK_K) is baked into the packed buffer;
-        # running the other mode's kernel is a silent wrong answer.
+    if weight.k % block_k:
         raise ValueError(
-            f"weight was packed for mode={weight.mode!r} (BLOCK_K={weight.block_k}) "
-            f"but the {mode!r} kernel requires BLOCK_K="
-            f"{128 if mode == 'masked' else 64}; repack the weight"
+            f"the {mode!r} kernel uses BLOCK_K={block_k}, which does not divide "
+            f"the weight's K={weight.k}"
         )
     packed, scale = weight.packed, weight.scale
     if packed.dtype != torch.float8_e4m3fn or scale.dtype != torch.bfloat16:
@@ -82,12 +75,7 @@ def _num_sms(device: torch.device) -> int:
 
 
 def _env_tuning_key() -> tuple[int | None, ...]:
-    """The ``CHORD_W4A16_*`` overrides the heuristic reads, as a cache key part.
-
-    The layout search consults these at call time, so they have to participate
-    in the memo key: a tuning sweep that exports a new BM/BN between launches
-    must not keep replaying the layout picked under the previous values.
-    """
+    """The ``CHORD_W4A16_*`` overrides, so a sweep changing them misses the memo."""
     return tuple(_env_int(name) for name in ("BM", "BN", "BK", "CM", "CN", "STAGES"))
 
 
@@ -102,16 +90,21 @@ def _resolve_kernel_cached(
 
 
 def _resolve_kernel(desc: W4A16GemmDesc) -> GroupedW4A16Kernel:
-    """Select the layout and load its cubin, memoized on the problem shape.
-
-    The layout search plus ``load_cubin`` costs ~30us of CPU per call, which is
-    pure overhead once a shape has been seen: a serving process replays a
-    handful of descs (one per projection per phase) for the whole run.  Leaving
-    it uncached puts that cost on every forward, where it is invisible behind a
-    large GEMM but dominates a small decode launch whose kernel is ~37us.  This
-    mirrors the indexed path's ``_get_indexed_kernel`` cache.
-    """
+    """Select the layout and load its cubin, memoized (~30us CPU uncached)."""
     return _resolve_kernel_cached(desc, _env_tuning_key())
+
+
+@functools.lru_cache(maxsize=None)
+def _cpp_kernel_id_cached(
+    device_index: int, desc: W4A16GemmDesc, _env_key: tuple[int | None, ...]
+) -> int:
+    return cpp_jit.get_grouped_kernel(device_index, desc, select_w4a16_config(desc))
+
+
+def _cpp_kernel_id(device: torch.device, desc: W4A16GemmDesc) -> int:
+    """The C++ JIT kernel id for ``desc``, memoized like :func:`_resolve_kernel`."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _cpp_kernel_id_cached(index, desc, _env_tuning_key())
 
 
 def w4a16_masked(
@@ -123,19 +116,15 @@ def w4a16_masked(
     outputs: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Run the masked (decode) grouped W4A16 GEMM.
+    """Masked (decode) grouped GEMM: ``[G*max_m, K]`` or ``[G, max_m, K]`` in,
+    flat ``[G*max_m, N]`` out.
 
-    ``inputs`` is the flat humming-convention activation ``[G*max_m, K]`` or
-    the grouped view ``[G, max_m, K]``; the return is flat ``[G*max_m, N]``.
-    ``masked_m`` is the per-expert valid token count ``[G] int32``.
-    ``expected_m`` is the nominal per-group token count used by the launch
-    heuristics (block-M/N sizing); it does not bound the kernel's reads.
-
-    Rows beyond a group's ``masked_m[g]`` are not written by the kernel; when
-    ``outputs`` is omitted they are left UNINITIALIZED (matching upstream —
-    a consumer must gather valid rows by the counts).
+    ``masked_m`` ``[G] int32`` is each group's valid rows; ``expected_m`` only
+    sizes the tiles.  Rows past ``masked_m[g]`` are not written.  Keep
+    ``max_m >= 16`` and ``expected_m`` close to the real counts: the kernel
+    mis-writes when ``max_m`` is below BLOCK_M or ``masked_m`` exceeds it.
     """
-    _check_weight(weight, "masked", inputs.device)
+    _check_weight(weight, "masked", _MASKED_BLOCK_K, inputs.device)
     _check_activation(inputs, weight.k)
     if inputs.dim() == 2:
         if inputs.size(0) % weight.num_experts:
@@ -194,6 +183,13 @@ def w4a16_masked(
         expected_m=expected_m,
     )
     with torch.cuda.device(inputs.device):
+        if cpp_jit.enabled(inputs.device):
+            # CHORD_CPP_JIT=1: the C++ JIT (cpp_jit.py).
+            d = cpp_jit.grouped_masked(
+                _cpp_kernel_id(inputs.device, desc), grouped, weight.packed,
+                weight.scale, masked_m, out3, enable_pdl,
+            )
+            return d.view(weight.num_experts * grouped.size(1), weight.n)
         kernel = _resolve_kernel(desc)
         d = ops.launch_grouped_w4a16_masked(
             kernel_id=kernel.kernel_id,
@@ -215,14 +211,9 @@ def w4a16_contiguous(
     outputs: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Run the contiguous (prefill) grouped W4A16 GEMM.
-
-    ``inputs`` is the grouped-native contiguous layout ``[m, K]``: every
-    expert's rows are packed consecutively and padded to a 128-row boundary
-    (padding rows zeroed), and ``m_indices`` ``[m] int32`` maps each row to its
-    expert id (-1 for padding rows).  Returns ``[m, N]``.
-    """
-    _check_weight(weight, "contiguous", inputs.device)
+    """Contiguous (prefill) grouped GEMM: ``[m, K]`` with each expert's rows
+    padded to 128 (zeroed), ``m_indices`` ``[m] int32`` (-1 padding) -> ``[m, N]``."""
+    _check_weight(weight, "contiguous", _CONTIGUOUS_BLOCK_K, inputs.device)
     _check_activation(inputs, weight.k)
     if inputs.dim() != 2:
         raise ValueError(f"inputs must be 2D [m, K], got {inputs.dim()}D")
@@ -257,6 +248,12 @@ def w4a16_contiguous(
         num_sms=_num_sms(inputs.device),
     )
     with torch.cuda.device(inputs.device):
+        if cpp_jit.enabled(inputs.device):
+            # CHORD_CPP_JIT=1: the C++ JIT (cpp_jit.py).
+            return cpp_jit.grouped_contiguous(
+                _cpp_kernel_id(inputs.device, desc), inputs, weight.packed,
+                weight.scale, m_indices, outputs, enable_pdl,
+            )
         kernel = _resolve_kernel(desc)
         return ops.launch_grouped_w4a16_contiguous(
             kernel_id=kernel.kernel_id,

@@ -1,44 +1,19 @@
 # Derived from inclusionAI/humming; modified for chord_kernels.
-# Provenance and the list of changes are in chord_kernels/operator/SOURCE.md.
 
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import Iterator
-from typing import Literal
 
 import torch
 
 from chord_kernels.operator import cpp_jit
 from chord_kernels.operator.kernel.repack_weight import RepackWeightKernel
 
-# The operator has only two physical layouts.
-WeightLayout = Literal["mma", "wgmma"]
-
-SUPPORTED_INDEXED_COMPUTE_CAPABILITIES = frozenset(
-    {
-        (9, 0),
-        (10, 0),
-        (10, 3),
-    }
-)
-
-
-def _validate_layout(layout: str) -> WeightLayout:
-    if not isinstance(layout, str):
-        raise TypeError(f"layout must be a string, got {type(layout).__name__}")
-    if layout not in ("mma", "wgmma"):
-        raise ValueError(f"layout must be 'mma' or 'wgmma', got {layout!r}")
-    return layout  # type: ignore[return-value]
+SUPPORTED_INDEXED_COMPUTE_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
 
 
 def _validate_supported_architecture(device: torch.device) -> None:
-    """Validate architectures covered by the indexed W4A16 kernel.
-
-    The indexed kernel is used on Hopper SM90 and Blackwell SM100/SM103.  Do
-    not accept arbitrary 10.x or newer architectures: the generated code and
-    layout contracts are covered only for the capabilities listed above.
-    """
     capability = torch.cuda.get_device_capability(device)
     if capability not in SUPPORTED_INDEXED_COMPUTE_CAPABILITIES:
         raise RuntimeError(
@@ -50,11 +25,11 @@ def _validate_supported_architecture(device: torch.device) -> None:
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class PreparedWeight:
-    """Packed tensors plus the physical layout required by the W4A16 kernel."""
+    """Packed weight ``[E, K/16, 2N]`` and scale ``[E, K/32, N]``; every indexed
+    kernel (MMA, swap-AB MMA, WGMMA) reads the same bytes."""
 
     packed: torch.Tensor
     scale: torch.Tensor
-    layout: WeightLayout
     n: int
     k: int
     num_experts: int
@@ -77,34 +52,19 @@ def _pack_weight_scale(weight_scale: torch.Tensor) -> torch.Tensor:
     return packed.view(-1, 64)[:, perm_tensor].contiguous().view(shape)
 
 
-def pack_w4a16(
+def pack_w4a16_indexed(
     weight_uint4: torch.Tensor,
     weight_scale: torch.Tensor,
-    layout: WeightLayout = "mma",
     *,
     packed: bool = False,
 ) -> PreparedWeight:
-    """Pack quantized W4A16 weights for the indexed kernel.
+    """Pack INT4 weights and their BF16 group-32 scales for ``indexed``.
 
-    By default, ``weight_uint4`` is an unpacked int32 CUDA tensor shaped
-    ``[E, N, K]`` whose values are INT4 weights held as unsigned codes in
-    ``[0, 15]``. With
-    ``packed=True``, it is the common checkpoint representation ``[E, N, K/8]``
-    with eight little-endian nibbles in each int32 word. The packed path feeds
-    those words directly to the retained Humming repack kernel and avoids
-    materializing an
-    eight-times-larger intermediate tensor. With no explicit zero point, the
-    GEMM interprets each code as ``code - 8``.
-
-    ``weight_scale`` is BF16 ``[E, N, K/32]``. The returned object carries an
-    int32 kernel layout ``[E, K/16, 2*N]``, a BF16 scale layout
-    ``[E, K/32, N]``, and the physical MMA layout metadata required to prevent
-    incompatible launches.
-
-    MMA and WGMMA weights use different mini-block layouts and are not
-    interchangeable. The indexed swap-AB API uses ``layout="mma"``.
+    ``weight_uint4`` is int32 ``[E, N, K]`` holding unsigned codes in ``[0, 15]``
+    (decoded as ``code - 8``), or with ``packed=True`` the checkpoint form
+    ``[E, N, K/8]``, eight little-endian nibbles per word.  ``weight_scale`` is
+    BF16 ``[E, N, K/32]``.
     """
-    layout = _validate_layout(layout)
     if not isinstance(packed, bool):
         raise TypeError(f"packed must be a bool, got {type(packed).__name__}")
     if not isinstance(weight_uint4, torch.Tensor):
@@ -163,29 +123,19 @@ def pack_w4a16(
     )
     with torch.cuda.device(weight_uint4.device):
         if cpp_jit.enabled(weight_uint4.device):
-            # CHORD_CPP_JIT=1 on SM100 / SM103: the C++ JIT (cpp_jit.py).
-            cpp_jit.repack_w4a16(
-                weight_uint4, packed_weight, packed=packed, wgmma_layout=layout == "wgmma"
-            )
+            # CHORD_CPP_JIT=1: the C++ JIT (cpp_jit.py).
+            cpp_jit.repack_w4a16(weight_uint4, packed_weight, packed=packed)
         else:
-            kernel = RepackWeightKernel(
-                is_weight_packed=packed,
-                use_wgmma=layout == "wgmma",
-            )
+            kernel = RepackWeightKernel(is_weight_packed=packed)
             kernel(inputs=weight_uint4, outputs=packed_weight)
 
     return PreparedWeight(
         packed=packed_weight,
         scale=_pack_weight_scale(weight_scale),
-        layout=layout,
         n=shape_n,
         k=shape_k,
         num_experts=num_experts,
     )
 
 
-__all__ = [
-    "WeightLayout",
-    "PreparedWeight",
-    "pack_w4a16",
-]
+__all__ = ["PreparedWeight", "pack_w4a16_indexed"]

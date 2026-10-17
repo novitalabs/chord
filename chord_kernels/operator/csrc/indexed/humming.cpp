@@ -1,20 +1,20 @@
 // Indexed W4A16 GEMM on the generic C++ JIT; see humming.h.  Checks: api.py
 // _get_indexed_kernel and IndexedKernelConfig, kernel/humming.py
 // HummingKernel._validate_config / _select_mma_op.  Generated source:
-// kernel/humming.py CODE_TEMPLATE and config/mma.py _MmaOp.to_cpp_str.
+// kernel/humming.py CODE_TEMPLATE and config/mma.py (_MmaOp, _WgmmaOp, _format_asm).
 // Registration and launch: register_kernel / launch_kernel
 // (csrc/launcher/launcher.cpp).  Keep each in step with its Python / launcher
 // counterpart while both paths exist.
 
 #include "humming.h"
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <tuple>
-#include <unordered_map>
 #include <vector>
 
 #include "../jit/jit.h"
@@ -42,7 +42,9 @@ int64_t num_threads(const GemmConfig& c) {
   return c.block_m * c.block_n * c.block_k / (c.warp_m * c.warp_n * c.warp_k) * 32;
 }
 
-// MMA layout only: the C++ path never sees a WGMMA-packed weight.
+// WGMMA when warp-N is 32 (SM90 only), mma.sync when it is 64.
+bool uses_wgmma(const GemmConfig& c) { return c.warp_n == 32; }
+
 MmaShape check_config(const GemmConfig& c) {
   const std::initializer_list<std::pair<const char*, int64_t>> fields = {
       {"shape_n", c.shape_n}, {"shape_k", c.shape_k}, {"num_experts", c.num_experts},
@@ -64,27 +66,38 @@ MmaShape check_config(const GemmConfig& c) {
             "num_ctas_per_sm=" + str(c.num_ctas_per_sm));
   }
   // api.py _get_indexed_kernel
-  if (!c.swap_ab && c.block_m % 16 == 8) {
+  const bool wgmma = uses_wgmma(c);
+  if (c.swap_ab && wgmma) invalid("swap_ab requires the MMA kernel (warp-N 64)");
+  if (!wgmma && !c.swap_ab && c.block_m % 16 == 8) {
     invalid(
         "MMA indexed configs with block_m=8 (or another 16q+8 tile) must set swap_ab=True");
   }
   if (c.block_k % 64) {
     invalid("indexed block-K must be a positive multiple of 64, got " + str(c.block_k));
   }
+  if (wgmma && c.block_n < 128) invalid("the WGMMA kernel requires shape_n/block_n >= 128");
   // HummingKernel._validate_config
   if (c.shape_n % c.block_n || c.shape_k % c.block_k) {
     invalid("problem N/K must be divisible by the block N/K tile");
   }
-  if (c.warp_n != 64) invalid("WGMMA requires warp-N 32 and MMA requires warp-N 64");
+  if (c.warp_n != (wgmma ? 32 : 64)) invalid("WGMMA requires warp-N 32 and MMA requires warp-N 64");
   if (c.warp_k < 32) invalid("warp-K must be at least 32");
   for (int64_t v : {c.block_n, c.block_k, c.warp_n, c.warp_k, c.block_m / c.warp_m,
                     c.block_n / c.warp_n, c.block_k / c.warp_k}) {
     if (!is_power_of_two(v)) invalid("indexed kernel tile ratios must be powers of two");
   }
+  if (wgmma && num_threads(c) % 128) invalid("WGMMA requires complete four-warp groups");
   // HummingKernel.init_kernel / _select_mma_op
   const int arch = jit::current_arch();
-  if (arch != 100 && arch != 103) {
-    fail("the C++ JIT indexed W4A16 path requires SM100 or SM103, got sm_" + str(arch));
+  if (arch != 90 && arch != 100 && arch != 103) {
+    fail("the C++ JIT indexed W4A16 path requires SM90, SM100 or SM103, got sm_" + str(arch));
+  }
+  if (wgmma && arch != 90) fail("the WGMMA indexed kernel requires SM90, got sm_" + str(arch));
+  if (wgmma) {
+    const MmaShape op = {c.warp_m, 64, 16};
+    if (c.warp_m % op.m || c.warp_n % (op.n / 4)) invalid("warp shape is incompatible with the WGMMA tile");
+    if (c.warp_k % op.k) invalid("warp-K is incompatible with the MMA instruction");
+    return op;
   }
   MmaShape mma = {16, 8, 16};
   if (!c.swap_ab && c.warp_m % 16 == 8) mma = {8, 8, 8};
@@ -169,6 +182,107 @@ std::string mma_op_class(const MmaShape& mma) {
   return out;
 }
 
+// config/mma.py _format_asm: textwrap.dedent (common leading-space margin of
+// the non-blank lines; blank lines emptied), strip(), then "\n" + `indent`
+// spaces before every line.
+std::string format_asm(const std::string& code, int indent) {
+  std::vector<std::string> lines;
+  for (size_t start = 0;;) {
+    const size_t end = code.find('\n', start);
+    lines.push_back(code.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  size_t margin = std::string::npos;
+  for (auto& line : lines) {
+    const size_t first = line.find_first_not_of(' ');
+    if (first == std::string::npos) {
+      line.clear();
+      continue;
+    }
+    margin = std::min(margin, first);
+  }
+  std::string text;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (i) text += "\n";
+    if (!lines[i].empty()) text += lines[i].substr(margin);
+  }
+  const size_t first = text.find_first_not_of(" \n");
+  const size_t last = text.find_last_not_of(" \n");
+  text = first == std::string::npos ? "" : text.substr(first, last - first + 1);
+  std::string out;
+  const std::string prefix(indent, ' ');
+  for (size_t start = 0;;) {
+    const size_t end = text.find('\n', start);
+    out += "\n" + prefix + text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return out;
+}
+
+// config/mma.py _WgmmaOp.to_cpp_str / _generate_ptx: the dequantized weight
+// registers are WGMMA operand A and the activation's smem descriptor operand B.
+std::string wgmma_op_class(const MmaShape& mma) {
+  const int64_t rb = register_count(mma.n, mma.k, 16) / 4;
+  const int64_t rc = register_count(mma.m, mma.n, 32) / 4;
+  std::string out_ph = "{";
+  for (int64_t i = 0; i < rc; ++i) out_ph += (i ? ", %" : "%") + str(i);
+  out_ph += "}";
+  std::string b_ph = "{";
+  for (int64_t i = 0; i < rb; ++i) b_ph += (i ? ", %" : "%") + str(rc + i);
+  b_ph += "}";
+  const int64_t desc_ph = rc + rb, pred_ph = desc_ph + 1;
+  const std::string b_params = join(rb, " \"r\"(b[", "])");
+  std::string cd;  // four operands per line, continuation lines indented by 4
+  for (int64_t i = 0; i < rc; ++i) {
+    if (i) cd += (i % 4) ? ", " : ",\n    ";
+    cd += "\"+f\"(d[" + str(i) + "])";
+  }
+  const std::string asm_op = "wgmma.mma_async.sync.aligned.m" + str(mma.n) + "n" + str(mma.m) +
+                             "k" + str(mma.k) + ".f32.bf16.bf16";
+  const std::string code =
+      "\n"
+      "            asm volatile(\n"
+      "              \"{\\n\"\n"
+      "                \".reg .pred p;\\n\"\n"
+      "                \"setp.ne.b32 p, %" + str(pred_ph) + ", 0;\\n\"\n"
+      "                \"" + asm_op + " " + out_ph + ", " + b_ph + ", \"\n"
+      "                \"%" + str(desc_ph) + ", p, 1, 1, 0;\\n\"\n"
+      "              \"}\\n\"\n"
+      "              : " + cd + "\n"
+      "              : " + b_params + ",\n"
+      "                \"l\"(desc), \"r\"((uint32_t)pred)\n"
+      "            );\n"
+      "            ";
+  std::vector<std::string> lines = {
+      "static constexpr bool kUseWgmma = true;",
+      "using MmaShape = Shape<" + str(mma.m) + ", " + str(mma.n) + ", " + str(mma.k) + ">;",
+      "using BRegisters = uint32_t[" + str(rb) + "];",
+      "using CRegisters = float[" + str(rc) + "];",
+      "",
+      "CUDA_INLINE",
+      "static void fma(uint64_t &desc, uint32_t *b, float *d, bool pred = true) {",
+  };
+  // _generate_ptx(indent=2).strip("\n").split("\n")
+  std::string ptx = format_asm(code, 2);
+  while (!ptx.empty() && ptx.front() == '\n') ptx.erase(ptx.begin());
+  while (!ptx.empty() && ptx.back() == '\n') ptx.pop_back();
+  for (size_t start = 0;;) {
+    const size_t end = ptx.find('\n', start);
+    lines.push_back(ptx.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  lines.push_back("};");
+  std::string out;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (i) out += "\n";
+    if (!lines[i].empty()) out += "  " + lines[i];
+  }
+  return out;
+}
+
 const char* bool_str(bool v) { return v ? "true" : "false"; }
 
 // kernel/humming.py kernel_expr, whitespace collapsed as NVRTCCompiler._compile does.
@@ -183,7 +297,8 @@ std::string kernel_source(const GemmConfig& c, const MmaShape& mma) {
   const std::string threads = str(num_threads(c));
   std::string s;
   s += "\n#include <humming/kernel/humming.cuh>\n\n";
-  s += "class MmaOpClass {\npublic:\n" + mma_op_class(mma) + "\n};\n\n";
+  s += "class MmaOpClass {\npublic:\n" + (uses_wgmma(c) ? wgmma_op_class(mma) : mma_op_class(mma)) +
+       "\n};\n\n";
   s += "class TuningConfig {\npublic:\n";
   s += "  static constexpr uint32_t kNumStages = " + str(c.num_stages) + ";\n";
   s += "  static constexpr uint32_t kNumCtasPerSm = " + str(c.num_ctas_per_sm) + ";\n";
@@ -287,60 +402,6 @@ int64_t register_locked(const GemmConfig& c) {
   return id;
 }
 
-// --------------------------------------------------------------------------
-// Stream-K locks (launcher.cpp: kNumLocks, get_locks)
-
-constexpr int64_t kNumLocks = 1024;
-
-CUdeviceptr locks_for(int device, CUstream stream) {
-  static std::mutex mutex;
-  static std::unordered_map<int, std::unordered_map<CUstream, CUdeviceptr>> locks;
-  std::lock_guard<std::mutex> hold(mutex);
-  auto& device_locks = locks[device];
-  if (auto it = device_locks.find(stream); it != device_locks.end()) return it->second;
-  // As launcher.cpp get_locks: the first stream-K launch on a stream can be
-  // inside a CUDA-graph capture, where allocation is prohibited under the
-  // default capture modes.  Allocate in relaxed mode and zero on a private,
-  // synchronized stream, so the fill is neither recorded into the graph nor
-  // racing the first launch.
-  CUstreamCaptureMode mode = CU_STREAM_CAPTURE_MODE_RELAXED;
-  jit::check(cuThreadExchangeStreamCaptureMode(&mode), "cuThreadExchangeStreamCaptureMode");
-  CUdeviceptr ptr = 0;
-  CUstream fill_stream = nullptr;
-  CUresult result = cuMemAlloc(&ptr, kNumLocks * sizeof(int32_t));
-  if (result == CUDA_SUCCESS) result = cuStreamCreate(&fill_stream, CU_STREAM_NON_BLOCKING);
-  if (result == CUDA_SUCCESS) result = cuMemsetD32Async(ptr, 0, kNumLocks, fill_stream);
-  if (result == CUDA_SUCCESS) result = cuStreamSynchronize(fill_stream);
-  if (fill_stream != nullptr) cuStreamDestroy(fill_stream);
-  cuThreadExchangeStreamCaptureMode(&mode);
-  jit::check(result, "allocating the stream-K lock buffer");
-  device_locks[stream] = ptr;
-  return ptr;
-}
-
-// FP32 stream-K workspace (launcher.cpp: get_streamk_workspace), keyed like the
-// locks.  A slice only reads tile floats an earlier slice of the same launch
-// wrote, so it needs no zeroing and no reset between launches.  The size is
-// fixed at first use so a buffer a captured CUDA graph points at is never
-// freed or moved.
-constexpr int64_t kStreamKWorkspaceBytes = 64LL << 20;
-
-CUdeviceptr streamk_workspace_for(int device, CUstream stream) {
-  static std::mutex mutex;
-  static std::unordered_map<int, std::unordered_map<CUstream, CUdeviceptr>> workspaces;
-  std::lock_guard<std::mutex> hold(mutex);
-  auto& device_ws = workspaces[device];
-  if (auto it = device_ws.find(stream); it != device_ws.end()) return it->second;
-  CUstreamCaptureMode mode = CU_STREAM_CAPTURE_MODE_RELAXED;
-  jit::check(cuThreadExchangeStreamCaptureMode(&mode), "cuThreadExchangeStreamCaptureMode");
-  CUdeviceptr ptr = 0;
-  const CUresult result = cuMemAlloc(&ptr, kStreamKWorkspaceBytes);
-  cuThreadExchangeStreamCaptureMode(&mode);
-  jit::check(result, "allocating the FP32 stream-K workspace");
-  device_ws[stream] = ptr;
-  return ptr;
-}
-
 }  // namespace
 
 int64_t register_gemm(const GemmConfig& config) {
@@ -366,15 +427,30 @@ const GemmConfig& gemm_config(int64_t id) {
   return g_registered[id].config;
 }
 
-void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
-  Registered kd;
-  {
-    std::lock_guard<std::mutex> hold(g_mutex);
-    if (id < 0 || id >= static_cast<int64_t>(g_registered.size())) {
-      fail("indexed kernel is not registered: " + str(id));
-    }
-    kd = g_registered[id];
+namespace {
+
+Registered registered_kernel(int64_t id) {
+  std::lock_guard<std::mutex> hold(g_mutex);
+  if (id < 0 || id >= static_cast<int64_t>(g_registered.size())) {
+    fail("indexed kernel is not registered: " + str(id));
   }
+  return g_registered[id];
+}
+
+uint32_t num_ctas(const Registered& kd) {
+  return kd.num_ctas_per_sm * static_cast<uint32_t>(jit::num_sms());
+}
+
+}  // namespace
+
+int64_t gemm_streamk_workspace_elems(int64_t id) {
+  const Registered kd = registered_kernel(id);
+  if (!(kd.use_stream_k && kd.stream_k_fp32)) return 0;
+  return static_cast<int64_t>(num_ctas(kd)) * kd.streamk_tile_elems;
+}
+
+void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
+  const Registered kd = registered_kernel(id);
   const int device = jit::current_device();
   if (device != kd.device) {
     fail("indexed kernel " + str(id) + " was registered on device " + str(kd.device) +
@@ -386,29 +462,25 @@ void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
   if (static_cast<int64_t>(shape_m) != a.shape_m) fail("shape_m overflows uint32_t: " + str(a.shape_m));
   if (static_cast<int64_t>(top_k) != a.top_k) fail("top_k overflows uint32_t: " + str(a.top_k));
 
-  const uint32_t num_ctas = kd.num_ctas_per_sm * static_cast<uint32_t>(jit::num_sms());
+  const uint32_t grid = num_ctas(kd);
   // Only stream-K touches the locks; data-parallel launches pass a null pointer.  The
   // scheduler needs at most gridDim.x + gridDim.x / 10 of them (launcher.cpp).
   CUdeviceptr locks = 0;
   if (kd.use_stream_k) {
-    const int64_t max_streamk_tiles = static_cast<int64_t>(num_ctas) + num_ctas / 10;
-    if (max_streamk_tiles > kNumLocks) {
-      fail("stream-K launch may need " + str(max_streamk_tiles) + " lock words but only " +
-           str(kNumLocks) + " are allocated");
+    const int64_t max_streamk_tiles = static_cast<int64_t>(grid) + grid / 10;
+    if (a.locks == nullptr) fail("a stream-K kernel needs caller-owned locks (zeroed int32)");
+    if (max_streamk_tiles > a.num_locks) {
+      fail("stream-K launch may need " + str(max_streamk_tiles) +
+           " lock words but locks holds " + str(a.num_locks));
     }
-    locks = locks_for(device, stream);
+    locks = reinterpret_cast<CUdeviceptr>(a.locks);
   }
-  CUdeviceptr streamk_ws = 0;
-  if (kd.use_stream_k && kd.stream_k_fp32) {
-    // One partial-segment tile per CTA (see EpiloguePipeline::partial_slot).
-    const int64_t need = static_cast<int64_t>(num_ctas) * kd.streamk_tile_elems *
-                         static_cast<int64_t>(sizeof(float));
-    if (need > kStreamKWorkspaceBytes) {
-      fail("FP32 stream-K launch may need " + str(need) + " workspace bytes but only " +
-           str(kStreamKWorkspaceBytes) + " are allocated");
-    }
-    streamk_ws = streamk_workspace_for(device, stream);
+  // FP32 stream-K partials (see EpiloguePipeline::partial_slot): the caller
+  // allocates gemm_streamk_workspace_elems floats per launch.
+  if (kd.use_stream_k && kd.stream_k_fp32 && a.streamk_workspace == nullptr) {
+    fail("FP32 stream-K launch needs a workspace (gemm_streamk_workspace_elems)");
   }
+  float* streamk_ws = kd.use_stream_k && kd.stream_k_fp32 ? a.streamk_workspace : nullptr;
   const void* input = a.input;
   const void* weight = a.weight;
   void* output = a.output;
@@ -417,13 +489,13 @@ void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
   const int32_t* expert_ids = a.expert_ids;
   const int32_t* num_tokens_padded = a.num_tokens_padded;
   void* locks_ptr = reinterpret_cast<void*>(locks);
-  void* streamk_ws_ptr = reinterpret_cast<void*>(streamk_ws);
+  void* streamk_ws_ptr = streamk_ws;
   void* kernel_args[] = {&input,      &weight,    &output,         &weight_scale,
                          &sorted_ids, &expert_ids, &num_tokens_padded, &locks_ptr,
                          &streamk_ws_ptr, &shape_m, &top_k};
 
   CUlaunchConfig config = {};
-  config.gridDimX = num_ctas;
+  config.gridDimX = grid;
   config.gridDimY = 1;
   config.gridDimZ = 1;
   config.blockDimX = kd.num_threads;

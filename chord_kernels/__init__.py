@@ -1,23 +1,35 @@
-"""Chord indexed W4A16 operator and runtime backend."""
+"""Chord W4A16 MoE CUDA operators."""
 
 from importlib import import_module
 from typing import Any
 
+__all__ = [
+    "contiguous",
+    "indexed",
+    "indexed_block_m",
+    "masked",
+    "pack_w4a16_grouped",
+    "pack_w4a16_indexed",
+]
 
-__all__ = ["contiguous", "indexed", "masked", "operator"]
-
-_OPERATOR_NAMES = frozenset(("indexed", "masked", "contiguous"))
+# Resolved on first access, so importing the package does not import torch.
+_EXPORTS = {
+    "indexed": "chord_kernels.ops",
+    "masked": "chord_kernels.ops",
+    "contiguous": "chord_kernels.ops",
+    "indexed_block_m": "chord_kernels.operator.api",
+    "pack_w4a16_indexed": "chord_kernels.operator.packing",
+    "pack_w4a16_grouped": "chord_kernels.operator.grouped.packing",
+}
 
 
 def __getattr__(name: str) -> Any:
-    if name in _OPERATOR_NAMES:
-        value = getattr(import_module(f"{__name__}.ops"), name)
+    if name in _EXPORTS:
+        value = getattr(import_module(_EXPORTS[name]), name)
         globals()[name] = value
         return value
     if name == "operator":
-        module = import_module(f"{__name__}.{name}")
-        globals()[name] = module
-        return module
+        return import_module("chord_kernels.operator")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
