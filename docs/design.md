@@ -119,6 +119,11 @@ warpgroup, WGMMA consumers.
   one small problem); masked BLOCK_M from `expected_m` (`1.3x` gate/up,
   `ceil(1.25x, 8)` down), BN 256 only while `G x ceil(N/256) >= 2 x num_sms`,
   stages for ~512 buffered K (~768 from BM 72).
+- **Residency** (`_ctas_per_sm`): small masked tiles (`block_m <= 24`) run two
+  CTAs per SM -- a persistent grid of `num_sms * 2`, halved smem ring and
+  register budget -- which hides the single TMA producer's latency the way
+  Humming's compact-MoE path does; one CTA everywhere else.
 
-`CHORD_W4A16_BM/BN/BK/CM/CN/STAGES` pin one layout. The masked kernel's limits
+`CHORD_W4A16_BM/BN/BK/CM/CN/STAGES` pin one layout, `CHORD_W4A16_CTAS` the
+residency. The masked kernel's limits
 are in [getting_started.md](getting_started.md).

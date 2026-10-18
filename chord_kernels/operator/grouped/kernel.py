@@ -96,13 +96,13 @@ static void __instantiate_kernel() {
         {{config.layout.cluster_size}}, {{multicast_on_a}},
         {{desc.num_sms}}, deep_gemm::GemmType::{{gemm_type_cpp}},
         deep_gemm::epilogue::transform::EpilogueIdentity,
-        true, {{scale_group}}
+        true, {{scale_group}}, {{config.launch.num_ctas_per_sm}}
     >);
 }
 
 extern "C" __constant__ uint32_t SMEM_SIZE = {{config.pipeline.smem_size}};
 extern "C" __constant__ uint32_t NUM_THREADS = {{config.launch.num_threads}};
-extern "C" __constant__ uint32_t GRID_DIM = {{desc.num_sms}};
+extern "C" __constant__ uint32_t GRID_DIM = {{config.launch.grid_dim}};
 extern "C" __constant__ uint32_t CLUSTER_DIM = {{config.layout.cluster_size}};
 extern "C" __constant__ uint32_t GRP_BLOCK_M = {{config.layout.block_m}};
 extern "C" __constant__ uint32_t GRP_BLOCK_N = {{config.layout.block_n}};
@@ -173,7 +173,7 @@ class GroupedW4A16Kernel(KernelRuntime):
             f"{self.config.layout.cluster_size}, {'true' if self.config.layout.cluster_n > 1 else 'false'},\n"
             f"{self.desc.num_sms}, deep_gemm::GemmType::{_GEMM_TYPE_CPP[gemm_type]},\n"
             "deep_gemm::epilogue::transform::EpilogueIdentity,\n"
-            f"true, {W4A16_SCALE_GROUP}>"
+            f"true, {W4A16_SCALE_GROUP}, {self.config.launch.num_ctas_per_sm}>"
         )
         self.kernel_expr = expr
         self.prepare()

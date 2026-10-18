@@ -45,8 +45,9 @@ template <cute::SM90::GMMA::Major kMajorSFB,
           uint32_t kNumSMs, GemmType kGemmType,
           typename epilogue_type_t,
           bool kIsW4A16 = false,
-          uint32_t kScaleGroup = 0>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+          uint32_t kScaleGroup = 0,
+          uint32_t kNumCTAsPerSM = 1>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kNumCTAsPerSM) void
 sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a,
@@ -163,16 +164,25 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
     // Synchronize all threads to make barrier visible in normal memory model
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
-    // Register reconfigurations
+    // Register reconfigurations.  Two resident CTAs split an SM's 64K registers,
+    // and `__launch_bounds__(threads, 2)` caps a CTA at 80 regs/thread (30720 for
+    // 384 threads), so the reallocation must stay inside that: 128 producer
+    // threads at 40 leave 25600 for the math warpgroups -- 200 per thread with
+    // one of them, 96 with two (multiples of 8, as `setmaxnreg` requires).
+    // Asking for more stalls `setmaxnreg.inc` on registers the SM never frees.
     constexpr uint32_t kNumTMARegisters = 40;
-    constexpr uint32_t kNumMathRegisters = kNumMathThreads == 128 ? 248 : 232;
+    constexpr uint32_t kNumMathRegisters = kNumCTAsPerSM > 1
+                                               ? (kNumMathThreads == 128 ? 200 : 96)
+                                               : (kNumMathThreads == 128 ? 248 : 232);
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
-    // Block scheduler
+    // Block scheduler.  The persistent grid is `kNumSMs * kNumCTAsPerSM` CTAs,
+    // and the round-robin stride is that whole grid: two resident CTAs on one SM
+    // take consecutive block indices, not the same index twice.
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs * kNumCTAsPerSM>(shape_m, shape_n, shape_k, grouped_layout);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;

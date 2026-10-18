@@ -33,7 +33,7 @@ void check_config(const GemmConfig& c) {
   if (c.gemm_type != 1 && c.gemm_type != 2) invalid("grouped gemm_type must be 1 or 2");
   for (int64_t v : {c.shape_n, c.shape_k, c.num_groups, c.num_sms, c.block_m, c.block_n,
                     c.block_k, c.num_stages, c.smem_size, c.num_tma_threads, c.num_math_threads,
-                    c.num_threads, c.cluster_size}) {
+                    c.num_threads, c.cluster_size, c.num_ctas_per_sm}) {
     if (v <= 0) invalid("grouped config fields must be positive");
   }
   if (c.block_k != 64 && c.block_k != 128) invalid("grouped block-K must be 64 or 128");
@@ -79,7 +79,8 @@ std::string name_expression(const GemmConfig& c) {
          str(c.num_tma_threads) + ", " + str(c.num_math_threads) + ", " + str(c.cluster_size) +
          ", " + (c.multicast_on_a ? "true" : "false") + ", " + str(c.num_sms) +
          ", deep_gemm::GemmType::" + gemm_type_cpp(c.gemm_type) +
-         ", deep_gemm::epilogue::transform::EpilogueIdentity, true, 32>";
+         ", deep_gemm::epilogue::transform::EpilogueIdentity, true, 32, " +
+         str(c.num_ctas_per_sm) + ">";
 }
 
 // grouped/kernel.py CODE_TEMPLATE rendered (jinja2 drops the final newline).
@@ -100,7 +101,7 @@ std::string kernel_source(const GemmConfig& c) {
   s += "        " + str(c.cluster_size) + ", " + multicast + ",\n";
   s += "        " + str(c.num_sms) + ", deep_gemm::GemmType::" + gemm_type_cpp(c.gemm_type) + ",\n";
   s += "        deep_gemm::epilogue::transform::EpilogueIdentity,\n";
-  s += "        true, 32\n";
+  s += "        true, 32, " + str(c.num_ctas_per_sm) + "\n";
   s += "    >);\n";
   s += "}\n\n";
   auto constant = [&](const char* name, int64_t value) {
@@ -108,7 +109,7 @@ std::string kernel_source(const GemmConfig& c) {
   };
   constant("SMEM_SIZE", c.smem_size);
   constant("NUM_THREADS", c.num_threads);
-  constant("GRID_DIM", c.num_sms);
+  constant("GRID_DIM", c.num_sms * c.num_ctas_per_sm);
   constant("CLUSTER_DIM", c.cluster_size);
   constant("GRP_BLOCK_M", c.block_m);
   constant("GRP_BLOCK_N", c.block_n);

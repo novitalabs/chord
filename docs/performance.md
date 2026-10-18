@@ -9,9 +9,8 @@ microseconds; the `gate_up + down` column is speedup(gate_up + down), Humming's
 summed time over chord's. The chart in the README is
 `docs/assets/benchmark_chart.py` over these tables.
 
-On H200 chord leads on speedup(gate_up + down) everywhere except EP8 prefill at 8192 tokens (0.99x)
-and masked decode at 8 tokens per expert (0.95x); both gaps are in the kernel,
-not the tile choice.
+On H200 chord leads on speedup(gate_up + down) everywhere except EP8 prefill at 8192 tokens (0.99x);
+that gap is in the kernel, not the tile choice.
 
 ## Shapes
 
@@ -153,14 +152,15 @@ FP32 is also deterministic across launches; BF16 was not on three rows.
 
 | Stage | tokens/E | humming µs | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 8 | 253.1 | 268.1 | 2983 | 0.94 | 0.95 |
-| gate_up | 16 | 341.5 | 286.6 | 2828 | 1.19 | 1.18 |
-| gate_up | 32 | 375.3 | 356.9 | 2322 | 1.05 | 1.06 |
-| gate_up | 64 | 468.4 | 455.1 | 1896 | 1.03 | 1.03 |
-| down | 8 | 132.0 | 138.2 | 2913 | 0.95 |  |
-| down | 16 | 170.7 | 147.5 | 2787 | 1.16 |  |
-| down | 32 | 191.1 | 175.4 | 2424 | 1.09 |  |
-| down | 64 | 242.1 | 233.6 | 1948 | 1.04 |  |
+| gate_up | 8 | 253.1 | 247.5 | 3238 | 1.02 | 1.03 |
+| gate_up | 16 | 341.5 | 270.2 | 2999 | 1.26 | 1.25 |
+| gate_up | 32 | 375.3 | 350.0 | 2368 | 1.07 | 1.08 |
+| gate_up | 64 | 468.4 | 457.5 | 1890 | 1.02 | 1.03 |
+| down | 8 | 132.0 | 128.1 | 3149 | 1.03 |  |
+| down | 16 | 170.7 | 139.6 | 2943 | 1.22 |  |
+| down | 32 | 191.1 | 173.1 | 2458 | 1.10 |  |
+| down | 64 | 242.1 | 230.5 | 1974 | 1.05 |  |
 
-EP16 (24 experts) 1.04-1.21x, EP32 (12 experts) 1.04-1.31x speedup(gate_up + down). At 8
-tokens per expert none of 91 swept layouts beats the heuristic's `16x256x128`.
+EP16 (24 experts) 1.04-1.21x, EP32 (12 experts) 1.04-1.31x speedup(gate_up + down). The 8
+tokens per expert row was closed by running two resident CTAs per SM, not by a
+tile: none of 91 swept layouts beats the heuristic's `16x256x128`.

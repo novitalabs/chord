@@ -268,13 +268,14 @@ int64_t register_gemm(int64_t device, const std::vector<int64_t>& config) {
 
 // grouped config: (gemm_type, shape_n, shape_k, num_groups, num_sms, block_m,
 // block_n, block_k, swizzle_a, swizzle_b, swizzle_cd, num_stages, smem_size,
-// num_tma_threads, num_math_threads, num_threads, cluster_size, multicast_on_a).
+// num_tma_threads, num_math_threads, num_threads, cluster_size, multicast_on_a,
+// num_ctas_per_sm).
 int64_t register_grouped(int64_t device, const std::vector<int64_t>& v) {
-  if (v.size() != 18) throw std::invalid_argument("a grouped config has 18 fields");
+  if (v.size() != 19) throw std::invalid_argument("a grouped config has 19 fields");
   set_device(device);
   return chord::grouped::register_gemm({v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
                                         v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16],
-                                        v[17] != 0});
+                                        v[18], v[17] != 0});
 }
 
 std::vector<int64_t> precompile_gemm(int64_t device,
