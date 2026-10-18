@@ -292,6 +292,39 @@ def test_sm90_w4a16_masked_heuristic_table() -> None:
         assert config.launch.num_threads == 384
 
 
+def test_w4a16_masked_cta_residency() -> None:
+    """Two resident CTAs per SM for the small masked tiles, one elsewhere.
+
+    Measured on H200 (docs/performance.md): the second CTA only pays at
+    ``block_m`` 16/24 once the doubled grid runs two waves, so the heuristic
+    keeps one CTA below that and for every larger tile.
+    """
+    h = _heuristics()
+
+    def ctas(k: int, em: int, n: int, g: int) -> tuple[int, int]:
+        config = h.select_w4a16_config(
+            h.W4A16GemmDesc("masked", 256, n, k, g, 132, expected_m=em)
+        )
+        return config.launch.num_ctas_per_sm, config.launch.grid_dim
+
+    # EP8: both projections are long enough at block_m 16/24.
+    assert ctas(7168, 8, 4096, 48) == (2, 264)
+    assert ctas(2048, 16, 7168, 48) == (2, 264)
+    # EP32 gate_up: 384 tiles at G=24 is below the two-wave mark of the
+    # doubled grid; G=12 is one wave either way.
+    assert ctas(7168, 8, 4096, 24) == (1, 132)
+    assert ctas(7168, 16, 4096, 12) == (1, 132)
+    # block_m >= 40: the halved ring drops under three stages.
+    assert ctas(7168, 32, 4096, 48) == (1, 132)
+    assert ctas(2048, 64, 7168, 48) == (1, 132)
+    # Contiguous never takes the second CTA.
+    contiguous = h.select_w4a16_config(
+        h.W4A16GemmDesc("contiguous", 12288, 4096, 7168, 48, 132)
+    )
+    assert contiguous.launch.num_ctas_per_sm == 1
+    assert contiguous.launch.grid_dim == 132
+
+
 def test_sm90_w4a16_contiguous_heuristic_table() -> None:
     h = _heuristics()
     config = h.select_w4a16_config(
@@ -497,6 +530,62 @@ def test_masked_partial_last_tile_stays_in_its_group(
         diff = _cos_diff(outs[0][j, :mm], ref.to(torch.bfloat16))
         assert diff < _COSINE_LIMIT, (j, mm, diff)
         assert all(torch.equal(o[j, :mm], outs[0][j, :mm]) for o in outs[1:]), (j, mm)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "n,k,em", [(4096, 7168, 8), (7168, 2048, 16)], ids=["gate_up", "down"]
+)
+def test_masked_two_cta_residency_matches_one(
+    hopper: torch.device, n: int, k: int, em: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2-CTA masked path (EP8 small tiles) agrees with the 1-CTA path bit
+    for bit and is repeatable.
+
+    The residency is a launch-shape change only -- the scheduler walks the same
+    block list, just over twice as many persistent CTAs -- so any difference
+    would mean a race in the pipeline or the 3D masked store.  Forcing
+    ``CHORD_W4A16_CTAS`` also covers the config plumbing through both JITs.
+    """
+    from chord_kernels.operator.grouped.api import (
+        _resolve_kernel_cached,
+        w4a16_masked,
+    )
+
+    _reset_seed()
+    g, max_m, n_exp, k_exp = 48, 256, n, k
+    weights = torch.randint(
+        0, 16, (g, n_exp, k_exp), device=hopper, dtype=torch.int8
+    ).to(torch.int32)
+    scale = (torch.randn((g, n_exp, k_exp // _W4A16_GROUP), device=hopper) * 0.02).to(
+        torch.bfloat16
+    )
+    weight = _pack_unpacked(weights, scale)
+    masked_m = torch.tensor([em] * g, dtype=torch.int32, device=hopper)
+
+    def run(ctas: int, a3: torch.Tensor) -> torch.Tensor:
+        monkeypatch.setenv("CHORD_W4A16_CTAS", str(ctas))
+        _resolve_kernel_cached.cache_clear()
+        out = w4a16_masked(a3, weight, masked_m, em)
+        torch.cuda.synchronize(hopper)
+        return out
+
+    a3 = torch.randn((g, max_m, k_exp), device=hopper, dtype=torch.bfloat16)
+    one = run(1, a3).view(g, max_m, n_exp)
+    two = run(2, a3).view(g, max_m, n_exp)
+    two_again = run(2, a3).view(g, max_m, n_exp)
+    monkeypatch.delenv("CHORD_W4A16_CTAS")
+    _resolve_kernel_cached.cache_clear()
+
+    # Only the first `em` rows of each group carry results; the rest of max_m
+    # is padding the masked path leaves untouched.
+    valid = slice(0, em)
+    assert torch.equal(two[:, valid], two_again[:, valid]), (
+        "the 2-CTA launch is not repeatable"
+    )
+    assert torch.equal(one[:, valid], two[:, valid]), (
+        "the 2-CTA launch differs from the 1-CTA launch"
+    )
 
 
 # One case per decode bucket at a single shape: the flat/3D equivalence is a

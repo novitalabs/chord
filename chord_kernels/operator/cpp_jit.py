@@ -259,6 +259,7 @@ def get_grouped_kernel(device_index: int, desc, config) -> int:
         config.launch.num_threads,
         config.layout.cluster_size,
         int(config.layout.cluster_n > 1),
+        config.launch.num_ctas_per_sm,
     ]
     module = _load()
     with torch.cuda.device(device_index):

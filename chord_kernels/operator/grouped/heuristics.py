@@ -156,10 +156,15 @@ class W4A16PipelineConfig:
 
 @dataclasses.dataclass(frozen=True)
 class W4A16LaunchConfig:
-    num_sms: int  # grid-dim X (persistent kernel)
+    num_sms: int  # physical SMs; the persistent grid is num_sms * num_ctas_per_sm
     num_threads: int
     num_tma_threads: int
     num_math_threads: int
+    num_ctas_per_sm: int = 1
+
+    @property
+    def grid_dim(self) -> int:
+        return self.num_sms * self.num_ctas_per_sm
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,8 +198,14 @@ def _get_storage_config(desc: W4A16GemmDesc, layout: W4A16Layout) -> W4A16Storag
 
 
 def _get_pipeline_config(
-    desc: W4A16GemmDesc, layout: W4A16Layout, storage: W4A16StorageConfig
+    desc: W4A16GemmDesc,
+    layout: W4A16Layout,
+    storage: W4A16StorageConfig,
+    num_ctas_per_sm: int = 1,
 ) -> W4A16PipelineConfig:
+    # Every CTA on an SM gets its own slice of the 227 KiB, so residency divides
+    # the budget before the ring is fit into it.
+    smem_capacity = _SMEM_CAPACITY // num_ctas_per_sm
     smem_cd = _align(layout.block_m * layout.block_n * 2, 1024)
     smem_barriers = _NUM_MAX_STAGES * 8 * 2
     smem_a_per_stage = storage.load_block_m * layout.block_k * 2
@@ -207,7 +218,7 @@ def _get_pipeline_config(
     smem_extra = smem_cd + smem_barriers
     smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage
     smem_max_stages = min(
-        (_SMEM_CAPACITY - smem_extra) // smem_per_stage, _NUM_MAX_STAGES
+        (smem_capacity - smem_extra) // smem_per_stage, _NUM_MAX_STAGES
     )
 
     # W4A16 stage tuning: masked decode is latency-bound at 1 block/SM, so
@@ -222,7 +233,7 @@ def _get_pipeline_config(
     env_stages = _env_int("STAGES")
     if env_stages is not None:
         num_stages = min(
-            (_SMEM_CAPACITY - smem_extra) // smem_per_stage, env_stages
+            (smem_capacity - smem_extra) // smem_per_stage, env_stages
         )
     return W4A16PipelineConfig(
         smem_size=smem_extra + num_stages * smem_per_stage,
@@ -230,7 +241,9 @@ def _get_pipeline_config(
     )
 
 
-def _get_launch_config(desc: W4A16GemmDesc, layout: W4A16Layout) -> W4A16LaunchConfig:
+def _get_launch_config(
+    desc: W4A16GemmDesc, layout: W4A16Layout, num_ctas_per_sm: int = 1
+) -> W4A16LaunchConfig:
     num_tma_threads = 128
     # One consumer warpgroup for COMPUTE_M <= 64, two above; more consumer
     # warpgroups measured no speedup (the bottleneck is the single TMA producer
@@ -241,7 +254,43 @@ def _get_launch_config(desc: W4A16GemmDesc, layout: W4A16Layout) -> W4A16LaunchC
         num_threads=num_tma_threads + num_math_threads,
         num_tma_threads=num_tma_threads,
         num_math_threads=num_math_threads,
+        num_ctas_per_sm=num_ctas_per_sm,
     )
+
+
+def _ctas_per_sm(desc: W4A16GemmDesc, layout: W4A16Layout) -> int:
+    """Resident CTAs per SM: 2 for the small masked decode tiles, else 1.
+
+    Mirror of Humming's compact-MoE rule (``get_compact_moe_config``): its
+    W4A16 decode path drops warp specialization, TMA and the single resident
+    CTA in favour of ``>= 2`` once ``block_m <= 32``.  The lever here is the
+    opposite one -- the TMA producer stays, and the second CTA is what hides
+    its latency -- so it costs a halved shared-memory ring per CTA (and so
+    fewer stages) and a halved register budget, and only pays when the tile is
+    small and the problem is long enough to amortize both.  Measured on H200
+    (docs/performance.md): 2 CTAs wins 3-8% at ``block_m`` 16/24 once the
+    doubled grid runs at least two waves, and loses 7-15% below that (one wave,
+    nothing to overlap) or once ``block_m >= 40`` (the pipeline drops below
+    three stages).  The env override (``CHORD_W4A16_CTAS``) exists for sweeps.
+    """
+    env = _env_int("CTAS")
+    if env is not None:
+        return max(1, env)
+    if desc.gemm_type != "masked" or layout.block_m > 24:
+        return 1
+    storage = _get_storage_config(desc, layout)
+    if _get_pipeline_config(desc, layout, storage, 2).num_stages < 3:
+        return 1
+    if _masked_num_blocks(desc, layout) < 2 * 2 * desc.num_sms:
+        return 1
+    return 2
+
+
+def _masked_num_blocks(desc: W4A16GemmDesc, layout: W4A16Layout) -> int:
+    """Output tiles the masked kernel schedules: every group x its M tiles x
+    the N tiles, the same enumeration the device scheduler walks."""
+    m_tiles = _ceil_div(desc.exp_m, layout.block_m)
+    return desc.num_groups * m_tiles * _ceil_div(desc.n, layout.block_n)
 
 
 def _layout_candidates(desc: W4A16GemmDesc) -> list[W4A16Layout]:
@@ -377,8 +426,10 @@ def select_w4a16_config(desc: W4A16GemmDesc) -> W4A16GemmConfig:
     return W4A16GemmConfig(
         layout=best,
         storage=storage,
-        pipeline=_get_pipeline_config(desc, best, storage),
-        launch=_get_launch_config(desc, best),
+        pipeline=_get_pipeline_config(
+            desc, best, storage, _ctas_per_sm(desc, best)
+        ),
+        launch=_get_launch_config(desc, best, _ctas_per_sm(desc, best)),
     )
 
 

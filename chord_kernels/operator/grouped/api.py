@@ -76,7 +76,9 @@ def _num_sms(device: torch.device) -> int:
 
 def _env_tuning_key() -> tuple[int | None, ...]:
     """The ``CHORD_W4A16_*`` overrides, so a sweep changing them misses the memo."""
-    return tuple(_env_int(name) for name in ("BM", "BN", "BK", "CM", "CN", "STAGES"))
+    return tuple(
+        _env_int(name) for name in ("BM", "BN", "BK", "CM", "CN", "STAGES", "CTAS")
+    )
 
 
 @functools.lru_cache(maxsize=256)

@@ -21,6 +21,7 @@ struct GemmConfig {
   int64_t num_stages, smem_size;
   int64_t num_tma_threads, num_math_threads, num_threads;
   int64_t cluster_size;
+  int64_t num_ctas_per_sm;  // launch-bounds residency; grid is num_sms * this
   bool multicast_on_a;
 };
 
