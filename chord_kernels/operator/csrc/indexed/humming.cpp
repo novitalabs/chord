@@ -76,6 +76,10 @@ MmaShape check_config(const GemmConfig& c) {
     invalid("indexed block-K must be a positive multiple of 64, got " + str(c.block_k));
   }
   if (wgmma && c.block_n < 128) invalid("the WGMMA kernel requires shape_n/block_n >= 128");
+  if (wgmma && num_threads(c) * c.num_ctas_per_sm > 512) {
+    invalid("WGMMA configs need threads x CTAs/SM <= 512, got " + str(num_threads(c)) + " x " +
+            str(c.num_ctas_per_sm));
+  }
   // HummingKernel._validate_config
   if (c.shape_n % c.block_n || c.shape_k % c.block_k) {
     invalid("problem N/K must be divisible by the block N/K tile");

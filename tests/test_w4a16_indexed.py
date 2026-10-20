@@ -1473,3 +1473,50 @@ def test_one_packed_weight_serves_mma_and_wgmma() -> None:
         actual = indexed(activation, weight, sorted_ids, expert_ids, ntp, top_k,
                          config=config, validate_routing=False)
         _check_output(actual[:rows], reference)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "block_shape,num_stages",
+    [((56, 256, 128), 6), ((56, 128, 256), 4), ((72, 256, 128), 6), ((88, 128, 128), 6)],
+    ids=["56x256x128", "56x128x256", "72x256x128", "88x128x128"],
+)
+def test_wgmma_split_k_odd_warp_m(block_shape: tuple[int, int, int], num_stages: int) -> None:
+    """block_k > 64 splits K across warps and sums them in shared memory.  A
+    warp-M of 16q+8 holds a number of accumulator int4s its q reduction rounds
+    do not divide; the last ones used to be dropped (cos diff 1e-4 to 2e-2)."""
+    from chord_kernels import pack_w4a16
+    from chord_kernels.operator import IndexedKernelConfig, w4a16_indexed as indexed
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the WGMMA indexed kernel needs SM90")
+    device = torch.device("cuda")
+    num_experts, top_k, num_tokens, n, k = 16, 8, 192, 1024, 2048
+    gen = torch.Generator(device=device).manual_seed(20261020)
+    codes = torch.randint(0, 16, (num_experts, n, k), dtype=torch.int32, device=device, generator=gen)
+    scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
+             + 0.005).to(torch.bfloat16)
+    weight = pack_w4a16(codes, scale)
+    activation = torch.randn((num_tokens, k), dtype=torch.bfloat16, device=device, generator=gen)
+    topk_ids = generate_topk_ids(num_tokens=num_tokens, top_k=top_k, num_experts=num_experts,
+                                 device=device, generator=gen)
+    reference, rows = reference_indexed(activation, codes, scale, topk_ids, top_k)
+    config = IndexedKernelConfig(block_shape=block_shape, warp_shape=(block_shape[0], 32, 64),
+                                 num_stages=num_stages)
+    sorted_ids, expert_ids, ntp = align_routing_blocks(
+        topk_ids, block_m=config.block_m, num_experts=num_experts)
+    out = indexed(activation, weight, sorted_ids, expert_ids, ntp, top_k, config=config)
+    cosine, _ = _check_output(out[:rows], reference, cosine_limit=1e-5)
+    assert cosine < 1e-5
+
+
+def test_wgmma_register_budget_guard() -> None:
+    """A WGMMA config of 512 threads at 2 CTAs/SM leaves under 64 registers a
+    thread; it spilled and computed wrong results, so it is rejected."""
+    from chord_kernels.operator import IndexedKernelConfig
+    from chord_kernels.operator.api import _get_indexed_kernel
+
+    config = IndexedKernelConfig(block_shape=(32, 512, 64), warp_shape=(32, 32, 64),
+                                 num_ctas_per_sm=2)
+    with pytest.raises(ValueError, match="threads x CTAs/SM"):
+        _get_indexed_kernel.__wrapped__(0, 4096, 7168, 48, config)
