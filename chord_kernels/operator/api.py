@@ -2,6 +2,7 @@
 
 import dataclasses
 import functools
+import math
 
 import torch
 
@@ -191,6 +192,16 @@ def _get_indexed_kernel(
     mma_type = layout
     if mma_type == "wgmma" and block_n < 128:
         raise ValueError("the WGMMA kernel requires shape_n/block_n >= 128")
+    num_threads = (
+        block_m * block_n * block_k // math.prod(config.warp_shape) * 32
+    )
+    if mma_type == "wgmma" and num_threads * config.num_ctas_per_sm > 512:
+        # 64K registers / (threads x CTAs) leaves under 64 per thread: the
+        # accumulator spills to the stack and the WGMMA results come out wrong.
+        raise ValueError(
+            "WGMMA configs need threads x CTAs/SM <= 512, got "
+            f"{num_threads} x {config.num_ctas_per_sm}"
+        )
 
     # WGMMA instructions execute across a full four-warp group. With the
     # minimum block-N of 128, warp-N 32 produces exactly those 128 threads.

@@ -27,6 +27,11 @@ private:
   // FP32 stream-K workspace: one tile of floats per stream-K tile, laid out
   // [register][thread] so every CTA sharing a tile (same kernel, same thread ->
   // element mapping) reads back exactly the floats it would have held.
+  // The reducer writes into the union of the stage ring and `reduce`.
+  static_assert(SmemReducer::kSmemInt4s * sizeof(int4) <=
+                    MAX(sizeof(SharedStorage::stages), sizeof(SharedStorage::reduce)),
+                "the split-K reduction does not fit the epilogue buffer");
+
   static constexpr uint32_t kTileElems = BlockShape::M * BlockShape::N;
   static_assert(
       !kStreamKFp32 ||

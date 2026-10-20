@@ -24,11 +24,22 @@ public:
   EpilogueSmemReducer(int4 *smem_ptr)
       : smem_ptr(smem_ptr) {}
 
+  // The accumulator is reduced in kNumChunks rounds of kChunkInt4s int4s each.
+  // A WGMMA warp-M of 16q+8 (56, 72, 88, ...) holds warp_m / 4 int4s, which
+  // q rounds do not divide evenly: the chunk rounds up and the last round
+  // skips the indices past the end, so every register is reduced.
+  static constexpr uint32_t kNumInt4s = sizeof(CRegistersArrayType) / 16;
+  static constexpr uint32_t kNumChunks = MAX(WarpShape::M / 16, 1);
+  static constexpr uint32_t kChunkInt4s = CEIL_DIV(kNumInt4s, kNumChunks);
+  static constexpr uint32_t kGroupNumWarps = BlockShape::K / WarpShape::K;
+  // int4s of shared memory reduce() touches; the caller checks it fits.
+  static constexpr uint32_t kSmemInt4s =
+      kGroupNumWarps / 2 * (TuningConfig::kNumThreads / 32 / kGroupNumWarps) * kChunkInt4s * 32;
+
   CUDA_INLINE
   void reduce(uint32_t *regs_ptr) {
-    constexpr uint32_t num_int4s = sizeof(CRegistersArrayType) / 16;
-    constexpr uint32_t num_int4s_per_time = num_int4s / MAX(WarpShape::M / 16, 1);
-    constexpr uint32_t group_num_warps = BlockShape::K / WarpShape::K;
+    constexpr uint32_t num_int4s_per_time = kChunkInt4s;
+    constexpr uint32_t group_num_warps = kGroupNumWarps;
     constexpr uint32_t num_groups = TuningConfig::kNumThreads / 32 / group_num_warps;
     uint32_t group_id = threadIdx.x / 32 % num_groups;
     uint32_t group_warp_id = threadIdx.x / (32 * num_groups);
@@ -42,7 +53,9 @@ public:
 
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < num_int4s_per_time; i++) {
-        smem_arr[buffer_id][group_id][i][laneid] = regs_int4_ptr[i];
+        if (m * num_int4s_per_time + i < kNumInt4s) {
+          smem_arr[buffer_id][group_id][i][laneid] = regs_int4_ptr[i];
+        }
       };
     };
 
@@ -51,6 +64,7 @@ public:
 
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < num_int4s_per_time; i++) {
+        if (m * num_int4s_per_time + i >= kNumInt4s) continue;
         int4 val = smem_arr[buffer_id][group_id][i][laneid];
 
         float *sval_scalar_ptr = reinterpret_cast<float *>(&val);

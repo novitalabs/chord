@@ -32,8 +32,8 @@ family (K2.5/K2.6/K2.7).
 ## Performance
 
 speedup(gate_up + down) over
-[`vllm-project/humming@b4f3fc6`](https://github.com/vllm-project/humming/commit/b4f3fc6ee1dfc637cb8081e57c02c4bf1791c5f1)
-(2026-10-19) on the same GPU, detailed in [docs/performance.md](docs/performance.md).
+[`vllm-project/humming@7ec54ed`](https://github.com/vllm-project/humming/commit/7ec54ed8c673e9b31ebb23de4e99c0968075ad42)
+(2026-10-20) on the same GPU, detailed in [docs/performance.md](docs/performance.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
