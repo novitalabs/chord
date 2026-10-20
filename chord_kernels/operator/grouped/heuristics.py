@@ -329,10 +329,25 @@ def _layout_candidates(desc: W4A16GemmDesc) -> list[W4A16Layout]:
         block_n_candidates = (
             [64] if bn128_tiles * 3 < desc.num_sms * 2 else [128]
         )
+        # Full-size problems: 128x256x128 (3 stages, no cluster) beats
+        # 128x128x64 by 2-9% on H200 at 128-512 rows/E, except short-K down
+        # below 256 rows/E (2-5% slower there), where K/128 is too few k-blocks
+        # to fill the ring.  Multicast costs this tile 2-4%.
+        rows_per_group = desc.m // desc.num_groups
+        if (
+            block_m_candidates == [128]
+            and desc.k % 128 == 0
+            and (desc.k >= 4096 or rows_per_group >= 256)
+        ):
+            block_k = 128
+            block_n_candidates = [256]
 
+    wide_contiguous = desc.gemm_type == "contiguous" and block_k == 128
     candidates: list[W4A16Layout] = []
     for cluster_m in (1, 2):
         for cluster_n in (1, 2):
+            if wide_contiguous and cluster_m * cluster_n > 1:
+                continue
             if cluster_m * cluster_n > 2:
                 continue
             if desc.num_sms % (cluster_m * cluster_n):
