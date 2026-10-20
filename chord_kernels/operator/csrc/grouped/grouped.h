@@ -31,8 +31,8 @@ int64_t register_gemm(const GemmConfig& config);
 
 struct GemmArgs {
   void* a;               // bf16; masked [G, max_m, K], contiguous [m, K]
-  void* weight;          // float8_e4m3fn bytes [G, N, K/2] (pack_w4a16_grouped)
-  void* scale;           // bf16 [G, K/32, N]
+  void* weight;          // int32 [G, K/16, 2N] (pack_w4a16)
+  void* scale;           // bf16 [G, K/32, N], lane-permuted (pack_w4a16)
   int32_t* layout;       // masked_m [G] or m_indices [m]
   void* d;               // bf16; masked [G, max_m, N], contiguous [m, N]
   int64_t m;             // masked: per-group max_m; contiguous: total rows

@@ -223,7 +223,7 @@ def _validate_prepared_weight(
     weight: PreparedWeight, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
     if not isinstance(weight, PreparedWeight):
-        raise TypeError("weight must be a PreparedWeight from pack_w4a16_indexed()")
+        raise TypeError("weight must be a PreparedWeight from pack_w4a16()")
     n, k, e = weight.n, weight.k, weight.num_experts
     packed, scale = weight.packed, weight.scale
     if packed.dtype != torch.int32 or tuple(packed.shape) != (e, k // 16, n * 2):
@@ -296,7 +296,7 @@ def indexed_block_m(
     from chord_kernels.operator.tuning import select_indexed_config
 
     if not isinstance(weight, PreparedWeight):
-        raise TypeError("weight must be a PreparedWeight from pack_w4a16_indexed()")
+        raise TypeError("weight must be a PreparedWeight from pack_w4a16()")
     if device is None:
         device = weight.packed.device
     return select_indexed_config(

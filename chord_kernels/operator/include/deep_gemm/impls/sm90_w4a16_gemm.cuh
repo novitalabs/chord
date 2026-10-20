@@ -228,24 +228,30 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                              num_tma_multicast_a, batch_idx);
                     // W4A16: SFA slot carries weight scales (block_n dim, indexed by n_block_idx)
                     if constexpr (kIsW4A16) {
-                        // INT4 weight scales with per-`kScaleGroup` granularity along K.
-                        // SF tensor K-length = shape_k / kScaleGroup; per block load `kScaleSub` rows.
-                        // Group offset into the [G, K/group, N] scale tensor: masked tracks the group in
-                        // `current_group_idx`, contiguous resolves it per-M-block from `grouped_layout`
-                        // (m_indices), matching how the weight B is indexed via get_global_idx.
-                        const uint32_t sf_k_len = shape_k / kScaleGroup;
-                        uint32_t group_off = 0;
+                        // The weight and its scales are pack_w4a16's: int32 [G, K/16, 2N] and
+                        // BF16 [G, K/32, N].  Masked tracks the group in `current_group_idx`,
+                        // contiguous resolves it per M-block from `grouped_layout` (m_indices).
+                        uint32_t group_idx = 0;
                         if constexpr (kGemmType == GemmType::MGroupedMasked)
-                            group_off = scheduler.current_group_idx * sf_k_len;
+                            group_idx = scheduler.current_group_idx;
                         else if constexpr (kGemmType == GemmType::MGroupedContiguous)
-                            group_off = cute::max(0, scheduler.grouped_layout[m_block_idx * BLOCK_M]) * sf_k_len;
+                            group_idx = cute::max(0, scheduler.grouped_layout[m_block_idx * BLOCK_M]);
+                        // INT4 weight scales with per-`kScaleGroup` granularity along K: K/group
+                        // rows per group, `kScaleSub` of them per block.
+                        const uint32_t sf_k_len = shape_k / kScaleGroup;
                         #pragma unroll
                         for (uint32_t s = 0; s < kScaleSub; ++ s) {
                             tma::copy<COMPUTE_M, kScaleGroup, 0>(&tensor_map_sfa, &full_barrier,
                                      smem_sfa[stage_idx] + s * COMPUTE_M, n_block_idx * BLOCK_N,
-                                     group_off + k_block_idx * kScaleSub + s,
+                                     group_idx * sf_k_len + k_block_idx * kScaleSub + s,
                                      num_tma_multicast_b);
                         }
+                        // B: the weight seen as (N, G*K/16) uint64, one uint64 per N column of a K16
+                        // row, so the stage is one unswizzled box of BLOCK_K/16 rows x BLOCK_N.
+                        tma::copy<BLOCK_N, BLOCK_K / WGMMA::K, 0, uint64_t>(&tensor_map_b, &full_barrier,
+                                 reinterpret_cast<uint64_t*>(smem_b[stage_idx]), n_block_idx * BLOCK_N,
+                                 (group_idx * shape_k + k_idx) / WGMMA::K,
+                                 num_tma_multicast_b);
                     } else {
                         tma::copy<COMPUTE_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
                                  smem_sfa[stage_idx], m_block_idx * BLOCK_M,
@@ -257,9 +263,11 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                     }
 
                     // Issue TMA B
-                    tma::copy<BLOCK_K / WEIGHT_RATIO, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
-                             smem_b[stage_idx], k_idx / WEIGHT_RATIO, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                             num_tma_multicast_b, batch_idx);
+                    if constexpr (not kIsW4A16) {
+                        tma::copy<BLOCK_K / WEIGHT_RATIO, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
+                                 smem_b[stage_idx], k_idx / WEIGHT_RATIO, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                                 num_tma_multicast_b, batch_idx);
+                    }
                     full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE +
                                                       SMEM_SFA_SIZE_PER_STAGE);
                 }
@@ -305,12 +313,27 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
         const uint32_t a_desc_lo = __shfl_sync(0xffffffff, a_desc.reg32_[0], 0);
         const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
 
-        // W4A16: Precompute thread-invariant values for ldmatrix (hoisted out of k-loop)
-        constexpr uint32_t NV = 16 / sizeof(__nv_fp8_e4m3);
-        const uint32_t tidG = threadIdx.x % 128;
-        const uint32_t tRow = (tidG & 15) | ((tidG >> 5) << 4);
-        const uint32_t tCol = ((tidG >> 4) & 1) * NV;
-        const uint32_t sRow = math_wg_idx * WGMMA::M + tRow;
+        // W4A16 weight fragments (hoisted out of the k-loop).  A K16 row of the stage is
+        // BLOCK_N * 2 words; each 64-row N atom is 128 of them, and lane t's word for the
+        // atom's 16-row slab j is word t * 4 + j: rows 16j + t/4 and +8, K (t%4)*2 + {0, 1, 8, 9},
+        // i.e. exactly this lane's RS-WGMMA A fragment for the 16 WGMMA-M rows of its warp.
+        // Which slab a warp feeds is free as long as the epilogue stores it back in place:
+        //   - one wave per warpgroup: warp w takes slab w of atom `math_wg_idx`;
+        //   - two waves (BLOCK_N 256, two warpgroups): warp w takes slabs 2 (w % 2) + {0, 1} of
+        //     atom 2 math_wg_idx + w / 2, one per wave, so both waves' words are adjacent and
+        //     one `ld.shared.v2` reads them (a lone 32-bit word per lane is a 4-way bank conflict).
+        // The scales are permuted within each 64-wide N chunk (row n at 8 * (n % 8) + n / 8), so
+        // rows r_0 and r_1 = r_0 + 8 of slab j sit side by side at 2j, and slabs 2j, 2j+1 too.
+        constexpr uint32_t W4A16_WAVE_BLOCK_M = COMPUTE_M <= WGMMA::M ? COMPUTE_M : WGMMA::M * 2;
+        constexpr uint32_t kW4A16Waves = COMPUTE_M / W4A16_WAVE_BLOCK_M;
+        constexpr bool kW4A16PairWaves = kIsW4A16 and kW4A16Waves == 2;
+        DG_STATIC_ASSERT(not kIsW4A16 or kW4A16Waves <= 2, "W4A16 holds at most two waves");
+        DG_STATIC_ASSERT(not kW4A16PairWaves or (kNumMathThreads == 256 and kSwizzleDMode == 128),
+                         "paired W4A16 waves assume two warpgroups and the 128B D swizzle");
+        const uint32_t w4_atom = kW4A16PairWaves ? math_wg_idx * 2 + (warp_idx % 4) / 2 : math_wg_idx;
+        const uint32_t w4_slab = kW4A16PairWaves ? (warp_idx % 2) * 2 : warp_idx % 4;
+        const uint32_t b_word_offset = w4_atom * 128 + lane_idx * 4 + w4_slab;
+        const uint32_t sf_offset = w4_atom * WGMMA::M + (lane_idx / 4) * 8 + w4_slab * 2;
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -386,7 +409,7 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                 // Dispatch `num_former_iters` and launch MMAs
                 dispatch_num_former_iters<0, kGap, kEnd>(kShouldOptimize ? num_former_iters : 0, [&](auto _) {
                     // W4A16 wait<1> overlap: keep the previous k-block's
-                    // WGMMA group in flight so it overlaps this k-block's ldmatrix + int4->bf16 dequant,
+                    // WGMMA group in flight so it overlaps this k-block's weight loads + int4->bf16 dequant,
                     // instead of draining (wait<0>) after every group. We must defer each stage's empty
                     // barrier release until its WGMMA group has drained (the activation operand B is read
                     // from smem for the whole async op); track the previous stage here.
@@ -421,55 +444,64 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                         // Wait TMA arrivals
                         full_barriers[stage_idx]->wait(phase);
 
+                        // W4A16: every wave's weight words (one per K16 RS operand) and BF16 scale
+                        // pairs, read up front (cheap LSU, lets dequant/wgmma overlap below).
+                        constexpr uint32_t kW4NumK16 = kIsW4A16 ? BLOCK_K / WGMMA::K : 1;
+                        uint32_t w4_frag[kW4A16Waves][kW4NumK16];
+                        __nv_bfloat16 w4_scale_0[kW4A16Waves][kScaleSub], w4_scale_1[kW4A16Waves][kScaleSub];
+                        if constexpr (kIsW4A16) {
+                            const auto words = reinterpret_cast<const uint32_t*>(smem_b[stage_idx]) + b_word_offset;
+                            const auto scales = smem_sfa[stage_idx] + sf_offset;
+                            #pragma unroll
+                            for (uint32_t rr = 0; rr < kW4NumK16; ++ rr) {
+                                if constexpr (kW4A16PairWaves) {
+                                    const uint2 pair = ptx::ld_shared(reinterpret_cast<const uint2*>(words + rr * BLOCK_N * 2));
+                                    w4_frag[0][rr] = pair.x, w4_frag[1][rr] = pair.y;
+                                } else {
+                                    w4_frag[0][rr] = ptx::ld_shared(words + rr * BLOCK_N * 2);
+                                }
+                            }
+                            #pragma unroll
+                            for (uint32_t s = 0; s < kScaleSub; ++ s) {
+                                #pragma unroll
+                                for (uint32_t wave = 0; wave < kW4A16Waves; ++ wave) {
+                                    const auto pair = *reinterpret_cast<const __nv_bfloat162*>(scales + s * COMPUTE_M + wave * 2);
+                                    w4_scale_0[wave][s] = pair.x;
+                                    w4_scale_1[wave][s] = pair.y;
+                                }
+                            }
+                        }
+
                         // TODO: remove some useless computation for unaligned Ms
                         #pragma unroll
                         for (uint32_t local_idx = 0; local_idx < WAVE_WGMMA; ++ local_idx) {
                             auto m_offset = local_idx * WAVE_BLOCK_M;
 
                             // W4A16: INT4 weights in registers (operand A), BF16 activations in smem (operand B desc).
-                            // BLOCK_K = 64 -> one ldmatrix.x4 (32 nibbles/thread) -> BLOCK_K/16 K=16 RS operands.
+                            // One 32-bit word per thread per K16 RS operand.
                             // Weight scales have per-`kScaleGroup` granularity along K (kScaleSub sub-groups per block);
                             // each sub-group is promoted independently into `final_accum`.
                             if constexpr (kIsW4A16) {
                                 using WGMMARS = typename mma::sm90::BF16MMASelectorRS<MMA_N>::type;
                                 constexpr uint32_t kOpsPerSub = kScaleGroup / WGMMA::K;
                                 constexpr uint32_t kNumK16 = BLOCK_K / WGMMA::K;          // K=16 operands per block
-                                // One ldmatrix.x4 covers 32 weight bytes = 64 nibbles = 4 K16 operands.
-                                constexpr uint32_t kLdsmChunks = (BLOCK_K / 2) / 32;       // = BLOCK_K / 64
                                 // Activation (operand B desc) swizzle-atom size along K (in TA elements).
                                 constexpr uint32_t BLOCK_ATOM_K = kSwizzleAMode / sizeof(TA);
 
-                                // Read all per-sub-group weight scales up front (before `warpgroup_arrive`).
                                 // W4A16 scales are BF16; kept as BF16 to fold directly into the dequantized
                                 // weight (scale-on-weight), removing the fp32 scale-promote FMA + dual bank.
-                                __nv_bfloat16 scale_w_0[kScaleSub], scale_w_1[kScaleSub];
-                                #pragma unroll
-                                for (uint32_t s = 0; s < kScaleSub; ++ s) {
-                                    scale_w_0[s] = smem_sfa[stage_idx][s * COMPUTE_M + r_0 + m_offset];
-                                    scale_w_1[s] = smem_sfa[stage_idx][s * COMPUTE_M + r_1 + m_offset];
-                                }
+                                const __nv_bfloat16* scale_w_0 = w4_scale_0[local_idx];
+                                const __nv_bfloat16* scale_w_1 = w4_scale_1[local_idx];
 
-                                // Interleaved software pipeline (cf. PR287 fp8-W4): overlap the ALU-heavy
-                                // int4->bf16 dequant of the *next* K16 operand with the WGMMA of the *current*
-                                // one, using a 2-deep ping-pong of `unpackB`. One ldmatrix.x4 yields 4 operands
-                                // (a 64-nibble chunk); we dequant operand-by-operand to keep the convert close
-                                // to its WGMMA. Per-`kScaleGroup` subgroup keeps its own accum bank (scale on C).
                                 // Interleaved software pipeline: overlap the int4->bf16 dequant of the
                                 // *next* K16 operand with the WGMMA of the *current* one (2-deep ping-pong).
                                 // Scale-on-weight: the per-(N,K-group) weight scale is folded into the bf16
                                 // weight in the convert (scale_w_0 -> even regs / row r_0, scale_w_1 -> odd
                                 // regs / row r_1), so WGMMA accumulates straight into the single `final_accum`
                                 // across the whole K-loop — no separate fp32 promote, no dual accum bank.
-                                const __nv_fp8_e4m3* smem_b_w4_ptr = smem_b[stage_idx] + (sRow + m_offset) * (BLOCK_K / 2);
-                                uint32_t fragB[kNumK16];   // one ldmatrix reg == one K16 operand
+                                const uint32_t* fragB = w4_frag[local_idx];   // one word == one K16 operand
                                 uint32_t unpackB[2][4];    // ping-pong: only 2 operands' bf16 live at a time
                                 auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
-
-                                auto ldsm_chunk = [&](uint32_t c) {
-                                    const uint32_t pCol = ptx::permute_col<BLOCK_K / 2 * sizeof(__nv_fp8_e4m3), NV>(tRow, c * 32 + tCol);
-                                    uint32_t* fb = fragB + c * 4;
-                                    ptx::SM90_U32x4_LDSM_N::copy(fb[0], fb[1], fb[2], fb[3], (void*)(smem_b_w4_ptr + pCol));
-                                };
                                 auto a_desc_for = [&](uint32_t rr) {
                                     const uint32_t k_elem = rr * WGMMA::K;
                                     const uint32_t atom_k_idx = k_elem / BLOCK_ATOM_K;
@@ -481,10 +513,6 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                                     const uint32_t s = rr / kOpsPerSub;  // scale subgroup for this K16 op
                                     ptx::fast_int4_to_bf16_convert_scaled(out, frag, scale_w_0[s], scale_w_1[s]);
                                 };
-
-                                // All ldmatrix up front (cheap LSU, lets dequant/wgmma overlap below).
-                                #pragma unroll
-                                for (uint32_t c = 0; c < kLdsmChunks; ++ c) ldsm_chunk(c);
 
                                 #pragma unroll
                                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
@@ -509,7 +537,7 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                                     ptx::warpgroup_fence_operand(shifted_accum[i]);
                                 if constexpr (kW4A16Wait1) {
                                     // wait<1>: keep THIS k-block's WGMMA group in flight so it overlaps the
-                                    // next k-block's ldmatrix + int4->bf16 dequant. `shifted_accum` regs are
+                                    // next k-block's weight loads + int4->bf16 dequant. `shifted_accum` regs are
                                     // only read at the epilogue (no read between groups), and register operand
                                     // A (unpackB) is latched at issue (the existing distance-2 ping-pong
                                     // already relies on this), so 1 group in flight is bit-safe. The only
@@ -634,11 +662,12 @@ sm90_w4a16_gemm_impl(float* sfb, int* grouped_layout,
                         constexpr uint32_t kNumBankGroupBytes = 16;
 
                         if constexpr (kIsW4A16) {
+                            // The 16 N rows this warp's accumulators hold (see b_word_offset).
                             auto row = i * 8 + lane_idx % 8;
-                            auto col = (warp_idx % 4) * 2 + lane_idx / 8;
+                            auto col = (kW4A16PairWaves ? w4_slab + local_idx : warp_idx % 4) * 2 + lane_idx / 8;
                             col ^= row % (kSwizzleDMode / 16);
 
-                            auto n_atom_idx = m_offset / WGMMA::M + math_wg_idx;
+                            auto n_atom_idx = kW4A16PairWaves ? w4_atom : m_offset / WGMMA::M + math_wg_idx;
                             smem_ptr = reinterpret_cast<uint8_t*>(smem_d) +
                                     n_atom_idx * BLOCK_M * kSwizzleDMode +
                                     row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;

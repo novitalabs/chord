@@ -32,8 +32,8 @@ family (K2.5/K2.6/K2.7).
 ## Performance
 
 speedup(gate_up + down) over
-[`vllm-project/humming@c00b2e6`](https://github.com/vllm-project/humming/commit/c00b2e645a4b5ef57174f40254968a2996944217)
-(2026-10-16) on the same GPU, detailed in [docs/performance.md](docs/performance.md).
+[`vllm-project/humming@b4f3fc6`](https://github.com/vllm-project/humming/commit/b4f3fc6ee1dfc637cb8081e57c02c4bf1791c5f1)
+(2026-10-19) on the same GPU, detailed in [docs/performance.md](docs/performance.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark_chart_dark.svg">
@@ -52,9 +52,9 @@ pip install git+https://github.com/novitalabs/chord.git
 
 ```python
 import torch
-from chord_kernels import indexed, indexed_block_m, pack_w4a16_indexed
+from chord_kernels import indexed, indexed_block_m, pack_w4a16
 
-weight = pack_w4a16_indexed(weight_uint4, scale)
+weight = pack_w4a16(weight_uint4, scale)
 locks = torch.zeros(1024, dtype=torch.int32, device="cuda")
 
 # sorted_ids / expert_ids / num_tokens_padded: routing aligned to block_m
@@ -67,9 +67,9 @@ Details in [docs/getting_started.md](docs/getting_started.md).
 ### grouped (SM90)
 
 ```python
-from chord_kernels import contiguous, masked, pack_w4a16_grouped
+from chord_kernels import contiguous, masked, pack_w4a16
 
-weight = pack_w4a16_grouped(weight_uint4, scale)            # serves both operators
+weight = pack_w4a16(weight_uint4, scale)                    # the same weight as indexed
 out = masked(x3, weight, masked_m, expected_m)              # x3 [G, max_m, K] -> [G*max_m, N]
 out = contiguous(x2, weight, m_indices)                     # x2 [m, K], 128-row padded per expert
 ```

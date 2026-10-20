@@ -15,9 +15,6 @@ from typing import Literal
 
 # Fixed schema of the vendored instantiation (all site-asserted by the API).
 W4A16_SCALE_GROUP = 32
-# The weight atom the offline packer permutes within; the kernel consumes
-# N in multiples of this atom.  Mirrored from the upstream generators.
-W4A16_N_ATOM = 64
 # The weight scale TMA descriptor requires N to meet the BF16 TMA alignment.
 W4A16_TMA_N_ALIGN = 16
 

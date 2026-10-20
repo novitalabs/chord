@@ -14,7 +14,7 @@ api.w4a16_indexed（参数检查，tuning.select_indexed_config 选配置，有�
        └─ cpp_jit.indexed_gemm → torch.ops.chord_cpp.indexed_gemm（检查张量、分配输出、当前 stream）
             └─ chord::indexed::gemm                                          stream-K 锁、启动
 
-packing.pack_w4a16_indexed
+packing.pack_w4a16
   └─ cpp_jit.repack_w4a16 → torch.ops.chord_cpp.repack_w4a16 → chord::indexed::repack_w4a16
 
 grouped.api.w4a16_masked / w4a16_contiguous（参数检查，heuristic 选配置，有缓存）

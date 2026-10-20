@@ -14,7 +14,7 @@ from chord_kernels.operator.grouped.heuristics import (
     select_w4a16_config,
 )
 from chord_kernels.operator.grouped.kernel import GroupedW4A16Kernel
-from chord_kernels.operator.grouped.packing import GroupedPreparedWeight
+from chord_kernels.operator.packing import PreparedWeight
 
 # BLOCK_K the heuristic picks per kernel; K must cover whole tiles.
 _MASKED_BLOCK_K = 128
@@ -22,11 +22,15 @@ _CONTIGUOUS_BLOCK_K = 64
 
 
 def _check_weight(
-    weight: GroupedPreparedWeight, mode: str, block_k: int, device: torch.device
+    weight: PreparedWeight, mode: str, block_k: int, device: torch.device
 ) -> None:
-    if not isinstance(weight, GroupedPreparedWeight):
-        raise TypeError(
-            "weight must be a GroupedPreparedWeight from pack_w4a16_grouped()"
+    if not isinstance(weight, PreparedWeight):
+        raise TypeError("weight must be a PreparedWeight from pack_w4a16()")
+    capability = torch.cuda.get_device_capability(device)
+    if capability != (9, 0):
+        raise RuntimeError(
+            f"the {mode!r} W4A16 kernel requires an SM90 Hopper GPU, got compute "
+            f"capability {capability[0]}.{capability[1]} on {device}"
         )
     if weight.k % block_k:
         raise ValueError(
@@ -34,20 +38,20 @@ def _check_weight(
             f"the weight's K={weight.k}"
         )
     packed, scale = weight.packed, weight.scale
-    if packed.dtype != torch.float8_e4m3fn or scale.dtype != torch.bfloat16:
+    if packed.dtype != torch.int32 or scale.dtype != torch.bfloat16:
         raise TypeError(
-            f"packed weight must be float8_e4m3fn and scale bfloat16, got "
+            f"packed weight must be int32 and scale bfloat16, got "
             f"{packed.dtype}/{scale.dtype}"
         )
     if (
-        tuple(packed.shape) != (weight.num_experts, weight.n, weight.k // 2)
+        tuple(packed.shape) != (weight.num_experts, weight.k // 16, weight.n * 2)
         or tuple(scale.shape)
         != (weight.num_experts, weight.k // 32, weight.n)
     ):
         raise ValueError(
             "packed tensors disagree with the recorded metadata: "
             f"packed {tuple(packed.shape)} vs "
-            f"{(weight.num_experts, weight.n, weight.k // 2)}, scale "
+            f"{(weight.num_experts, weight.k // 16, weight.n * 2)}, scale "
             f"{tuple(scale.shape)} vs "
             f"{(weight.num_experts, weight.k // 32, weight.n)}"
         )
@@ -111,7 +115,7 @@ def _cpp_kernel_id(device: torch.device, desc: W4A16GemmDesc) -> int:
 
 def w4a16_masked(
     inputs: torch.Tensor,
-    weight: GroupedPreparedWeight,
+    weight: PreparedWeight,
     masked_m: torch.Tensor,
     expected_m: int,
     *,
@@ -206,7 +210,7 @@ def w4a16_masked(
 
 def w4a16_contiguous(
     inputs: torch.Tensor,
-    weight: GroupedPreparedWeight,
+    weight: PreparedWeight,
     m_indices: torch.Tensor,
     *,
     outputs: torch.Tensor | None = None,

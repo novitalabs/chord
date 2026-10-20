@@ -52,7 +52,7 @@ def _pack_weight_scale(weight_scale: torch.Tensor) -> torch.Tensor:
     return packed.view(-1, 64)[:, perm_tensor].contiguous().view(shape)
 
 
-def pack_w4a16_indexed(
+def pack_w4a16(
     weight_uint4: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
@@ -138,4 +138,4 @@ def pack_w4a16_indexed(
     )
 
 
-__all__ = ["PreparedWeight", "pack_w4a16_indexed"]
+__all__ = ["PreparedWeight", "pack_w4a16"]

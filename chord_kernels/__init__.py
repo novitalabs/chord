@@ -8,8 +8,7 @@ __all__ = [
     "indexed",
     "indexed_block_m",
     "masked",
-    "pack_w4a16_grouped",
-    "pack_w4a16_indexed",
+    "pack_w4a16",
 ]
 
 # Resolved on first access, so importing the package does not import torch.
@@ -18,8 +17,7 @@ _EXPORTS = {
     "masked": "chord_kernels.ops",
     "contiguous": "chord_kernels.ops",
     "indexed_block_m": "chord_kernels.operator.api",
-    "pack_w4a16_indexed": "chord_kernels.operator.packing",
-    "pack_w4a16_grouped": "chord_kernels.operator.grouped.packing",
+    "pack_w4a16": "chord_kernels.operator.packing",
 }
 
 

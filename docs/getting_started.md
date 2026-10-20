@@ -4,9 +4,9 @@
 
 ```python
 import torch
-from chord_kernels import indexed, indexed_block_m, pack_w4a16_indexed
+from chord_kernels import indexed, indexed_block_m, pack_w4a16
 
-weight = pack_w4a16_indexed(weight_uint4, scale)        # once, at load time
+weight = pack_w4a16(weight_uint4, scale)        # once, at load time
 locks = torch.zeros(1024, dtype=torch.int32, device="cuda")
 
 block_m = indexed_block_m(weight, num_tokens, top_k)     # per call
@@ -16,7 +16,7 @@ out = indexed(x, weight, sorted_ids, expert_ids, num_tokens_padded, top_k, locks
 
 | Argument | Contract |
 | --- | --- |
-| `pack_w4a16_indexed(weight_uint4, scale)` | int32 codes `[E, N, K]` in `[0, 15]`, decoded as `code - 8`; `packed=True` takes the checkpoint form `[E, N, K/8]`. BF16 scale `[E, N, K/32]`. `N % 128 == 0`, `K % 64 == 0`. |
+| `pack_w4a16(weight_uint4, scale)` | int32 codes `[E, N, K]` in `[0, 15]`, decoded as `code - 8`; `packed=True` takes the checkpoint form `[E, N, K/8]`. BF16 scale `[E, N, K/32]`. `N % 128 == 0`, `K % 64 == 0`. |
 | `x` | contiguous BF16 `[M, K]`. For down, the routed rows `[M * top_k, K]` with `top_k=1`. |
 | `sorted_ids`, `expert_ids`, `num_tokens_padded` | contiguous CUDA int32, as `moe_align_block_size` returns them, aligned to `indexed_block_m`. Buffers may be over-allocated; only the first `num_tokens_padded / block_m` blocks are read. Each block holds its routed ids (`< M * top_k`, each once) as a prefix followed by sentinels. EP routing may carry only this rank's routes. |
 | `locks` | zeroed int32 `[1024]`, allocated once and reused: every launch indexes it from word 0 and leaves it zeroed. Launches sharing one buffer must be ordered (one stream, or one graph); launches that may run concurrently, e.g. on different streams or graphs replayed on different streams, need one buffer each. Needed when the tuned schedule uses stream-K. |
@@ -31,9 +31,9 @@ the PyTorch caching allocator.
 ## grouped (SM90)
 
 ```python
-from chord_kernels import contiguous, masked, pack_w4a16_grouped
+from chord_kernels import contiguous, masked, pack_w4a16
 
-weight = pack_w4a16_grouped(weight_uint4, scale)
+weight = pack_w4a16(weight_uint4, scale)
 out = masked(x3, weight, masked_m, expected_m)
 out = contiguous(x2, weight, m_indices)
 ```
@@ -43,7 +43,7 @@ out = contiguous(x2, weight, m_indices)
 | `masked` (decode) | `x3` BF16 `[G, max_m, K]`, `masked_m` int32 `[G]` valid rows per expert, `expected_m` their typical count. Returns `[G*max_m, N]`. |
 | `contiguous` (prefill) | `x2` BF16 `[m, K]`, each expert's rows padded to 128 (padding zeroed), `m_indices` int32 `[m]` (`-1` for padding). Returns `[m, N]`. |
 
-One packed weight serves both operators. For `masked`, any `max_m` works and
+One `pack_w4a16` weight serves all three operators. For `masked`, any `max_m` works and
 `expected_m` only sizes the tiles; keep it close to the real counts for speed.
 
 ## Environment variables
