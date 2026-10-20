@@ -9,11 +9,10 @@ microseconds; the `gate_up + down` column is speedup(gate_up + down), Humming's
 summed time over chord's. The chart in the README is
 `docs/assets/benchmark_chart.py` over these tables.
 
-Per layer chord is ahead or level everywhere except grouped contiguous at 512
-rows/E (0.96x) and EP8 prefill at 2048 tokens (0.99x). Humming b4f3fc6 retuned
-its heuristics and stream-K; against c00b2e6 it is 4-23% faster on B300 decode,
-grouped contiguous, masked at 16-32 tokens/E and H200 chunks up to 2048 tokens,
-and 11-14% slower on masked at 64 tokens/E.
+Per layer chord is ahead or level everywhere except EP8 prefill at 2048 tokens
+(0.99x). Humming b4f3fc6 retuned its heuristics and stream-K; against c00b2e6
+it is 4-23% faster on B300 decode, grouped contiguous, masked at 16-32 tokens/E
+and H200 chunks up to 2048 tokens, and 11-14% slower on masked at 64 tokens/E.
 
 ## Shapes
 
@@ -88,7 +87,7 @@ slower).
 | Stage | tokens/GPU | humming µs | humming GB/s | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | gate_up | 20 | 215.0 | 3540.18 | 209.3 | 3637 | 1.03 | 1.03 |
-| gate_up | 30 | 247.1 | 3217.38 | 238.8 | 3331 | 1.04 | 1.06 |
+| gate_up | 30 | 247.1 | 3217.38 | 237.6 | 3348 | 1.04 | 1.07 |
 | gate_up | 40 | 253.9 | 3134.92 | 239.4 | 3324 | 1.06 | 1.07 |
 | gate_up | 50 | 255.8 | 3114.96 | 248.2 | 3210 | 1.03 | 1.04 |
 | down | 20 | 116.2 | 3293.81 | 112.2 | 3412 | 1.04 |  |
@@ -103,14 +102,14 @@ slower).
 | gate_up | 20 | 149.1 | 5107.17 | 147.7 | 5154 | 1.01 | 1.01 |
 | gate_up | 30 | 168.5 | 4718.80 | 167.2 | 4758 | 1.01 | 1.01 |
 | gate_up | 40 | 181.5 | 4384.25 | 181.7 | 4384 | 1.00 | 1.02 |
-| gate_up | 50 | 185.5 | 4294.63 | 189.5 | 4205 | 0.98 | 1.01 |
+| gate_up | 50 | 185.5 | 4294.63 | 183.5 | 4342 | 1.01 | 1.03 |
 | down | 20 | 85.2 | 4492.74 | 83.8 | 4575 | 1.02 |  |
 | down | 30 | 94.2 | 4256.66 | 92.0 | 4357 | 1.02 |  |
 | down | 40 | 98.0 | 4103.31 | 92.0 | 4367 | 1.07 |  |
 | down | 50 | 102.3 | 3948.20 | 95.0 | 4253 | 1.08 |  |
 
 Humming's SM100 schedule is now chord's: `8x256x64` swap-AB at 4 CTAs/SM with
-stream-K (`16x256x64` at 50 tokens), so the B300 lead is down to 1.01-1.02x.
+stream-K (`16x256x64` at 50 tokens), so the B300 lead is down to 1.01-1.03x.
 
 ## Stream-K reduction
 
@@ -142,15 +141,14 @@ FP32 is also deterministic across launches; BF16 was not on three rows.
 
 | Stage | rows/E | humming µs | chord µs | chord TFLOPS | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 128 | 762.3 | 631.2 | 570 | 1.21 | 1.20 |
-| gate_up | 256 | 1338.4 | 1220.5 | 592 | 1.10 | 1.09 |
-| gate_up | 512 | 2249.0 | 2369.3 | 608 | 0.95 | 0.96 |
-| down | 128 | 383.7 | 322.9 | 556 | 1.19 |  |
-| down | 256 | 674.4 | 620.5 | 581 | 1.09 |  |
-| down | 512 | 1183.3 | 1223.8 | 589 | 0.97 |  |
+| gate_up | 128 | 762.3 | 598.3 | 601 | 1.27 | 1.24 |
+| gate_up | 256 | 1338.4 | 1142.1 | 633 | 1.17 | 1.17 |
+| gate_up | 512 | 2249.0 | 2247.4 | 641 | 1.00 | 1.02 |
+| down | 128 | 383.7 | 323.0 | 556 | 1.19 |  |
+| down | 256 | 674.4 | 585.6 | 616 | 1.15 |  |
+| down | 512 | 1183.3 | 1128.6 | 639 | 1.05 |  |
 
-24 experts: 1.02-1.19x speedup(gate_up + down). At 512 rows/E Humming's
-stream-K `88x256x64`/`80x256x64` beats chord's one-pass `128x128x64`.
+24 experts: 1.09-1.23x speedup(gate_up + down).
 
 ## H200 grouped decode (`masked`)
 

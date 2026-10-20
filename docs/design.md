@@ -61,7 +61,7 @@ Block-M follows routed tokens per expert, `tok_e = routed_m / num_experts`.
 | mid window (`tok_e` ~20..70) | minimize `sum(ceil(count_e / block_m)) * (block_m + 32)` |
 | EP8 prefill, `tok_e` >= 80 | cover `tok_e * 1.1` in fewest blocks, block-M <= 176 |
 | TP8, `tok_e` >= 80 | gate/up: row-work argmin to 128; down: one block per expert; then 96, 128 |
-| H200 decode | 8 for `tok_e` <= 6, 16 to 13, else 24 |
+| H200 decode | 8 for `tok_e / 0.9` <= 6 (gate/up 5.5), 16 to 13, else 24 |
 | Blackwell decode | fixed routed-M brackets (below) |
 
 ### Tiles
@@ -102,7 +102,7 @@ Blackwell decode, one table for SM100/SM103, tuned on B300:
 | Projection | routed_m | Tile | CTAs/SM | Stream-K |
 | --- | --- | --- | --- | --- |
 | gate/up | <= 320 | `8x256x64` swap-AB | 4 | on |
-| gate/up | 321..736 | `16x512x128` | 1 | on |
+| gate/up | 321..736 | `16x256x64` swap-AB | 4 | on |
 | gate/up | 737..1424 / above | `32x512x64` / `48x512x64` | 1 | on |
 | down | <= 272 / 273..848 | `8x256x64` / `16x256x64` swap-AB | 4 | off |
 | down | 849..1424 / above | `32x512x64` / `48x512x64` | 1 | on |
@@ -120,8 +120,9 @@ warpgroup, WGMMA consumers.
   256 each warp takes two adjacent 16-row slabs, one per wave, so one
   `ld.shared.v2` feeds both (one 32-bit load per wave is a 4-way bank conflict
   and cost masked em=64 1-2%).
-- **Tiles** (`grouped/heuristics.py`, per call): contiguous BM128/BK64 (BM64 for
-  one small problem); masked BLOCK_M from `expected_m` (`1.3x` gate/up,
+- **Tiles** (`grouped/heuristics.py`, per call): contiguous `128x256x128`, 3
+  stages, no cluster (`128x128x64` for short-K below 256 rows/E, BM64 for one
+  small problem); masked BLOCK_M from `expected_m` (`1.3x` gate/up,
   `ceil(1.25x, 8)` down), BN 256 only while `G x ceil(N/256) >= 2 x num_sms`,
   stages for ~512 buffered K (~768 from BM 72).
 - **Residency** (`_ctas_per_sm`): small masked tiles (`block_m <= 24`) run two

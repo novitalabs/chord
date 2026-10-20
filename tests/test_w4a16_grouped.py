@@ -318,16 +318,20 @@ def test_w4a16_masked_cta_residency() -> None:
 
 def test_sm90_w4a16_contiguous_heuristic_table() -> None:
     h = _heuristics()
-    config = h.select_w4a16_config(
-        h.W4A16GemmDesc("contiguous", 12288, 4096, 7168, 48, 132)
-    )
-    assert (
-        config.layout.block_m,
-        config.layout.block_n,
-        config.layout.block_k,
-    ) == (128, 128, 64)
-    assert config.pipeline.num_stages == 8
-    assert config.pipeline.smem_size <= 232448
+
+    def tile(m: int, n: int, k: int, g: int):
+        c = h.select_w4a16_config(h.W4A16GemmDesc("contiguous", m, n, k, g, 132))
+        assert c.pipeline.smem_size <= 232448
+        return (c.layout.block_m, c.layout.block_n, c.layout.block_k,
+                c.layout.cluster_size, c.pipeline.num_stages)
+
+    # gate/up at every size and down from 256 rows/E: the wide 128x256x128
+    # tile, no multicast.
+    assert tile(48 * 128, 4096, 7168, 48) == (128, 256, 128, 1, 3)
+    assert tile(48 * 512, 7168, 2048, 48) == (128, 256, 128, 1, 3)
+    assert tile(24 * 256, 7168, 2048, 24) == (128, 256, 128, 1, 3)
+    # Short-K down below 256 rows/E keeps 128x128x64.
+    assert tile(48 * 128, 7168, 2048, 48) == (128, 128, 64, 2, 8)
     # A small single-group problem doubles the M/N tiles to fill the SMs.
     small = h.select_w4a16_config(
         h.W4A16GemmDesc("contiguous", 128, 4096, 7168, 1, 132)

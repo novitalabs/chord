@@ -398,8 +398,12 @@ def _select_indexed_kernel_config(
         (7168, 2048),
     }:
         tokens_per_expert = m / max(experts, 1) / 0.9
+        # gate/up moves to block-M 16 a little earlier than down (30 tokens/GPU:
+        # 2.5% faster; at 25 block-M 8 is still 7% faster).
+        bm8_max = 5.5 if k >= 4096 else 6
         block_m = (
-            8 if tokens_per_expert <= 6 else (16 if tokens_per_expert <= 13 else 24)
+            8 if tokens_per_expert <= bm8_max
+            else (16 if tokens_per_expert <= 13 else 24)
         )
         # 3 CTAs/SM; only down's block-M 8 tile gains from a fourth.
         num_ctas_per_sm = 4 if k < 4096 and block_m == 8 else 3
@@ -445,9 +449,11 @@ def _select_indexed_kernel_config(
                 swap_ab=True, use_stream_k=True,
             )
         if m <= 736:
+            # swap-AB 16x256 at 4 CTAs/SM: 2.6-2.8% faster than the non-swap
+            # 16x512x128 from 50 to 80 tokens/GPU.
             return _indexed_config(
-                prof, block_m=16, block_n=512, block_k=128,
-                swap_ab=False, use_stream_k=True,
+                prof, block_m=16, block_n=256, num_ctas_per_sm=4,
+                swap_ab=True, use_stream_k=True,
             )
         if m <= 1424:
             return _indexed_config(
