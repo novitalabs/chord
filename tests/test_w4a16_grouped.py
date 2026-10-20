@@ -235,15 +235,6 @@ def make_contiguous_case(case: ContiguousCase, device: torch.device):
     return a2, codes, scale, m_indices, ref, bounds
 
 
-def _pack_checkpoint_int32(codes: torch.Tensor) -> torch.Tensor:
-    """[G, N, K] codes [0,15] -> INT32 [G, N, K/8], 8 little-endian nibbles
-    per word (the framework checkpoint contract)."""
-    g, n, k = codes.shape
-    nib = codes.to(torch.int64).reshape(g, n, k // 8, 8)
-    shifts = torch.arange(8, dtype=torch.int64, device=codes.device) * 4
-    return (nib << shifts).sum(-1).to(torch.int32)
-
-
 # ---------------------------------------------------------------------------
 # Non-GPU unit tests: the heuristic port.
 # ---------------------------------------------------------------------------
@@ -360,9 +351,9 @@ def hopper() -> torch.device:
 
 
 def _pack_unpacked(codes: torch.Tensor, scale: torch.Tensor):
-    from chord_kernels.operator.grouped.packing import pack_w4a16_grouped
+    from chord_kernels import pack_w4a16
 
-    return pack_w4a16_grouped(codes, scale, packed=False)
+    return pack_w4a16(codes, scale)
 
 
 @pytest.mark.gpu
@@ -410,63 +401,46 @@ def test_nvrtc_compiles_both_instantiations(
 
 
 @pytest.mark.gpu
-def test_pack_parity_packed_vs_unpacked(hopper: torch.device) -> None:
-    """The checkpoint-packed [G,N,K/8] and unpacked [G,N,K] paths must produce
-    bit-identical grouped buffers."""
-    from chord_kernels.operator.grouped.packing import pack_w4a16_grouped
+def test_one_packed_weight_serves_indexed_masked_and_contiguous(
+    hopper: torch.device,
+) -> None:
+    """``pack_w4a16`` feeds the grouped kernels too: masked (BLOCK_K 128)
+    and contiguous (BLOCK_K 64) read the same bytes as ``indexed`` and match the
+    BF16 dequant reference, and a K the masked tile does not cover is rejected."""
+    from chord_kernels import contiguous, indexed, masked, pack_w4a16
+    from generators import align_routing_blocks, generate_topk_ids
 
     _reset_seed()
-    g, n, k = 4, 256, 512
-    codes = torch.randint(0, 16, (g, n, k), device=hopper, dtype=torch.int8).to(
-        torch.int32
-    )
-    scale = (torch.randn((g, n, k // 32), device=hopper) * 0.02).to(torch.bfloat16)
-    unpacked = pack_w4a16_grouped(codes, scale, packed=False)
-    packed = pack_w4a16_grouped(_pack_checkpoint_int32(codes), scale, packed=True)
-    assert torch.equal(
-        unpacked.packed.view(torch.uint8), packed.packed.view(torch.uint8)
-    )
-    assert torch.equal(unpacked.scale, packed.scale)
+    g, n, k, rows = 8, 256, 1024, 128
+    codes = torch.randint(0, 16, (g, n, k), device=hopper, dtype=torch.int8).to(torch.int32)
+    scale = (torch.randn((g, n, k // _W4A16_GROUP), device=hopper) * 0.02).to(torch.bfloat16)
+    weight = pack_w4a16(codes, scale)
+    deq = [_dequant_reference(codes[j], scale[j]).reshape(n, k).float() for j in range(g)]
 
+    a3 = torch.randn((g, rows, k), device=hopper, dtype=torch.bfloat16)
+    masked_m = torch.tensor([rows - 7 * j for j in range(g)], dtype=torch.int32, device=hopper)
+    out3 = masked(a3, weight, masked_m, 64).view(g, rows, n)
+    out2 = contiguous(a3.view(g * rows, k), weight,
+                      torch.arange(g, dtype=torch.int32, device=hopper).repeat_interleave(rows))
+    for j in range(g):
+        mm = int(masked_m[j])
+        ref = (a3[j].float() @ deq[j].t()).to(torch.bfloat16)
+        assert _cos_diff(out3[j, :mm], ref[:mm]) < _COSINE_LIMIT, j
+        assert _cos_diff(out2.view(g, rows, n)[j], ref) < _COSINE_LIMIT, j
 
-@pytest.mark.gpu
-def test_pack_layout_shape_and_block_k_guard(hopper: torch.device) -> None:
-    from chord_kernels.operator.grouped.api import w4a16_masked
-    from chord_kernels.operator.grouped.packing import (
-        pack_w4a16_grouped,
-        reorder_w4a16,
-    )
-
-    _reset_seed()
-    g, n, k = 2, 128, 256
-    codes = torch.randint(0, 16, (g, n, k), device=hopper, dtype=torch.int8).to(
-        torch.int32
-    )
-    scale = (torch.randn((g, n, k // 32), device=hopper) * 0.02).to(torch.bfloat16)
-    weight = pack_w4a16_grouped(codes, scale, packed=False)
-    assert weight.packed.shape == (g, n, k // 2)
-    assert weight.packed.dtype == torch.float8_e4m3fn
-    assert weight.scale.shape == (g, k // 32, n)
-    assert weight.scale.is_contiguous()
-    assert weight.scale.dtype == torch.bfloat16
-
-    # The BLOCK_K=128 reorder the masked kernel was written against is two
-    # BLOCK_K=64 reorders side by side, so the one buffer serves both kernels.
-    signed = (codes[0].to(torch.int16) - 8).to(torch.int8)
-    for block_k in (64, 128):
-        assert torch.equal(
-            weight.packed[0].view(torch.uint8),
-            reorder_w4a16(signed, block_k=block_k).view(torch.uint8),
-        )
+    topk_ids = generate_topk_ids(num_tokens=64, top_k=4, num_experts=g, device=hopper)
+    sorted_ids, expert_ids, ntp = align_routing_blocks(topk_ids, block_m=16, num_experts=g)
+    x = torch.randn((64, k), device=hopper, dtype=torch.bfloat16)
+    out = indexed(x, weight, sorted_ids, expert_ids, ntp, 4, block_m=16)
+    flat = topk_ids.reshape(-1)
+    ref = torch.stack([x[i // 4].float() @ deq[int(e)].t() for i, e in enumerate(flat)])
+    assert _cos_diff(out[: flat.numel()], ref.to(torch.bfloat16)) < _COSINE_LIMIT
 
     # The masked kernel's BLOCK_K=128 must still tile K whole.
-    short_k = pack_w4a16_grouped(
-        codes[..., :192].contiguous(), scale[..., :6].contiguous()
-    )
-    a3 = torch.randn((g, 16, 192), device=hopper, dtype=torch.bfloat16)
-    masked_m = torch.full((g,), 4, dtype=torch.int32, device=hopper)
+    short_k = pack_w4a16(codes[..., :192].contiguous(), scale[..., :6].contiguous())
     with pytest.raises(ValueError, match="BLOCK_K=128"):
-        w4a16_masked(a3, short_k, masked_m, 4)
+        masked(torch.randn((g, 16, 192), device=hopper, dtype=torch.bfloat16), short_k,
+               torch.full((g,), 4, dtype=torch.int32, device=hopper), 4)
 
 
 @pytest.mark.gpu

@@ -1,7 +1,7 @@
 # Performance
 
-Against [`vllm-project/humming@c00b2e6`](https://github.com/vllm-project/humming/commit/c00b2e645a4b5ef57174f40254968a2996944217)
-(2026-10-16): `indexed` against Humming's indexed path, `masked`/`contiguous`
+Against [`vllm-project/humming@b4f3fc6`](https://github.com/vllm-project/humming/commit/b4f3fc6ee1dfc637cb8081e57c02c4bf1791c5f1)
+(2026-10-19): `indexed` against Humming's indexed path, `masked`/`contiguous`
 against its `grouped_masked`/`grouped_contiguous`, timed with its own
 `benchmarks/bench_humming.py` on the same GPU (H200 SXM, B300 SXM6), the same
 shape and the same routing draw. Mean of two runs, spread under 2%. Per-call
@@ -9,8 +9,11 @@ microseconds; the `gate_up + down` column is speedup(gate_up + down), Humming's
 summed time over chord's. The chart in the README is
 `docs/assets/benchmark_chart.py` over these tables.
 
-On H200 chord leads on speedup(gate_up + down) everywhere except EP8 prefill at 8192 tokens (0.99x);
-that gap is in the kernel, not the tile choice.
+Per layer chord is ahead or level everywhere except grouped contiguous at 512
+rows/E (0.96x) and EP8 prefill at 2048 tokens (0.99x). Humming b4f3fc6 retuned
+its heuristics and stream-K; against c00b2e6 it is 4-23% faster on B300 decode,
+grouped contiguous, masked at 16-32 tokens/E and H200 chunks up to 2048 tokens,
+and 11-14% slower on masked at 64 tokens/E.
 
 ## Shapes
 
@@ -49,63 +52,65 @@ launch. `triton` (default) is `do_bench(warmup=100, rep=1000)`, the call
 
 | Stage | num_tokens_total | humming µs | humming TFLOPS | chord µs | chord TFLOPS | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 1024 | 334.9 | 179.52 | 297.4 | 202 | 1.13 | 1.12 |
-| gate_up | 2048 | 385.4 | 312.08 | 367.4 | 327 | 1.05 | 1.05 |
-| gate_up | 4096 | 569.5 | 422.33 | 546.9 | 440 | 1.04 | 1.03 |
-| gate_up | 8192 | 999.5 | 481.29 | 1001.1 | 481 | 1.00 | 0.99 |
-| gate_up | 16384 | 1952.7 | 492.70 | 1692.5 | 568 | 1.15 | 1.11 |
-| down | 1024 | 169.1 | 177.84 | 154.1 | 195 | 1.10 |  |
-| down | 2048 | 207.1 | 290.37 | 196.1 | 307 | 1.06 |  |
-| down | 4096 | 296.8 | 405.14 | 293.9 | 409 | 1.01 |  |
-| down | 8192 | 524.1 | 458.91 | 541.0 | 445 | 0.97 |  |
-| down | 16384 | 1003.4 | 479.42 | 959.0 | 502 | 1.05 |  |
+| gate_up | 1024 | 300.0 | 200.40 | 297.1 | 202 | 1.01 | 1.01 |
+| gate_up | 2048 | 364.9 | 329.59 | 367.9 | 327 | 0.99 | 0.99 |
+| gate_up | 4096 | 563.8 | 426.63 | 545.3 | 441 | 1.03 | 1.03 |
+| gate_up | 8192 | 1031.4 | 466.40 | 999.9 | 482 | 1.03 | 1.01 |
+| gate_up | 16384 | 1947.2 | 494.07 | 1697.8 | 566 | 1.15 | 1.11 |
+| down | 1024 | 154.9 | 194.05 | 154.1 | 195 | 1.01 |  |
+| down | 2048 | 195.4 | 307.74 | 195.8 | 307 | 1.00 |  |
+| down | 4096 | 297.2 | 404.64 | 293.2 | 410 | 1.01 |  |
+| down | 8192 | 524.4 | 458.65 | 540.8 | 445 | 0.97 |  |
+| down | 16384 | 1004.5 | 478.91 | 961.0 | 501 | 1.05 |  |
 
 At 8192 tokens Humming's `96x256x64` tile, whose weights a TMA producer warpgroup
 loads, is 3% faster on down; the same tile on chord's cp.async path does not
-close it.
+close it (a bulk-copy weight load without a producer warpgroup measured 5-24%
+slower).
 
 ## H200 TP8
 
 | Stage | num_tokens_total | humming µs | humming TFLOPS | chord µs | chord TFLOPS | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 1024 | 340.4 | 176.66 | 300.5 | 200 | 1.13 | 1.10 |
-| gate_up | 2048 | 395.2 | 304.32 | 378.5 | 318 | 1.04 | 1.04 |
-| gate_up | 4096 | 594.3 | 404.68 | 566.9 | 424 | 1.05 | 1.14 |
-| gate_up | 8192 | 1029.3 | 467.34 | 1040.3 | 462 | 0.99 | 1.05 |
-| gate_up | 16384 | 2019.6 | 476.37 | 1820.7 | 528 | 1.11 | 1.13 |
-| down | 1024 | 207.5 | 144.88 | 197.7 | 152 | 1.05 |  |
-| down | 2048 | 309.9 | 194.02 | 298.1 | 202 | 1.04 |  |
-| down | 4096 | 597.8 | 201.16 | 476.7 | 252 | 1.25 |  |
-| down | 8192 | 955.5 | 251.73 | 853.7 | 282 | 1.12 |  |
-| down | 16384 | 1840.9 | 261.30 | 1591.4 | 302 | 1.16 |  |
+| gate_up | 1024 | 307.1 | 195.83 | 300.4 | 200 | 1.02 | 1.03 |
+| gate_up | 2048 | 372.4 | 322.93 | 377.2 | 319 | 0.99 | 1.01 |
+| gate_up | 4096 | 603.0 | 398.86 | 566.0 | 425 | 1.07 | 1.08 |
+| gate_up | 8192 | 1068.0 | 450.41 | 1042.5 | 461 | 1.02 | 1.07 |
+| gate_up | 16384 | 2061.3 | 466.74 | 1821.3 | 528 | 1.13 | 1.15 |
+| down | 1024 | 209.2 | 143.72 | 199.0 | 151 | 1.05 |  |
+| down | 2048 | 311.8 | 192.87 | 297.9 | 202 | 1.05 |  |
+| down | 4096 | 519.5 | 231.50 | 475.4 | 253 | 1.09 |  |
+| down | 8192 | 956.4 | 251.47 | 852.5 | 282 | 1.12 |  |
+| down | 16384 | 1840.0 | 261.44 | 1585.3 | 303 | 1.16 |  |
 
 ## H200 EP8 decode
 
 | Stage | tokens/GPU | humming µs | humming GB/s | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 20 | 226.3 | 3364.14 | 210.3 | 3620 | 1.08 | 1.06 |
-| gate_up | 30 | 257.8 | 3084.34 | 239.3 | 3323 | 1.08 | 1.09 |
-| gate_up | 40 | 253.4 | 3140.91 | 240.0 | 3316 | 1.06 | 1.07 |
-| gate_up | 50 | 255.2 | 3121.97 | 248.0 | 3213 | 1.03 | 1.04 |
-| down | 20 | 116.5 | 3287.25 | 112.5 | 3404 | 1.04 |  |
-| down | 30 | 131.9 | 3039.01 | 118.5 | 3381 | 1.11 |  |
-| down | 40 | 134.8 | 2984.07 | 123.2 | 3264 | 1.09 |  |
-| down | 50 | 135.1 | 2987.56 | 127.5 | 3167 | 1.06 |  |
+| gate_up | 20 | 215.0 | 3540.18 | 209.3 | 3637 | 1.03 | 1.03 |
+| gate_up | 30 | 247.1 | 3217.38 | 238.8 | 3331 | 1.04 | 1.06 |
+| gate_up | 40 | 253.9 | 3134.92 | 239.4 | 3324 | 1.06 | 1.07 |
+| gate_up | 50 | 255.8 | 3114.96 | 248.2 | 3210 | 1.03 | 1.04 |
+| down | 20 | 116.2 | 3293.81 | 112.2 | 3412 | 1.04 |  |
+| down | 30 | 132.2 | 3032.68 | 118.5 | 3382 | 1.12 |  |
+| down | 40 | 134.1 | 2999.23 | 123.0 | 3269 | 1.09 |  |
+| down | 50 | 136.0 | 2968.96 | 127.2 | 3176 | 1.07 |  |
 
 ## B300 EP8 decode
 
 | Stage | tokens/GPU | humming µs | humming GB/s | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 20 | 179.1 | 4251.67 | 147.2 | 5172 | 1.22 | 1.25 |
-| gate_up | 30 | 191.4 | 4153.30 | 165.7 | 4800 | 1.16 | 1.19 |
-| gate_up | 40 | 192.5 | 4134.89 | 180.1 | 4422 | 1.07 | 1.13 |
-| gate_up | 50 | 192.9 | 4129.49 | 188.9 | 4218 | 1.02 | 1.08 |
-| down | 20 | 110.1 | 3476.92 | 83.7 | 4578 | 1.32 |  |
-| down | 30 | 113.9 | 3517.71 | 91.8 | 4366 | 1.24 |  |
-| down | 40 | 114.2 | 3523.22 | 91.8 | 4377 | 1.24 |  |
-| down | 50 | 114.3 | 3532.76 | 94.8 | 4260 | 1.21 |  |
+| gate_up | 20 | 149.1 | 5107.17 | 147.7 | 5154 | 1.01 | 1.01 |
+| gate_up | 30 | 168.5 | 4718.80 | 167.2 | 4758 | 1.01 | 1.01 |
+| gate_up | 40 | 181.5 | 4384.25 | 181.7 | 4384 | 1.00 | 1.02 |
+| gate_up | 50 | 185.5 | 4294.63 | 189.5 | 4205 | 0.98 | 1.01 |
+| down | 20 | 85.2 | 4492.74 | 83.8 | 4575 | 1.02 |  |
+| down | 30 | 94.2 | 4256.66 | 92.0 | 4357 | 1.02 |  |
+| down | 40 | 98.0 | 4103.31 | 92.0 | 4367 | 1.07 |  |
+| down | 50 | 102.3 | 3948.20 | 95.0 | 4253 | 1.08 |  |
 
-Humming's SM100 schedule is `16x128x128`, 2 CTAs/SM, stream-K on both stages.
+Humming's SM100 schedule is now chord's: `8x256x64` swap-AB at 4 CTAs/SM with
+stream-K (`16x256x64` at 50 tokens), so the B300 lead is down to 1.01-1.02x.
 
 ## Stream-K reduction
 
@@ -137,14 +142,15 @@ FP32 is also deterministic across launches; BF16 was not on three rows.
 
 | Stage | rows/E | humming µs | chord µs | chord TFLOPS | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 128 | 865.5 | 635.6 | 566 | 1.36 | 1.35 |
-| gate_up | 256 | 1432.3 | 1231.6 | 586 | 1.16 | 1.16 |
-| gate_up | 512 | 2781.2 | 2402.7 | 600 | 1.16 | 1.16 |
-| down | 128 | 427.9 | 325.2 | 552 | 1.32 |  |
-| down | 256 | 731.4 | 628.0 | 574 | 1.16 |  |
-| down | 512 | 1441.6 | 1234.0 | 584 | 1.17 |  |
+| gate_up | 128 | 762.3 | 631.2 | 570 | 1.21 | 1.20 |
+| gate_up | 256 | 1338.4 | 1220.5 | 592 | 1.10 | 1.09 |
+| gate_up | 512 | 2249.0 | 2369.3 | 608 | 0.95 | 0.96 |
+| down | 128 | 383.7 | 322.9 | 556 | 1.19 |  |
+| down | 256 | 674.4 | 620.5 | 581 | 1.09 |  |
+| down | 512 | 1183.3 | 1223.8 | 589 | 0.97 |  |
 
-24 experts: 1.16-1.40x speedup(gate_up + down).
+24 experts: 1.02-1.19x speedup(gate_up + down). At 512 rows/E Humming's
+stream-K `88x256x64`/`80x256x64` beats chord's one-pass `128x128x64`.
 
 ## H200 grouped decode (`masked`)
 
@@ -152,15 +158,15 @@ FP32 is also deterministic across launches; BF16 was not on three rows.
 
 | Stage | tokens/E | humming µs | chord µs | chord GB/s | Speedup | gate_up + down |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 8 | 253.1 | 247.5 | 3238 | 1.02 | 1.03 |
-| gate_up | 16 | 341.5 | 270.2 | 2999 | 1.26 | 1.25 |
-| gate_up | 32 | 375.3 | 350.0 | 2368 | 1.07 | 1.08 |
-| gate_up | 64 | 468.4 | 457.5 | 1890 | 1.02 | 1.03 |
-| down | 8 | 132.0 | 128.1 | 3149 | 1.03 |  |
-| down | 16 | 170.7 | 139.6 | 2943 | 1.22 |  |
-| down | 32 | 191.1 | 173.1 | 2458 | 1.10 |  |
-| down | 64 | 242.1 | 230.5 | 1974 | 1.05 |  |
+| gate_up | 8 | 253.1 | 242.1 | 3311 | 1.05 | 1.05 |
+| gate_up | 16 | 287.9 | 261.8 | 3095 | 1.10 | 1.10 |
+| gate_up | 32 | 354.5 | 340.6 | 2434 | 1.04 | 1.03 |
+| gate_up | 64 | 531.4 | 464.4 | 1862 | 1.14 | 1.15 |
+| down | 8 | 131.8 | 124.7 | 3235 | 1.06 |  |
+| down | 16 | 147.7 | 134.1 | 3064 | 1.10 |  |
+| down | 32 | 172.2 | 170.3 | 2498 | 1.01 |  |
+| down | 64 | 267.7 | 229.8 | 1980 | 1.17 |  |
 
-EP16 (24 experts) 1.04-1.21x, EP32 (12 experts) 1.04-1.31x speedup(gate_up + down). The 8
+EP16 (24 experts) 1.04-1.17x, EP32 (12 experts) 1.07-1.17x speedup(gate_up + down). The 8
 tokens per expert row was closed by running two resident CTAs per SM, not by a
 tile: none of 91 swept layouts beats the heuristic's `16x256x128`.

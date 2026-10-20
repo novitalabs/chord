@@ -354,14 +354,14 @@ void check_dg_common(
   ASSERT_CHECK(
       packed_w.is_cuda() && packed_w.is_contiguous(),
       "packed weight must be contiguous CUDA");
-  ASSERT_CHECK(packed_w.dim() == 3, "packed weight must be [G, N, K/2]");
+  ASSERT_CHECK(packed_w.dim() == 3, "packed weight must be [G, K/16, 2N]");
   ASSERT_CHECK(
-      packed_w.scalar_type() == ScalarType::Float8_e4m3fn,
-      "packed weight must be Float8_e4m3fn, got ",
+      packed_w.scalar_type() == ScalarType::Int,
+      "packed weight must be int32 (pack_w4a16), got ",
       DTYPE_TO_STRING(packed_w.scalar_type()));
   ASSERT_CHECK(packed_w.size(0) == num_groups, "weight G mismatch");
-  ASSERT_CHECK(packed_w.size(1) == shape_n, "weight N mismatch");
-  ASSERT_CHECK(packed_w.size(2) == shape_k / 2, "weight K/2 mismatch");
+  ASSERT_CHECK(packed_w.size(1) == shape_k / 16, "weight K/16 mismatch");
+  ASSERT_CHECK(packed_w.size(2) == shape_n * 2, "weight 2N mismatch");
   ASSERT_CHECK(
       scale.is_cuda() && scale.is_contiguous(), "scale must be contiguous CUDA");
   ASSERT_CHECK(scale.scalar_type() == ScalarType::BFloat16, "scale must be BFloat16");
@@ -397,10 +397,11 @@ void launch_grouped_w4a16(
       a_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, k,
       m_total * (a_has_groups ? num_groups : 1), kd.block_k, kd.block_m,
       k /* row stride in elements */, kd.swizzle_a);
-  // B: (K/2, N * groups) packed UINT8 rows, K-major; box (swizzle B, BLOCK_N).
+  // B: the pack_w4a16 weight [G, K/16, 2N] int32 as (N, G * K/16) uint64, one
+  // uint64 per N column of a K16 row; box (BLOCK_N, BLOCK_K/16), unswizzled.
   CUtensorMap tm_b = make_dg_tma_2d_desc(
-      w_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, k / 2, n * num_groups,
-      kd.block_k / 2, kd.block_n, k / 2, kd.swizzle_b);
+      w_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT64, 8, n, num_groups * (k / 16),
+      kd.block_n, kd.block_k / 16, n, 0);
   // D: (N, m_total [, groups]) BF16 rows; box (swizzle CD, BLOCK_M).
   CUtensorMap tm_d = a_has_groups
       ? make_dg_tma_3d_desc(
@@ -473,7 +474,7 @@ Tensor launch_grouped_w4a16_masked(
   const int64_t num_groups = a.size(0);
   const int64_t shape_m = a.size(1);
   const int64_t shape_k = a.size(2);
-  const int64_t shape_n = packed_w.size(1);
+  const int64_t shape_n = packed_w.size(2) / 2;
   check_dg_common(a, packed_w, scale, num_groups, shape_n, shape_k, device);
   ASSERT_CHECK(
       masked_m.is_cuda() && masked_m.is_contiguous() &&
@@ -519,7 +520,7 @@ Tensor launch_grouped_w4a16_contiguous(
   const int64_t shape_m = a.size(0);
   const int64_t shape_k = a.size(1);
   const int64_t num_groups = packed_w.size(0);
-  const int64_t shape_n = packed_w.size(1);
+  const int64_t shape_n = packed_w.size(2) / 2;
   check_dg_common(a, packed_w, scale, num_groups, shape_n, shape_k, device);
   ASSERT_CHECK(
       m_indices.is_cuda() && m_indices.is_contiguous() &&

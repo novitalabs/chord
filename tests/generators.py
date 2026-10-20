@@ -330,7 +330,7 @@ def pack_checkpoint_uint4(weight: torch.Tensor) -> torch.Tensor:
 def generate_indexed_case(case: IndexedCase, device: torch.device) -> IndexedTensors:
     """Generate and pack all tensors required by one indexed W4A16 case."""
 
-    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels import pack_w4a16
     from chord_kernels.operator.tuning import select_indexed_config
 
     # Block-M is selected from the routed row count for both projections: the
@@ -363,7 +363,7 @@ def generate_indexed_case(case: IndexedCase, device: torch.device) -> IndexedTen
         * 0.04
         + 0.005
     ).to(torch.bfloat16)
-    prepared_weight = pack_w4a16_indexed(logical_weight, scale)
+    prepared_weight = pack_w4a16(logical_weight, scale)
     # Routing reproduces the upstream bench_humming.py draw exactly: that
     # benchmark seeds the global CUDA RNG with the token count immediately
     # before scoring experts, and a fresh Generator with the same seed yields

@@ -38,7 +38,7 @@ const GemmConfig& gemm_config(int64_t id);
 
 struct GemmArgs {
   const void* input;              // bf16 [M, K]
-  const void* weight;             // int32 [E, K/16, 2N] (pack_w4a16_indexed)
+  const void* weight;             // int32 [E, K/16, 2N] (pack_w4a16)
   const void* weight_scale;       // bf16 [E, K/32, N]
   const int32_t* sorted_ids;      // moe_align_block_size routing
   const int32_t* expert_ids;

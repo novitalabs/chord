@@ -112,9 +112,14 @@ Blackwell decode, one table for SM100/SM103, tuned on B300:
 The SM90 W4A16 GEMM vendored from DeepGEMM: TMA weight loads from a producer
 warpgroup, WGMMA consumers.
 
-- **Packing.** `pack_w4a16_grouped` bit-permutes the codes for the dequant and
-  transposes scales to `[G, K/32, N]`. Every K bit below 6 stays inside one
-  64-wide slab, so masked (BLOCK_K 128) and contiguous (64) read the same bytes.
+- **Weight.** The `pack_w4a16` layout, the one indexed reads, so one packed copy
+  serves all three operators. The producer TMAs each stage as one unswizzled
+  `BLOCK_K/16 x BLOCK_N` box of uint64 (one per N column of a K16 row); a
+  consumer thread's word per K16 is its RS-WGMMA A fragment, and the
+  lane-permuted scales give rows `r` and `r+8` as one BF16 pair. With BLOCK_N
+  256 each warp takes two adjacent 16-row slabs, one per wave, so one
+  `ld.shared.v2` feeds both (one 32-bit load per wave is a 4-way bank conflict
+  and cost masked em=64 1-2%).
 - **Tiles** (`grouped/heuristics.py`, per call): contiguous BM128/BK64 (BM64 for
   one small problem); masked BLOCK_M from `expected_m` (`1.3x` gate/up,
   `ceil(1.25x, 8)` down), BN 256 only while `G x ceil(N/256) >= 2 x num_sms`,

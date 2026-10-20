@@ -244,9 +244,10 @@ void gemm(int64_t id, const GemmArgs& a, CUstream stream) {
   // A: (K, rows) BF16, K-major; box (swizzle A, BLOCK_M).
   CUtensorMap tm_a = tma_2d(a.a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, a.k, rows, kd.block_k,
                             kd.block_m, a.k, kd.swizzle_a);
-  // B: (K/2, N * groups) packed UINT8, K-major; box (swizzle B, BLOCK_N).
-  CUtensorMap tm_b = tma_2d(a.weight, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, a.k / 2,
-                            a.n * a.num_groups, kd.block_k / 2, kd.block_n, a.k / 2, kd.swizzle_b);
+  // B: the pack_w4a16 weight [G, K/16, 2N] int32 as (N, G * K/16) uint64, one
+  // uint64 per N column of a K16 row; box (BLOCK_N, BLOCK_K/16), unswizzled.
+  CUtensorMap tm_b = tma_2d(a.weight, CU_TENSOR_MAP_DATA_TYPE_UINT64, 8, a.n,
+                            a.num_groups * (a.k / 16), kd.block_n, kd.block_k / 16, a.n, 0);
   // D: (N, m [, groups]) BF16; box (swizzle CD, BLOCK_M).  Masked adds the
   // group as a third dimension so a partial last M tile's store clips at max_m.
   CUtensorMap tm_d =

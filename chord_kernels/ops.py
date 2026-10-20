@@ -21,7 +21,7 @@ def indexed(
     """Indexed (``moe_align_block_size``-routed) BF16 x INT4 MoE GEMM.
 
     ``activation`` is BF16 ``[M, K]`` and ``weight`` comes from
-    ``pack_w4a16_indexed``.  The routing must be aligned to
+    ``pack_w4a16``.  The routing must be aligned to
     ``indexed_block_m(weight, num_tokens, top_k)``; a host that aligns one
     routing for both projections passes that block size as ``block_m``.
     ``locks`` is a zeroed int32 tensor of 1024 words (needed when the tuned
@@ -58,7 +58,7 @@ def masked(
     """Grouped masked (decode) GEMM, SM90.
 
     ``activation`` is BF16 ``[G, max_m, K]`` (or flat ``[G*max_m, K]``),
-    ``weight`` comes from ``pack_w4a16_grouped``, ``masked_m`` is the valid row
+    ``weight`` comes from ``pack_w4a16``, ``masked_m`` is the valid row
     count per expert ``[G] int32`` and ``expected_m`` its typical value.
     Returns flat ``[G*max_m, N]``.
     """

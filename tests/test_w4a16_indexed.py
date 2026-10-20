@@ -358,7 +358,7 @@ def test_indexed_checkpoint_weight_correctness(supported_gpu: torch.device) -> N
     decode config end to end against the BF16 dequant reference."""
 
     from chord_kernels.operator import w4a16_indexed as indexed
-    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels import pack_w4a16
 
     capability = torch.cuda.get_device_capability(supported_gpu)
     profile = "h200_decode_ep8" if capability == (9, 0) else "blackwell_decode_ep8"
@@ -366,7 +366,7 @@ def test_indexed_checkpoint_weight_correctness(supported_gpu: torch.device) -> N
         profile, m=8, n=128, k=128, num_experts=4, top_k=2, seed=20260810
     )
     tensors = generate_indexed_case(case, supported_gpu)
-    weight = pack_w4a16_indexed(
+    weight = pack_w4a16(
         pack_checkpoint_uint4(tensors.logical_weight), tensors.scale, packed=True
     )
     assert torch.equal(weight.packed, tensors.prepared_weight.packed)
@@ -1046,8 +1046,7 @@ def test_public_api_surface() -> None:
     import chord_kernels
 
     assert sorted(chord_kernels.__all__) == [
-        "contiguous", "indexed", "indexed_block_m", "masked", "pack_w4a16_grouped",
-        "pack_w4a16_indexed",
+        "contiguous", "indexed", "indexed_block_m", "masked", "pack_w4a16",
     ]
     for name in chord_kernels.__all__:
         assert callable(getattr(chord_kernels, name))
@@ -1089,11 +1088,13 @@ def test_indexed_kernels_covers_every_selected_config() -> None:
 
 
 def test_checkpoint_uint4_layout() -> None:
-    from chord_kernels.operator.grouped.packing import _unpack_checkpoint_codes
-
+    """Eight little-endian nibbles per word: code i of a row is word i // 8,
+    shift 4 * (i % 8) (the ``packed=True`` contract)."""
     logical = torch.arange(16, dtype=torch.int32).repeat(1, 128, 4)
-    packed = pack_checkpoint_uint4(logical)
-    assert torch.equal(_unpack_checkpoint_codes(packed).to(torch.int32), logical)
+    words = pack_checkpoint_uint4(logical).to(torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(8, dtype=torch.int64) * 4
+    codes = ((words.unsqueeze(-1) >> shifts) & 0xF).reshape(logical.shape)
+    assert torch.equal(codes.to(torch.int32), logical)
 
 
 def test_sm103_jit_target(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1178,7 +1179,7 @@ def _stream_k_swap_ab_case(device: torch.device, seed: int):
     K = 7168 (112 K-blocks) at 4 CTAs/SM leaves the tail tiles split more than
     three ways, so the stream-K reduction is exercised on every launch.
     """
-    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels import pack_w4a16
     from chord_kernels.operator import IndexedKernelConfig
 
     num_experts, top_k, m, n, k = 8, 4, 24, 512, 7168
@@ -1187,7 +1188,7 @@ def _stream_k_swap_ab_case(device: torch.device, seed: int):
                           generator=gen)
     scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
              + 0.005).to(torch.bfloat16)
-    weight = pack_w4a16_indexed(codes, scale)
+    weight = pack_w4a16(codes, scale)
     config = IndexedKernelConfig(
         block_shape=(8, 256, 64), warp_shape=(8, 64, 64), num_stages=4,
         num_ctas_per_sm=4, swap_ab=True, use_stream_k=True,
@@ -1341,7 +1342,7 @@ def test_wgmma_stream_k_fp32_matches_one_pass(
     import dataclasses
 
     from chord_kernels.operator import w4a16_indexed as indexed
-    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels import pack_w4a16
     from chord_kernels.operator import IndexedKernelConfig
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
@@ -1353,7 +1354,7 @@ def test_wgmma_stream_k_fp32_matches_one_pass(
                           generator=gen)
     scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
              + 0.005).to(torch.bfloat16)
-    weight = pack_w4a16_indexed(codes, scale)
+    weight = pack_w4a16(codes, scale)
     del codes, scale
     stream_k = IndexedKernelConfig(
         block_shape=block_shape, warp_shape=(block_shape[0], 32, 64),
@@ -1441,7 +1442,7 @@ def test_one_packed_weight_serves_mma_and_wgmma() -> None:
     """One packed weight feeds the WGMMA prefill/TP8 tile, the MMA non-swap tile
     and the swap-AB decode tile, each matching the BF16 dequant reference."""
     from chord_kernels.operator import w4a16_indexed as indexed
-    from chord_kernels import pack_w4a16_indexed
+    from chord_kernels import pack_w4a16
     from chord_kernels.operator import IndexedKernelConfig
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
@@ -1453,7 +1454,7 @@ def test_one_packed_weight_serves_mma_and_wgmma() -> None:
                           generator=gen)
     scale = (torch.rand((num_experts, n, k // 32), device=device, generator=gen) * 0.04
              + 0.005).to(torch.bfloat16)
-    weight = pack_w4a16_indexed(codes, scale)
+    weight = pack_w4a16(codes, scale)
 
     activation = torch.randn((num_tokens, k), dtype=torch.bfloat16, device=device,
                              generator=gen)

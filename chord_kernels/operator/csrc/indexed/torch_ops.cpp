@@ -130,13 +130,13 @@ void check_grouped_common(const Tensor& a, const Tensor& packed_w, const Tensor&
   ASSERT_CHECK(a.size(-1) == shape_k, "a K mismatch");
   ASSERT_CHECK(packed_w.is_cuda() && packed_w.is_contiguous(),
                "packed weight must be contiguous CUDA");
-  ASSERT_CHECK(packed_w.dim() == 3, "packed weight must be [G, N, K/2]");
-  ASSERT_CHECK(packed_w.scalar_type() == ScalarType::Float8_e4m3fn,
-               "packed weight must be Float8_e4m3fn, got ",
+  ASSERT_CHECK(packed_w.dim() == 3, "packed weight must be [G, K/16, 2N]");
+  ASSERT_CHECK(packed_w.scalar_type() == ScalarType::Int,
+               "packed weight must be int32 (pack_w4a16), got ",
                DTYPE_TO_STRING(packed_w.scalar_type()));
   ASSERT_CHECK(packed_w.size(0) == num_groups, "weight G mismatch");
-  ASSERT_CHECK(packed_w.size(1) == shape_n, "weight N mismatch");
-  ASSERT_CHECK(packed_w.size(2) == shape_k / 2, "weight K/2 mismatch");
+  ASSERT_CHECK(packed_w.size(1) == shape_k / 16, "weight K/16 mismatch");
+  ASSERT_CHECK(packed_w.size(2) == shape_n * 2, "weight 2N mismatch");
   ASSERT_CHECK(scale.is_cuda() && scale.is_contiguous(), "scale must be contiguous CUDA");
   ASSERT_CHECK(scale.scalar_type() == ScalarType::BFloat16, "scale must be BFloat16");
   ASSERT_CHECK(scale.dim() == 3 && scale.size(0) == num_groups &&
@@ -166,7 +166,7 @@ Tensor grouped_masked(int64_t kernel_id, Tensor a, Tensor packed_w, Tensor scale
   const int64_t device = a.get_device();
   check_current_device(device);
   const int64_t num_groups = a.size(0), shape_m = a.size(1), shape_k = a.size(2);
-  const int64_t shape_n = packed_w.size(1);
+  const int64_t shape_n = packed_w.size(2) / 2;
   check_grouped_common(a, packed_w, scale, num_groups, shape_n, shape_k, device);
   ASSERT_CHECK(masked_m.is_cuda() && masked_m.is_contiguous() &&
                    masked_m.scalar_type() == ScalarType::Int && masked_m.numel() == num_groups,
@@ -193,7 +193,7 @@ Tensor grouped_contiguous(int64_t kernel_id, Tensor a, Tensor packed_w, Tensor s
   const int64_t device = a.get_device();
   check_current_device(device);
   const int64_t shape_m = a.size(0), shape_k = a.size(1);
-  const int64_t num_groups = packed_w.size(0), shape_n = packed_w.size(1);
+  const int64_t num_groups = packed_w.size(0), shape_n = packed_w.size(2) / 2;
   check_grouped_common(a, packed_w, scale, num_groups, shape_n, shape_k, device);
   ASSERT_CHECK(m_indices.is_cuda() && m_indices.is_contiguous() &&
                    m_indices.scalar_type() == ScalarType::Int && m_indices.numel() == shape_m,
